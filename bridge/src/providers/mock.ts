@@ -35,12 +35,20 @@ export class ApprovalBindingMismatchError extends Error {
   }
 }
 
+export class InteractionPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InteractionPendingError";
+  }
+}
+
 interface PendingApproval {
   binding: ApprovalBinding;
   turnId: string;
 }
 
 interface PendingQuestion {
+  sessionId: string;
   turnId: string;
 }
 
@@ -109,6 +117,21 @@ export class MockProvider implements AgentProvider {
   }
 
   async sendPrompt(sessionId: string, text: string): Promise<void> {
+    for (const pending of this.pending.values()) {
+      if (pending.binding.sessionId === sessionId) {
+        throw new InteractionPendingError(
+          `session ${sessionId} has a pending approval ${pending.binding.approvalId}; resolve or cancel it first`,
+        );
+      }
+    }
+    for (const [questionId, pending] of this.pendingQuestions) {
+      if (pending.sessionId === sessionId) {
+        throw new InteractionPendingError(
+          `session ${sessionId} has a pending question ${questionId}; resolve or cancel it first`,
+        );
+      }
+    }
+
     const turnId = `trn_${++this.counter}`;
     const executionId = `exe_${++this.counter}`;
     const command = "bun test";
@@ -146,7 +169,7 @@ export class MockProvider implements AgentProvider {
     });
 
     const questionId = `qst_${++this.counter}`;
-    this.pendingQuestions.set(questionId, { turnId: pending.turnId });
+    this.pendingQuestions.set(questionId, { sessionId, turnId: pending.turnId });
     this.host.emit(sessionId, "question.requested", {
       questionId,
       turnId: pending.turnId,
@@ -171,7 +194,16 @@ export class MockProvider implements AgentProvider {
   }
 
   async cancel(sessionId: string): Promise<void> {
-    this.pending.clear();
+    for (const [approvalId, pending] of this.pending) {
+      if (pending.binding.sessionId === sessionId) {
+        this.pending.delete(approvalId);
+      }
+    }
+    for (const [questionId, pending] of this.pendingQuestions) {
+      if (pending.sessionId === sessionId) {
+        this.pendingQuestions.delete(questionId);
+      }
+    }
     this.host.emit(sessionId, "session.completed", { reason: "cancelled" });
   }
 

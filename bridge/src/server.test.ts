@@ -192,6 +192,35 @@ describe("bridge HTTP surface", () => {
     expect(response.status).toBe(409);
   });
 
+  test("prompt.send while an approval is pending is refused with 409 and emits no new turn.started", async () => {
+    await post(promptCommand("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
+    const before = await eventsAfter(0);
+
+    const response = await post(promptCommand("dddddddd-dddd-4ddd-8ddd-dddddddddddd"));
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("pending approval");
+
+    const after = await eventsAfter(0);
+    expect(after).toEqual(before);
+    expect(after.filter((event) => event.type === "turn.started").length).toBe(1);
+  });
+
+  test("a second prompt.send succeeds once the session is cancelled", async () => {
+    await post(promptCommand("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"));
+
+    const cancelResponse = await bridge.fetch(
+      new Request(`http://bridge.local/v1/sessions/${bridge.session.id}/cancel`, { method: "POST" }),
+    );
+    expect(cancelResponse.status).toBe(200);
+
+    const response = await post(promptCommand("11111111-2222-4111-8111-111111111112"));
+    expect(response.status).toBe(200);
+
+    const events = await eventsAfter(0);
+    expect(events.filter((event) => event.type === "turn.started").length).toBe(2);
+  });
+
   test("session.create starts a session and reports its new id", async () => {
     const response = await post({
       commandId: "88888888-8888-4888-8888-888888888888",
