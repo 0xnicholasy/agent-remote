@@ -13,7 +13,7 @@ import type {
   SessionsResponse,
 } from "@agentremote/protocol";
 
-import { ApprovalBindingMismatchError, MockProvider, type ProviderHost } from "./providers/mock";
+import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, type ProviderHost } from "./providers/mock";
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
@@ -198,7 +198,7 @@ export function createBridge(): Bridge {
       createdSessionId = await execute(command);
     } catch (error) {
       inFlight.delete(command.commandId);
-      if (error instanceof ApprovalBindingMismatchError) {
+      if (error instanceof ApprovalBindingMismatchError || error instanceof InteractionPendingError) {
         return json({ error: error.message }, 409);
       }
       throw error;
