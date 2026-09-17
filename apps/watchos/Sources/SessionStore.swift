@@ -11,6 +11,17 @@ struct TranscriptItem: Identifiable, Hashable {
     let text: String
 }
 
+/// Explicit status kind for the status line, so views branch on a typed value instead of
+/// matching a substring of the human-readable text.
+enum StatusKind: Equatable {
+    case notConnected
+    case connected
+    case skippedEvents
+    case reconnecting
+    case requestInvalid
+    case error
+}
+
 enum TurnState: String {
     case idle, thinking, running, waiting, completed, error
 
@@ -44,6 +55,7 @@ final class SessionStore {
     private(set) var lastSeenEventId: Int
     private(set) var connected = false
     private(set) var statusLine = "Not connected"
+    private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
 
     var hostText: String {
@@ -51,18 +63,19 @@ final class SessionStore {
     }
 
     let speaker: Speaker
-    @ObservationIgnored private let client: BridgeClient
+    @ObservationIgnored private let client: any BridgeClientProtocol
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
 
-    init(speaker: Speaker = Speaker()) {
+    /// `client` is injectable so tests can substitute a fake in place of a real `BridgeClient`.
+    init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker()) {
         let defaults = UserDefaults.standard
         let stored = defaults.string(forKey: SessionStore.hostKey)
         let url = stored.flatMap(BridgeClient.parseBaseURL) ?? BridgeClient.defaultBaseURL
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
-        client = BridgeClient(baseURL: url)
+        self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
     }
 
@@ -103,11 +116,18 @@ final class SessionStore {
                 // Advances past skipped (undecodable) events too, not just the decoded ones.
                 lastSeenEventId = max(lastSeenEventId, response.lastEventId)
                 UserDefaults.standard.set(lastSeenEventId, forKey: SessionStore.cursorKey)
-                statusLine = response.skipped > 0 ? "Skipped \(response.skipped) unreadable events" : "Connected"
+                if response.skipped > 0 {
+                    statusLine = "Skipped \(response.skipped) unreadable events"
+                    statusKind = .skippedEvents
+                } else {
+                    statusLine = "Connected"
+                    statusKind = .connected
+                }
             } catch {
                 if Task.isCancelled { return }
                 connected = false
                 statusLine = "Reconnecting: \(error)"
+                statusKind = .reconnecting
                 try? await Task.sleep(for: .seconds(backoff))
                 backoff = min(backoff * 2, 15)
             }
@@ -121,8 +141,13 @@ final class SessionStore {
 
     // MARK: - Event application
 
-    private func apply(_ event: AgentEvent) {
+    // Not private: the unit test target compiles this file directly and drives the store
+    // through decoded events instead of a running bridge.
+    func apply(_ event: AgentEvent) {
         if case .sessionStarted = event.payload {
+            // Already tracking a session: a session.started for a different id belongs to
+            // someone else's session and must not reset this one's card, status, or transcript.
+            if let current = sessionId, current != event.sessionId { return }
             sessionId = event.sessionId
             transcript.removeAll()
             pendingApproval = nil
@@ -131,6 +156,8 @@ final class SessionStore {
             append(.system, "Session \(event.sessionId) started", id: event.eventId)
             return
         }
+        // Binds to the first event seen when no session.started has been observed yet, for
+        // example right after relaunch with a cursor already past that event.
         if sessionId == nil { sessionId = event.sessionId }
         guard event.sessionId == sessionId else { return }
 
@@ -233,6 +260,7 @@ final class SessionStore {
         } catch BridgeError.http(let status, _) where status == 409 {
             pendingApproval = nil
             statusLine = "Request no longer valid"
+            statusKind = .requestInvalid
         } catch {
             report(error)
         }
@@ -249,6 +277,7 @@ final class SessionStore {
         } catch BridgeError.http(let status, _) where status == 409 {
             pendingApproval = nil
             statusLine = "Request no longer valid"
+            statusKind = .requestInvalid
         } catch {
             report(error)
         }
@@ -265,6 +294,7 @@ final class SessionStore {
         } catch BridgeError.http(let status, _) where status == 409 {
             pendingQuestion = nil
             statusLine = "Request no longer valid"
+            statusKind = .requestInvalid
         } catch {
             report(error)
         }
@@ -281,6 +311,7 @@ final class SessionStore {
         } catch BridgeError.http(let status, _) where status == 409 {
             pendingQuestion = nil
             statusLine = "Request no longer valid"
+            statusKind = .requestInvalid
         } catch {
             report(error)
         }
@@ -311,5 +342,6 @@ final class SessionStore {
     private func report(_ error: any Error) {
         turnState = .error
         statusLine = "\(error)"
+        statusKind = .error
     }
 }
