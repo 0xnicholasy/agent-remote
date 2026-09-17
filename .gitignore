@@ -16,6 +16,7 @@ node_modules/
 dist/
 .env
 .env.local
+*.tsbuildinfo
 
 # local scratch notes, never committed
 .private/
