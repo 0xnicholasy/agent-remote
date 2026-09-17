@@ -51,7 +51,7 @@ struct ChoiceCardView: View {
     }
 
     private var prompt: String {
-        if let approval { return "Agent wants to run: \(approval.title)" }
+        if let approval { return approval.title }
         return question?.text ?? ""
     }
 }
