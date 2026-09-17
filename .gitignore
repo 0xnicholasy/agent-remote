@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+.build/
+.swiftpm/
+
+# Node and Bun
+node_modules/
+dist/
+.env
+.env.local
+
+# local scratch notes, never committed
+.private/
