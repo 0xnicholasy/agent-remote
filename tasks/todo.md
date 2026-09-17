@@ -1,6 +1,6 @@
 # Agent Remote task board
 
-Last updated: 2026-09-16
+Last updated: 2026-09-17
 
 Agent Remote lets a user steer short coding-agent interruptions from an Apple Watch while the Mac remains the authority. The first release targets one real provider and one paired Mac on the local network: tap answers, approve or deny, send reviewed dictation, hear short foreground replies, see current/syncing/disconnected state, and cancel. It controls only sessions created through its bridge, not arbitrary terminal sessions that were already running.
 
@@ -16,9 +16,10 @@ Agent Remote lets a user steer short coding-agent interruptions from an Apple Wa
 - [ ] Prototype follow-ups, ranked:
   1. Done 2026-09-17: bridge validates commands with ajv and rejects unknown session ids (400). 10 bridge tests pass.
   2. Done 2026-09-17: Watch decodes events one by one, skips unreadable ones, advances the cursor, shows the status line under the state pill. Two smells left: RootView keys visibility off the "Skipped" string prefix, and a malformed page root throws BridgeError.http with status 0.
-  3. `approve()` / `reject()` / `answer()` clear the pending card before the POST, so a 409 drops the card with no retry.
+  3. In progress 2026-09-17: `approve()` / `reject()` / `answer()` keep the card until the bridge acknowledges; 409 (stale binding) clears it with a status line, any other failure keeps it for retry; buttons disabled while sending.
   4. Mock allows a new prompt while an approval is still pending; the old approval is orphaned (event 19). Decide whether the bridge should reject or auto-cancel.
   5. Speech on simulator unconfirmed; nav title overlaps card; approval title repeats the verb; mock reject path has no follow-up question; SessionStore not scoped to a session.
+- [ ] Security review of the first commits (2026-09-17), the cancel route session check landed in PR #1 on 2026-09-17; the rest is deferred to Phase 1 with the pairing work: bridge has no authentication on any route; the mock provider lets an approval or answer for one session touch state of another because bindings are not checked against the session id.
 - [ ] Add explicit root lint and typecheck entry points so documentation and CI can invoke the available package checks consistently.
 - [ ] Keep related-project research (claude-watch, agent-watcher, codex-apple-watch, iOS-vibebuddy, and mimi-remote) bounded to concrete reuse or contribution questions. It does not block the release path.
 

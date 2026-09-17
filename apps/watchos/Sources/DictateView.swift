@@ -16,7 +16,7 @@ struct DictateView: View {
                 dismiss()
                 Task { await store.submitDictation(outgoing) }
             }
-            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isSending)
         }
         .padding(.horizontal, 4)
     }

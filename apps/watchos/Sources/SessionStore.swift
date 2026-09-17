@@ -44,6 +44,7 @@ final class SessionStore {
     private(set) var lastSeenEventId: Int
     private(set) var connected = false
     private(set) var statusLine = "Not connected"
+    private(set) var isSending = false
 
     var hostText: String {
         didSet { UserDefaults.standard.set(hostText, forKey: SessionStore.hostKey) }
@@ -215,39 +216,83 @@ final class SessionStore {
         if target == nil { target = await createSession() }
         guard let target else { return }
         turnState = .thinking
-        await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
+        do {
+            try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
+        } catch {
+            report(error)
+        }
     }
 
     func approve() async {
-        guard let request = pendingApproval else { return }
-        pendingApproval = nil
-        await perform(.approvalAccept(ApprovalAcceptPayload(binding: request.binding)), sessionId: request.binding.sessionId)
+        guard !isSending, let request = pendingApproval else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            try await perform(.approvalAccept(ApprovalAcceptPayload(binding: request.binding)), sessionId: request.binding.sessionId)
+            pendingApproval = nil
+        } catch BridgeError.http(let status, _) where status == 409 {
+            pendingApproval = nil
+            statusLine = "Request no longer valid"
+        } catch {
+            report(error)
+        }
     }
 
     func reject() async {
-        guard let request = pendingApproval else { return }
-        pendingApproval = nil
+        guard !isSending, let request = pendingApproval else { return }
+        isSending = true
+        defer { isSending = false }
         let payload = ApprovalRejectPayload(binding: request.binding, reason: "Denied from the Watch")
-        await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
+        do {
+            try await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
+            pendingApproval = nil
+        } catch BridgeError.http(let status, _) where status == 409 {
+            pendingApproval = nil
+            statusLine = "Request no longer valid"
+        } catch {
+            report(error)
+        }
     }
 
     func answer(optionId: String) async {
-        guard let question = pendingQuestion, let target = sessionId else { return }
-        pendingQuestion = nil
+        guard !isSending, let question = pendingQuestion, let target = sessionId else { return }
+        isSending = true
+        defer { isSending = false }
         let payload = QuestionAnswerPayload(questionId: question.questionId, optionId: optionId)
-        await perform(.questionAnswer(payload), sessionId: target)
+        do {
+            try await perform(.questionAnswer(payload), sessionId: target)
+            pendingQuestion = nil
+        } catch BridgeError.http(let status, _) where status == 409 {
+            pendingQuestion = nil
+            statusLine = "Request no longer valid"
+        } catch {
+            report(error)
+        }
     }
 
     func answer(text: String) async {
-        guard let question = pendingQuestion, let target = sessionId else { return }
-        pendingQuestion = nil
+        guard !isSending, let question = pendingQuestion, let target = sessionId else { return }
+        isSending = true
+        defer { isSending = false }
         let payload = QuestionAnswerPayload(questionId: question.questionId, text: text)
-        await perform(.questionAnswer(payload), sessionId: target)
+        do {
+            try await perform(.questionAnswer(payload), sessionId: target)
+            pendingQuestion = nil
+        } catch BridgeError.http(let status, _) where status == 409 {
+            pendingQuestion = nil
+            statusLine = "Request no longer valid"
+        } catch {
+            report(error)
+        }
     }
 
     func cancel() async {
         guard let target = sessionId else { return }
-        await perform(.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch")), sessionId: target)
+        do {
+            try await perform(.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch")), sessionId: target)
+        } catch {
+            report(error)
+        }
     }
 
     /// Routes free text to the pending question when there is one, and to a new prompt otherwise.
@@ -259,12 +304,8 @@ final class SessionStore {
         }
     }
 
-    private func perform(_ payload: CommandPayload, sessionId: String) async {
-        do {
-            try await client.send(payload, sessionId: sessionId)
-        } catch {
-            report(error)
-        }
+    private func perform(_ payload: CommandPayload, sessionId: String) async throws {
+        try await client.send(payload, sessionId: sessionId)
     }
 
     private func report(_ error: any Error) {

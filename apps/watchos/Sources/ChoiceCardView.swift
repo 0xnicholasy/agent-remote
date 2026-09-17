@@ -47,6 +47,7 @@ struct ChoiceCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
+        .disabled(store.isSending)
     }
 
     private var prompt: String {
