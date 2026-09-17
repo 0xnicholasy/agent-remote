@@ -6,6 +6,8 @@
  * file is the thing that needs fixing.
  */
 
+import { createHash } from "node:crypto";
+
 /** ISO 8601 timestamp in UTC, for example "2026-09-14T10:15:00.000Z". */
 export type IsoTimestamp = string;
 
@@ -348,4 +350,44 @@ export interface SessionsResponse {
 
 export interface ProjectsResponse {
   projects: Project[];
+}
+
+/**
+ * Everything a provider needs from the bridge. The bridge owns the event log and the event id
+ * sequence, so a provider is handed an emitter rather than numbering its own events. Shared
+ * here, rather than owned by one provider package, so both the bridge and every
+ * `AgentProvider` implementation depend only on the protocol, never on each other.
+ */
+export interface ProviderHost {
+  emit<T extends AgentEventType>(
+    sessionId: string,
+    type: T,
+    payload: AgentEventPayloadMap[T],
+  ): AgentEvent;
+  eventsAfter(after: number): AgentEvent[];
+  waitForChange(timeoutMs: number): Promise<void>;
+}
+
+/** Thrown when an approval or question decision's binding no longer matches the pending one. */
+export class ApprovalBindingMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApprovalBindingMismatchError";
+  }
+}
+
+/** Thrown when `sendPrompt` is called while an approval or question is still pending. */
+export class InteractionPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InteractionPendingError";
+  }
+}
+
+/** Shared TTL for a pending approval before it expires. */
+export const APPROVAL_TTL_MS = 5 * 60 * 1000;
+
+/** Hashes the exact action text shown to the user, so a binding can be checked against it. */
+export function digest(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex").slice(0, 32)}`;
 }

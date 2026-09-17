@@ -1,19 +1,24 @@
 import Ajv2020 from "ajv/dist/2020";
 import addFormats from "ajv-formats";
-import type {
-  AgentEvent,
-  AgentEventEnvelope,
-  AgentEventPayloadMap,
-  AgentEventType,
-  Command,
-  CommandResponse,
-  EventsResponse,
-  ProjectsResponse,
-  Session,
-  SessionsResponse,
+import {
+  digest,
+  type AgentEvent,
+  type AgentEventEnvelope,
+  type AgentEventPayloadMap,
+  type AgentEventType,
+  type AgentProvider,
+  type Command,
+  type CommandResponse,
+  type EventsResponse,
+  type Project,
+  type ProjectsResponse,
+  type ProviderHost,
+  type Session,
+  type SessionsResponse,
 } from "@agentremote/protocol";
+import { ClaudeProvider } from "@agentremote/provider-claude";
 
-import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, type ProviderHost } from "./providers/mock";
+import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider } from "./providers/mock";
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
@@ -32,12 +37,29 @@ const validateCommand = ajv.compile<Command>(commandSchema);
 const MAX_WAIT_SECONDS = 30;
 const DEFAULT_PORT = 8787;
 
+/** The bootstrap hook every provider offers so `createBridge` can seed a demo session without
+ * going through `createSession` (which would emit `session.started` before anyone is
+ * listening). Not part of the public `AgentProvider` contract. */
+interface SeedableProvider extends AgentProvider {
+  seedSession(session: Session): void;
+}
+
 export interface Bridge {
   /** The request handler, usable directly in tests or through `Bun.serve`. */
   fetch(request: Request): Promise<Response>;
   /** The seeded session, exposed so callers do not have to guess its identifier. */
   readonly session: Session;
-  readonly provider: MockProvider;
+  readonly provider: AgentProvider;
+}
+
+// Derives a stable project id from an absolute directory: the basename for readability, plus
+// a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
+// both named "app") never collide.
+function projectIdFor(dir: string): string {
+  const base = dir.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
+  const slug = base.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
+  const suffix = digest(dir).replace("sha256:", "").slice(0, 8);
+  return `prj_${slug}_${suffix}`;
 }
 
 // `unknown` is genuinely the right type here: this helper serialises whatever a route hands
@@ -51,6 +73,7 @@ function json(body: unknown, status = 200): Response {
 }
 
 export function createBridge(): Bridge {
+  const providerId = (process.env.AGENTREMOTE_PROVIDER ?? "mock").trim() || "mock";
   const log: AgentEvent[] = [];
   const waiters = new Set<() => void>();
   const processed = new Map<string, CommandResponse>();
@@ -78,7 +101,7 @@ export function createBridge(): Bridge {
       const event = {
         eventId: nextEventId++,
         sessionId,
-        provider: "mock",
+        provider: providerId,
         type,
         timestamp: new Date().toISOString(),
         payload,
@@ -105,11 +128,25 @@ export function createBridge(): Bridge {
     },
   };
 
-  const provider = new MockProvider(host);
+  let provider: SeedableProvider;
+  let seedProjectId: string;
+  if (providerId === "claude") {
+    const dirs = (process.env.AGENTREMOTE_PROJECT_DIRS ?? process.cwd())
+      .split(",")
+      .map((dir) => dir.trim())
+      .filter((dir) => dir.length > 0);
+    const projects: Project[] = dirs.map((dir) => ({ id: projectIdFor(dir), name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir, path: dir }));
+    provider = new ClaudeProvider(host, { projects });
+    seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
+  } else {
+    provider = new MockProvider(host);
+    seedProjectId = "prj_demo";
+  }
+
   const now = new Date().toISOString();
   const session: Session = {
     id: "ses_seed",
-    projectId: "prj_demo",
+    projectId: seedProjectId,
     provider: provider.id,
     state: "idle",
     createdAt: now,
