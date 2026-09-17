@@ -144,6 +144,11 @@ export function createBridge(): Bridge {
     }
   }
 
+  async function sessionExists(sessionId: string): Promise<boolean> {
+    const sessions = await provider.listSessions();
+    return sessions.some((session) => session.id === sessionId);
+  }
+
   async function handleCommand(request: Request): Promise<Response> {
     // The body is untrusted network input: parse it as unknown JSON first (never asserted as
     // Command) and let the ajv schema validator, not a type cast, decide whether it is one.
@@ -168,8 +173,7 @@ export function createBridge(): Bridge {
     // every other command type must reference a session that actually exists, otherwise a typo
     // session id would emit orphan events no one is listening for.
     if (command.type !== "session.create") {
-      const sessions = await provider.listSessions();
-      if (!sessions.some((session) => session.id === command.sessionId)) {
+      if (!(await sessionExists(command.sessionId))) {
         return json({ error: "invalid_command", details: [{ instancePath: "/sessionId", message: `unknown sessionId: ${command.sessionId}` }] }, 400);
       }
     }
@@ -250,6 +254,9 @@ export function createBridge(): Bridge {
       const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
       if (request.method === "POST" && cancelMatch !== null) {
         const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
+        if (!(await sessionExists(sessionId))) {
+          return json({ error: "unknown_session" }, 404);
+        }
         await provider.cancel(sessionId);
         return json({ cancelled: true, sessionId });
       }
