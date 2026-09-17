@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentremote.dev/schema/command.schema.json",
+  "title": "Command",
+  "description": "One command sent by an Apple client to the Mac Agent Bridge. The payload shape is determined by the type field.",
+  "type": "object",
+  "properties": {
+    "commandId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Client generated UUID used as the idempotency key."
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "prompt.send",
+        "approval.accept",
+        "approval.reject",
+        "session.cancel",
+        "question.answer",
+        "session.create"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "commandId",
+    "sessionId",
+    "type",
+    "timestamp",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "const": "prompt.send"
+        },
+        "payload": {
+          "$ref": "#/$defs/promptSend"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "approval.accept"
+        },
+        "payload": {
+          "$ref": "#/$defs/approvalAccept"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "approval.reject"
+        },
+        "payload": {
+          "$ref": "#/$defs/approvalReject"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "session.cancel"
+        },
+        "payload": {
+          "$ref": "#/$defs/sessionCancel"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "question.answer"
+        },
+        "payload": {
+          "$ref": "#/$defs/questionAnswer"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "session.create"
+        },
+        "payload": {
+          "$ref": "#/$defs/sessionCreate"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    }
+  ],
+  "$defs": {
+    "approvalBinding": {
+      "type": "object",
+      "properties": {
+        "approvalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "toolCallId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actionDigest": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "approvalId",
+        "sessionId",
+        "turnId",
+        "toolCallId",
+        "actionDigest",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "promptSend": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "approvalAccept": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/approvalBinding"
+        }
+      },
+      "required": [
+        "binding"
+      ],
+      "additionalProperties": false
+    },
+    "approvalReject": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/approvalBinding"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "binding"
+      ],
+      "additionalProperties": false
+    },
+    "sessionCancel": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "questionAnswer": {
+      "type": "object",
+      "properties": {
+        "questionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "optionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "questionId"
+      ],
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": ["optionId"]
+        },
+        {
+          "required": ["text"]
+        }
+      ]
+    },
+    "sessionCreate": {
+      "type": "object",
+      "description": "Asks the bridge to start a new session. The envelope sessionId is a client generated placeholder; the real identifier is returned in the command response.",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "projectId",
+        "provider"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

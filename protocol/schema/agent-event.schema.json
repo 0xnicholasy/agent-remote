@@ -1,0 +1,748 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentremote.dev/schema/agent-event.schema.json",
+  "title": "AgentEvent",
+  "description": "One event published by the Mac Agent Bridge. The payload shape is determined by the type field.",
+  "type": "object",
+  "properties": {
+    "eventId": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing integer assigned per bridge."
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the AgentProvider that produced the event."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "session.started",
+        "session.completed",
+        "turn.started",
+        "turn.completed",
+        "agent.thinking",
+        "agent.message",
+        "file.read",
+        "file.modified",
+        "command.started",
+        "command.output",
+        "command.completed",
+        "approval.requested",
+        "approval.resolved",
+        "question.requested",
+        "question.answered",
+        "error",
+        "usage.updated"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "eventId",
+    "sessionId",
+    "provider",
+    "type",
+    "timestamp",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "const": "session.started"
+        },
+        "payload": {
+          "$ref": "#/$defs/sessionStarted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "session.completed"
+        },
+        "payload": {
+          "$ref": "#/$defs/sessionCompleted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "turn.started"
+        },
+        "payload": {
+          "$ref": "#/$defs/turnStarted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "turn.completed"
+        },
+        "payload": {
+          "$ref": "#/$defs/turnCompleted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "agent.thinking"
+        },
+        "payload": {
+          "$ref": "#/$defs/agentThinking"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "agent.message"
+        },
+        "payload": {
+          "$ref": "#/$defs/agentMessage"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "file.read"
+        },
+        "payload": {
+          "$ref": "#/$defs/fileRead"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "file.modified"
+        },
+        "payload": {
+          "$ref": "#/$defs/fileModified"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "command.started"
+        },
+        "payload": {
+          "$ref": "#/$defs/commandStarted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "command.output"
+        },
+        "payload": {
+          "$ref": "#/$defs/commandOutput"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "command.completed"
+        },
+        "payload": {
+          "$ref": "#/$defs/commandCompleted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "approval.requested"
+        },
+        "payload": {
+          "$ref": "#/$defs/approvalRequested"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "approval.resolved"
+        },
+        "payload": {
+          "$ref": "#/$defs/approvalResolved"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "question.requested"
+        },
+        "payload": {
+          "$ref": "#/$defs/questionRequested"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "question.answered"
+        },
+        "payload": {
+          "$ref": "#/$defs/questionAnswered"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "payload": {
+          "$ref": "#/$defs/error"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "usage.updated"
+        },
+        "payload": {
+          "$ref": "#/$defs/usageUpdated"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    }
+  ],
+  "$defs": {
+    "approvalBinding": {
+      "type": "object",
+      "properties": {
+        "approvalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "toolCallId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actionDigest": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "approvalId",
+        "sessionId",
+        "turnId",
+        "toolCallId",
+        "actionDigest",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "sessionStarted": {
+      "type": "object",
+      "properties": {
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projectId",
+        "resumed"
+      ],
+      "additionalProperties": false
+    },
+    "sessionCompleted": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "cancelled",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "turnStarted": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId"
+      ],
+      "additionalProperties": false
+    },
+    "turnCompleted": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId"
+      ],
+      "additionalProperties": false
+    },
+    "agentThinking": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "agentMessage": {
+      "type": "object",
+      "description": "The assistant's visible reply text, distinct from agent.thinking's transient status text.",
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "const": "assistant"
+        },
+        "text": {
+          "type": "string"
+        },
+        "final": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "messageId",
+        "role",
+        "text",
+        "final"
+      ],
+      "additionalProperties": false
+    },
+    "fileRead": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "fileModified": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "changeType": {
+          "type": "string",
+          "enum": [
+            "created",
+            "modified",
+            "deleted"
+          ]
+        },
+        "linesAdded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "linesRemoved": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "changeType"
+      ],
+      "additionalProperties": false
+    },
+    "commandStarted": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cwd": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "executionId",
+        "command"
+      ],
+      "additionalProperties": false
+    },
+    "commandOutput": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stream": {
+          "type": "string",
+          "enum": [
+            "stdout",
+            "stderr"
+          ]
+        },
+        "chunk": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "executionId",
+        "stream",
+        "chunk"
+      ],
+      "additionalProperties": false
+    },
+    "commandCompleted": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exitCode": {
+          "type": "integer"
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "executionId",
+        "exitCode"
+      ],
+      "additionalProperties": false
+    },
+    "approvalRequested": {
+      "type": "object",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/approvalBinding"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "command",
+            "file.write",
+            "network",
+            "other"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string"
+        },
+        "spokenSummary": {
+          "type": "string",
+          "description": "Short plain sentence the bridge composes for text-to-speech, e.g. 'Claude wants to run npm test. Allow or deny?'"
+        }
+      },
+      "required": [
+        "binding",
+        "kind",
+        "title"
+      ],
+      "additionalProperties": false
+    },
+    "approvalResolved": {
+      "type": "object",
+      "properties": {
+        "approvalId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "accepted",
+            "rejected",
+            "expired"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "approvalId",
+        "decision"
+      ],
+      "additionalProperties": false
+    },
+    "questionRequested": {
+      "type": "object",
+      "properties": {
+        "questionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "id",
+              "label"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "allowFreeText": {
+          "type": "boolean"
+        },
+        "spokenSummary": {
+          "type": "string",
+          "description": "Short plain sentence the bridge composes for text-to-speech."
+        }
+      },
+      "required": [
+        "questionId",
+        "turnId",
+        "text",
+        "options",
+        "allowFreeText"
+      ],
+      "additionalProperties": false
+    },
+    "questionAnswered": {
+      "type": "object",
+      "properties": {
+        "questionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "answer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "questionId",
+        "answer"
+      ],
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fatal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "fatal"
+      ],
+      "additionalProperties": false
+    },
+    "usageUpdated": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "costUsd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
