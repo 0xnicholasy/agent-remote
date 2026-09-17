@@ -267,4 +267,14 @@ describe("bridge HTTP surface", () => {
     expect(body.error).toBe("invalid_command");
     expect(await eventsAfter(0)).toEqual([]);
   });
+
+  test("cancelling an unknown session id is rejected with 404", async () => {
+    const response = await bridge.fetch(
+      new Request("http://bridge.local/v1/sessions/ses_does_not_exist/cancel", { method: "POST" }),
+    );
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toBe("unknown_session");
+    expect(await eventsAfter(0)).toEqual([]);
+  });
 });
