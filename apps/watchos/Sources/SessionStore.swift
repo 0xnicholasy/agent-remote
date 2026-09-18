@@ -94,6 +94,14 @@ final class SessionStore {
             await client.setBaseURL(url)
         }
         resetCursor()
+        // A new host means a different bridge and session space: drop the old binding and
+        // its state, or every event from the new bridge's session would be silently
+        // dropped by the cross-session guard in apply() until relaunch.
+        sessionId = nil
+        transcript.removeAll()
+        pendingApproval = nil
+        pendingQuestion = nil
+        turnState = .idle
         start()
     }
 
@@ -204,9 +212,15 @@ final class SessionStore {
         case .sessionCompleted(let payload):
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
+            // The session is over: release the binding so a later session.started (bridge- or
+            // user-initiated) can rebind instead of being dropped by the guard above.
+            sessionId = nil
         case .error(let payload):
             turnState = .error
             append(.system, payload.message, id: event.eventId)
+            // Only a fatal error ends the session; a recoverable one keeps the binding so
+            // in-flight events for it are still applied.
+            if payload.fatal { sessionId = nil }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
         case .fileModified(let payload):
