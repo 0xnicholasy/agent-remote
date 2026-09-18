@@ -384,6 +384,25 @@ export class InteractionPendingError extends Error {
   }
 }
 
+/** Thrown when `sendPrompt` is called while a turn is already running, with no approval or
+ * question pending (e.g. the agent is still streaming a reply). */
+export class TurnInProgressError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TurnInProgressError";
+  }
+}
+
+/** Thrown by a mutating call (`sendPrompt`, `approve`, `reject`, `cancel`, `answerQuestion`)
+ * made against a session id that has no live conversation: it was never created, or it already
+ * terminated (crashed, cancelled, or hit an unrecoverable error). */
+export class UnknownSessionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnknownSessionError";
+  }
+}
+
 /** Shared TTL for a pending approval before it expires. */
 export const APPROVAL_TTL_MS = 5 * 60 * 1000;
 

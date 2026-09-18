@@ -14,6 +14,8 @@ import {
   ApprovalBindingMismatchError,
   digest,
   InteractionPendingError,
+  TurnInProgressError,
+  UnknownSessionError,
   type AgentCapabilities,
   type AgentProvider,
   type ApprovalBinding,
@@ -22,9 +24,16 @@ import {
   type ProviderHost,
   type QuestionAnswerPayload,
   type Session,
+  type SessionCompletedPayload,
 } from "@agentremote/protocol";
 
-export { ApprovalBindingMismatchError, InteractionPendingError, type ProviderHost } from "@agentremote/protocol";
+export {
+  ApprovalBindingMismatchError,
+  InteractionPendingError,
+  TurnInProgressError,
+  UnknownSessionError,
+  type ProviderHost,
+} from "@agentremote/protocol";
 
 /**
  * The SDK's `query` function type, injected so tests can pass a scripted fake instead of
@@ -63,6 +72,21 @@ interface Conversation {
   turnId?: string;
   pendingApproval?: PendingApproval | undefined;
   pendingQuestion?: PendingQuestion | undefined;
+  /** True from `sendPrompt` until the matching `result` message arrives. Guards against a
+   * second prompt silently overwriting `turnId` while the SDK is still streaming a reply and
+   * no approval/question is pending yet. */
+  turnInProgress: boolean;
+  /** True once the conversation has crashed, been cancelled, or hit an unrecoverable error.
+   * Checked by anything still in flight (a queued `canUseTool` call waiting on the interaction
+   * lock) so it can bail out instead of opening a new interaction on a dead conversation. The
+   * conversation is also removed from `this.conversations` at the same time, so any later call
+   * that looks it up by session id sees it as unknown rather than merely "terminal". */
+  terminal: boolean;
+  /** Serializes `canUseTool`/`AskUserQuestion` requests so the SDK's parallel tool calls occupy
+   * `pendingApproval`/`pendingQuestion` one at a time instead of overwriting each other. Each
+   * interaction chains onto this promise and only resolves it once the interaction itself has
+   * been resolved (approved, rejected, answered, cancelled, or terminated). */
+  interactionLock: Promise<void>;
 }
 
 /** A minimal never-ending async iterable a provider can push messages into, so one `query()`
@@ -95,6 +119,10 @@ function createPushableIterable<T>(): { iterable: AsyncIterable<T>; push: (item:
   };
 
   return { iterable, push };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function userMessage(text: string): SDKUserMessage {
@@ -146,11 +174,12 @@ export class ClaudeProvider implements AgentProvider {
   /** Registers a session the bridge already knows about and starts its conversation, without
    * emitting `session.started`. Mirrors `MockProvider.seedSession`. */
   seedSession(session: Session): void {
-    this.sessions.set(session.id, session);
     const project = this.projects.find((candidate) => candidate.id === session.projectId);
-    if (project !== undefined) {
-      this.startConversation(session.id, project);
+    if (project === undefined) {
+      throw new Error(`unknown projectId: ${session.projectId}`);
     }
+    this.sessions.set(session.id, session);
+    this.startConversation(session.id, project);
   }
 
   async listProjects(): Promise<Project[]> {
@@ -195,9 +224,13 @@ export class ClaudeProvider implements AgentProvider {
         `session ${sessionId} has a pending question ${conversation.pendingQuestion.questionId}; resolve or cancel it first`,
       );
     }
+    if (conversation.turnInProgress) {
+      throw new TurnInProgressError(`session ${sessionId} has a turn in progress; wait for it to complete first`);
+    }
 
     const turnId = `trn_${++this.counter}`;
     conversation.turnId = turnId;
+    conversation.turnInProgress = true;
     this.host.emit(sessionId, "turn.started", { turnId, prompt: text });
     conversation.push(userMessage(text));
   }
@@ -223,19 +256,19 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   async cancel(sessionId: string): Promise<void> {
-    const conversation = this.conversations.get(sessionId);
-    if (conversation !== undefined) {
-      if (conversation.pendingApproval !== undefined) {
-        conversation.pendingApproval.resolve({ behavior: "deny", message: "cancelled", interrupt: true });
-        conversation.pendingApproval = undefined;
-      }
-      if (conversation.pendingQuestion !== undefined) {
-        conversation.pendingQuestion.resolve({ behavior: "deny", message: "cancelled", interrupt: true });
-        conversation.pendingQuestion = undefined;
-      }
+    // Mirrors approve/reject: an unknown session id throws rather than emitting a phantom
+    // session.completed for a session that never existed.
+    const conversation = this.requireConversation(sessionId);
+    try {
       await conversation.queryHandle.interrupt();
+    } catch (error) {
+      this.host.emit(sessionId, "error", {
+        code: "provider_error",
+        message: `interrupt failed: ${errorMessage(error)}`,
+        fatal: false,
+      });
     }
-    this.host.emit(sessionId, "session.completed", { reason: "cancelled" });
+    await this.terminateConversation(sessionId, conversation, "cancelled");
   }
 
   async answerQuestion(sessionId: string, answer: QuestionAnswerPayload): Promise<void> {
@@ -277,7 +310,7 @@ export class ClaudeProvider implements AgentProvider {
   private requireConversation(sessionId: string): Conversation {
     const conversation = this.conversations.get(sessionId);
     if (conversation === undefined) {
-      throw new Error(`no conversation for session ${sessionId}`);
+      throw new UnknownSessionError(`no conversation for session ${sessionId}`);
     }
     return conversation;
   }
@@ -291,22 +324,104 @@ export class ClaudeProvider implements AgentProvider {
       ...(this.permissionMode === undefined ? {} : { permissionMode: this.permissionMode }),
     };
     const queryHandle = this.queryFn({ prompt: iterable, options });
-    const conversation: Conversation = { projectId: project.id, cwd: project.path, queryHandle, push };
+    const conversation: Conversation = {
+      projectId: project.id,
+      cwd: project.path,
+      queryHandle,
+      push,
+      turnInProgress: false,
+      terminal: false,
+      interactionLock: Promise.resolve(),
+    };
     this.conversations.set(sessionId, conversation);
     void this.pumpMessages(sessionId, queryHandle);
+  }
+
+  /**
+   * Ends a conversation for good: resolves any pending approval/question with a deny so the SDK
+   * does not hang, disposes the query handle, and removes the conversation so later
+   * `sendPrompt`/`approve`/`reject`/`cancel`/`answerQuestion` calls see an unknown session
+   * instead of silently succeeding or hanging. Idempotent, so it is safe to call from `cancel`,
+   * from the `pumpMessages` crash path, and from a `handleMessage` failure without risking a
+   * double `session.completed`.
+   */
+  private async terminateConversation(
+    sessionId: string,
+    conversation: Conversation,
+    reason: SessionCompletedPayload["reason"],
+  ): Promise<void> {
+    if (conversation.terminal) {
+      return;
+    }
+    // Set before resolving the pendings below: a loop awaiting one of those resolves (the
+    // multi-question AskUserQuestion loop) re-checks this flag as soon as it wakes up, so it
+    // must already be true by then rather than racing the resolve.
+    conversation.terminal = true;
+    conversation.turnInProgress = false;
+    if (conversation.pendingApproval !== undefined) {
+      conversation.pendingApproval.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
+      conversation.pendingApproval = undefined;
+    }
+    if (conversation.pendingQuestion !== undefined) {
+      conversation.pendingQuestion.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
+      conversation.pendingQuestion = undefined;
+    }
+    try {
+      // `Query` extends `AsyncGenerator`; `.return()` is its close/dispose method (there is no
+      // separate `close()` on the interface) and stops the underlying subprocess.
+      await conversation.queryHandle.return(undefined);
+    } catch {
+      // Best effort: the generator/process may already be gone.
+    }
+    this.conversations.delete(sessionId);
+    this.host.emit(sessionId, "session.completed", { reason });
+  }
+
+  /** Chains `fn` onto the conversation's interaction lock so a second concurrent
+   * `canUseTool`/`AskUserQuestion` request waits for the current one to be fully resolved
+   * before it can occupy `pendingApproval`/`pendingQuestion`. Preserves the protocol's
+   * one-pending-interaction-per-session contract instead of building a queue of visible
+   * pendings. */
+  private withInteractionLock<T>(conversation: Conversation, fn: () => Promise<T>): Promise<T> {
+    const previous = conversation.interactionLock;
+    const run = previous.then(fn, fn);
+    conversation.interactionLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private async pumpMessages(sessionId: string, queryHandle: Query): Promise<void> {
     try {
       for await (const message of queryHandle) {
-        this.handleMessage(sessionId, message);
+        try {
+          this.handleMessage(sessionId, message);
+        } catch (error) {
+          // Distinct from the SDK/transport failure below: this is a bug in our own mapping of
+          // an otherwise healthy message, not the agent process failing.
+          this.host.emit(sessionId, "error", {
+            code: "message_handling_error",
+            message: errorMessage(error),
+            fatal: true,
+          });
+          const conversation = this.conversations.get(sessionId);
+          if (conversation !== undefined) {
+            await this.terminateConversation(sessionId, conversation, "error");
+          }
+          return;
+        }
       }
     } catch (error) {
       this.host.emit(sessionId, "error", {
         code: "provider_error",
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage(error),
         fatal: true,
       });
+      const conversation = this.conversations.get(sessionId);
+      if (conversation !== undefined) {
+        await this.terminateConversation(sessionId, conversation, "error");
+      }
     }
   }
 
@@ -329,48 +444,112 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     if (message.type === "result") {
-      this.host.emit(sessionId, "turn.completed", {
-        turnId,
-        durationMs: message.duration_ms,
-        summary: message.subtype === "success" ? message.result : message.subtype,
-      });
+      if (conversation !== undefined) {
+        conversation.turnInProgress = false;
+      }
       if (message.subtype === "success") {
+        this.host.emit(sessionId, "turn.completed", {
+          turnId,
+          durationMs: message.duration_ms,
+          summary: message.result,
+        });
         this.host.emit(sessionId, "usage.updated", {
           inputTokens: message.usage.input_tokens,
           outputTokens: message.usage.output_tokens,
           ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
         });
+        return;
       }
+
+      // An SDKResultError (error_max_turns, error_during_execution, ...) is a normal, non-thrown
+      // turn outcome, not a pump crash: surface it as an `error` event rather than a
+      // turn.completed, but usage is still meaningful and must still be reported.
+      this.host.emit(sessionId, "error", {
+        code: message.subtype,
+        message: message.errors.length > 0 ? message.errors.join("; ") : message.subtype,
+        fatal: false,
+      });
+      this.host.emit(sessionId, "usage.updated", {
+        inputTokens: message.usage.input_tokens,
+        outputTokens: message.usage.output_tokens,
+        ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
+      });
     }
   }
 
-  private async handleCanUseTool(
+  private handleCanUseTool(
     sessionId: string,
     toolName: string,
     input: Record<string, unknown>,
     callOptions: Parameters<CanUseTool>[2],
   ): Promise<PermissionResult> {
     const conversation = this.requireConversation(sessionId);
+    return this.withInteractionLock(conversation, () =>
+      this.runInteraction(sessionId, conversation, toolName, input, callOptions),
+    );
+  }
+
+  /** Runs one `canUseTool`/`AskUserQuestion` interaction to completion, holding the
+   * conversation's interaction lock for its whole duration (including the wait for the user's
+   * decision). Only one of these runs at a time per conversation. */
+  private async runInteraction(
+    sessionId: string,
+    conversation: Conversation,
+    toolName: string,
+    input: Record<string, unknown>,
+    callOptions: Parameters<CanUseTool>[2],
+  ): Promise<PermissionResult> {
+    if (conversation.terminal) {
+      return { behavior: "deny", message: "session terminated", interrupt: true };
+    }
     const turnId = conversation.turnId ?? `trn_${++this.counter}`;
 
     if (toolName === "AskUserQuestion") {
       // Narrowed by toolName: the SDK only shapes `input` this way for this tool.
       const askInput = input as unknown as AskUserQuestionInput;
-      const first = askInput.questions[0];
-      if (first === undefined) {
+      const questions = askInput.questions;
+      // The SDK's type guarantees 1-4 questions, but `input` arrives as an untyped
+      // `Record<string, unknown>` cast past that guarantee, so still check defensively.
+      if (questions[0] === undefined) {
         return { behavior: "deny", message: "no question supplied" };
       }
-      const questionId = `qst_${++this.counter}`;
-      return new Promise<PermissionResult>((resolve) => {
-        conversation.pendingQuestion = { questionId, turnId, resolve, question: first };
-        this.host.emit(sessionId, "question.requested", {
-          questionId,
-          turnId,
-          text: first.question,
-          options: first.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
-          allowFreeText: true,
+      // The SDK allows 1-4 questions per call. Each is asked in turn through the same pending
+      // slot (never more than one visible pending at once), and every answer is folded into a
+      // single AskUserQuestionOutput-shaped result.
+      const answers: Record<string, string> = {};
+      let freeTextResponse: string | undefined;
+      for (const question of questions) {
+        if (conversation.terminal) {
+          return { behavior: "deny", message: "session terminated", interrupt: true };
+        }
+        const questionId = `qst_${++this.counter}`;
+        const result = await new Promise<PermissionResult>((resolve) => {
+          conversation.pendingQuestion = { questionId, turnId, resolve, question };
+          this.host.emit(sessionId, "question.requested", {
+            questionId,
+            turnId,
+            text: question.question,
+            options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
+            allowFreeText: true,
+          });
         });
-      });
+        if (result.behavior === "deny") {
+          return result;
+        }
+        const updated = result.updatedInput as { answers?: Record<string, string>; response?: string } | undefined;
+        Object.assign(answers, updated?.answers);
+        if (updated?.response !== undefined) {
+          freeTextResponse = updated.response;
+        }
+      }
+      return {
+        behavior: "allow",
+        updatedInput: {
+          questions,
+          answers,
+          ...(freeTextResponse === undefined ? {} : { response: freeTextResponse }),
+        },
+      };
     }
 
     const actionText = callOptions.title ?? `${toolName} ${JSON.stringify(input)}`;

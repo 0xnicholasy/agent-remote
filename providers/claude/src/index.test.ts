@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { ApprovalBindingMismatchError, InteractionPendingError } from "@agentremote/protocol";
+import {
+  ApprovalBindingMismatchError,
+  InteractionPendingError,
+  TurnInProgressError,
+  UnknownSessionError,
+} from "@agentremote/protocol";
 import type { AgentEvent, ApprovalBinding, Project, ProviderHost } from "@agentremote/protocol";
 import type { CanUseTool, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -51,6 +56,22 @@ function fakeResult(result: string, usage = { input_tokens: 10, output_tokens: 2
   } as unknown as SDKMessage;
 }
 
+function fakeResultError(
+  subtype: "error_max_turns" | "error_during_execution",
+  errors: string[] = [],
+  usage = { input_tokens: 5, output_tokens: 7 },
+): SDKMessage {
+  return {
+    type: "result",
+    subtype,
+    duration_ms: 5,
+    usage,
+    total_cost_usd: 0.02,
+    errors,
+    uuid: "res_err",
+  } as unknown as SDKMessage;
+}
+
 function callOpts(overrides: Partial<Parameters<CanUseTool>[2]> = {}): Parameters<CanUseTool>[2] {
   return {
     signal: new AbortController().signal,
@@ -61,16 +82,24 @@ function callOpts(overrides: Partial<Parameters<CanUseTool>[2]> = {}): Parameter
 }
 
 /** Turns a plain async generator into a test double for `Query`: the provider only calls
- * `for await` iteration and `interrupt()` on it, so the rest of the real `Query` interface is
- * cast past rather than implemented. */
-function asQuery(gen: AsyncGenerator<SDKMessage, void>): { query: Query; interrupted: () => boolean } {
+ * `for await` iteration, `interrupt()`, and `return()` (disposal) on it, so the rest of the
+ * real `Query` interface is cast past rather than implemented. */
+function asQuery(
+  gen: AsyncGenerator<SDKMessage, void>,
+): { query: Query; interrupted: () => boolean; returned: () => boolean } {
   let interrupted = false;
+  let returned = false;
   const query = gen as unknown as Query;
   query.interrupt = async () => {
     interrupted = true;
     return undefined;
   };
-  return { query, interrupted: () => interrupted };
+  const originalReturn = gen.return.bind(gen);
+  query.return = ((value: void) => {
+    returned = true;
+    return originalReturn(value);
+  }) as Query["return"];
+  return { query, interrupted: () => interrupted, returned: () => returned };
 }
 
 function project(id: string, path: string): Project {
@@ -87,6 +116,19 @@ function bindingOf(events: AgentEvent[]): ApprovalBinding {
     throw new Error("no approval.requested event was emitted");
   }
   return requested.payload.binding;
+}
+
+function allBindings(events: AgentEvent[]): ApprovalBinding[] {
+  return events
+    .filter((event) => event.type === "approval.requested")
+    .map((event) => (event.type === "approval.requested" ? event.payload.binding : undefined))
+    .filter((binding): binding is ApprovalBinding => binding !== undefined);
+}
+
+/** A malformed `assistant` message missing the `content` array `handleMessage` reads, so it
+ * exercises a bug in our own message mapping rather than an SDK/transport failure. */
+function malformedAssistant(): SDKMessage {
+  return { type: "assistant", message: {}, uuid: "bad" } as unknown as SDKMessage;
 }
 
 async function readPrompt(prompt: AsyncIterable<SDKUserMessage>): Promise<SDKUserMessage> {
@@ -381,7 +423,41 @@ describe("ClaudeProvider", () => {
 
     expect(captured.interrupted?.()).toBe(true);
     expect(events.map((event) => event.type)).toContain("session.completed");
-    await expect(provider.approve(session.id, binding)).rejects.toBeInstanceOf(ApprovalBindingMismatchError);
+    // The whole conversation is torn down on cancel (not just the one approval), so a decision
+    // made afterwards is against an unknown session rather than a stale binding.
+    await expect(provider.approve(session.id, binding)).rejects.toBeInstanceOf(UnknownSessionError);
+  });
+
+  test("cancel() still terminates the session when interrupt() throws (E-011)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      const wrapped = asQuery(gen());
+      wrapped.query.interrupt = async () => {
+        throw new Error("interrupt boom");
+      };
+      return wrapped.query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    await provider.cancel(session.id);
+
+    expect(events.find((event) => event.type === "error")?.payload).toMatchObject({
+      code: "provider_error",
+      message: "interrupt failed: interrupt boom",
+      fatal: false,
+    });
+    expect(events.map((event) => event.type)).toContain("session.completed");
+    await expect(provider.sendPrompt(session.id, "another one")).rejects.toBeInstanceOf(UnknownSessionError);
   });
 
   test("cancelling one session leaves another session's pending approval intact", async () => {
@@ -422,5 +498,321 @@ describe("ClaudeProvider", () => {
         (event) => event.sessionId === sessionB.id && event.type === "approval.resolved" && event.payload.decision === "accepted",
       ),
     ).toBe(true);
+  });
+
+  test("two concurrent canUseTool calls are served one after the other (E-008)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const [first, second] = await Promise.all([
+          args.options!.canUseTool!("Bash", { command: "ls" }, callOpts({ toolUseID: "tc_a" })),
+          args.options!.canUseTool!("Bash", { command: "pwd" }, callOpts({ toolUseID: "tc_b" })),
+        ]);
+        yield fakeResult(`${first?.behavior}/${second?.behavior}`);
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run two things");
+    await delay();
+
+    // Only the first interaction is visible; the second is queued behind the lock rather than
+    // overwriting the first's pending slot.
+    expect(allBindings(events)).toHaveLength(1);
+
+    await provider.approve(session.id, allBindings(events)[0]!);
+    await delay();
+
+    expect(allBindings(events)).toHaveLength(2);
+    await provider.approve(session.id, allBindings(events)[1]!);
+    await delay();
+
+    expect(events.map((event) => event.type)).toContain("turn.completed");
+  });
+
+  test("a pump crash clears pending interactions, terminates the session, and blocks further prompts (E-001)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        void args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        throw new Error("sdk process crashed");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    const types = events.map((event) => event.type);
+    expect(types).toContain("approval.requested");
+    expect(types).toContain("error");
+    expect(types).toContain("session.completed");
+    expect(events.find((event) => event.type === "session.completed")?.payload).toMatchObject({ reason: "error" });
+
+    await expect(provider.sendPrompt(session.id, "another one")).rejects.toBeInstanceOf(UnknownSessionError);
+  });
+
+  test("a handleMessage bug is reported distinctly from an SDK crash and still terminates cleanly (E-002)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield malformedAssistant();
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "hi");
+    await delay();
+
+    expect(events.find((event) => event.type === "error")?.payload).toMatchObject({ code: "message_handling_error" });
+    expect(events.map((event) => event.type)).toContain("session.completed");
+  });
+
+  test("sendPrompt during an in-flight turn with no pending interaction throws (E-004)", async () => {
+    let releaseTurn: (() => void) | undefined;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "first");
+    await delay();
+
+    await expect(provider.sendPrompt(session.id, "second")).rejects.toBeInstanceOf(TurnInProgressError);
+
+    releaseTurn?.();
+  });
+
+  test("an SDKResultError emits an error event and usage, not turn.completed (E-007)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeResultError("error_max_turns", ["ran out of turns"]);
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const types = events.map((event) => event.type);
+    expect(types).not.toContain("turn.completed");
+    expect(types).toContain("usage.updated");
+    expect(events.find((event) => event.type === "error")?.payload).toMatchObject({
+      code: "error_max_turns",
+      message: "ran out of turns",
+    });
+  });
+
+  test("cancel disposes the query handle (E-010)", async () => {
+    const captured: { returned?: () => boolean } = {};
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      const wrapped = asQuery(gen());
+      captured.returned = wrapped.returned;
+      return wrapped.query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    await provider.cancel(session.id);
+
+    expect(captured.returned?.()).toBe(true);
+  });
+
+  test("seedSession throws for an unknown projectId (E-003)", () => {
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: (() => {
+        throw new Error("query() should not be called");
+      }) as unknown as QueryFn,
+    });
+    const now = new Date().toISOString();
+
+    expect(() =>
+      provider.seedSession({
+        id: "ses_seed",
+        projectId: "does-not-exist",
+        provider: "claude",
+        state: "idle",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).toThrow(/unknown projectId/);
+  });
+
+  test("a multi-question AskUserQuestion is asked sequentially and merged into one result (E-009)", async () => {
+    let updatedInputSeen: unknown;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const input = {
+          questions: [
+            {
+              question: "Which library?",
+              header: "Library",
+              options: [
+                { label: "date-fns", description: "smaller" },
+                { label: "luxon", description: "more features" },
+              ],
+              multiSelect: false,
+            },
+            {
+              question: "Which runtime?",
+              header: "Runtime",
+              options: [
+                { label: "bun", description: "fast" },
+                { label: "node", description: "standard" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        };
+        const result = await args.options!.canUseTool!("AskUserQuestion", input, callOpts());
+        if (result === null) {
+          throw new Error("canUseTool returned null");
+        }
+        if (result.behavior === "allow") {
+          updatedInputSeen = result.updatedInput;
+        }
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "pick things");
+    await delay();
+
+    const firstRequested = events.find((event) => event.type === "question.requested");
+    if (firstRequested === undefined || firstRequested.type !== "question.requested") {
+      throw new Error("missing first question.requested event");
+    }
+    expect(firstRequested.payload.text).toBe("Which library?");
+
+    await provider.answerQuestion(session.id, { questionId: firstRequested.payload.questionId, optionId: "opt_1" });
+    await delay();
+
+    const secondRequested = events.filter((event) => event.type === "question.requested")[1];
+    if (secondRequested === undefined || secondRequested.type !== "question.requested") {
+      throw new Error("missing second question.requested event");
+    }
+    expect(secondRequested.payload.text).toBe("Which runtime?");
+
+    await provider.answerQuestion(session.id, { questionId: secondRequested.payload.questionId, optionId: "opt_0" });
+    await delay();
+
+    expect(updatedInputSeen).toMatchObject({
+      answers: { "Which library?": "luxon", "Which runtime?": "bun" },
+    });
+  });
+
+  test("answerQuestion throws for an unknown questionId (E-012)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const input = {
+          questions: [
+            {
+              question: "Which library?",
+              header: "Library",
+              options: [
+                { label: "date-fns", description: "smaller" },
+                { label: "luxon", description: "more features" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        };
+        await args.options!.canUseTool!("AskUserQuestion", input, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "pick a library");
+    await delay();
+
+    await expect(
+      provider.answerQuestion(session.id, { questionId: "bogus", optionId: "opt_0" }),
+    ).rejects.toThrow(/no pending question/);
+  });
+
+  test("approve/reject/sendPrompt throw for an unknown session id (E-013)", async () => {
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: (() => {
+        throw new Error("query() should not be called");
+      }) as unknown as QueryFn,
+    });
+    const fakeBinding: ApprovalBinding = {
+      approvalId: "apr_x",
+      sessionId: "ses_missing",
+      turnId: "trn_x",
+      toolCallId: "tc_x",
+      actionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+
+    await expect(provider.sendPrompt("ses_missing", "hi")).rejects.toBeInstanceOf(UnknownSessionError);
+    await expect(provider.approve("ses_missing", fakeBinding)).rejects.toBeInstanceOf(UnknownSessionError);
+    await expect(provider.reject("ses_missing", fakeBinding)).rejects.toBeInstanceOf(UnknownSessionError);
+  });
+
+  test("cancel throws for an unknown session id instead of emitting a phantom session.completed (E-014)", async () => {
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: (() => {
+        throw new Error("query() should not be called");
+      }) as unknown as QueryFn,
+    });
+
+    await expect(provider.cancel("ses_missing")).rejects.toBeInstanceOf(UnknownSessionError);
+    expect(events.some((event) => event.type === "session.completed")).toBe(false);
   });
 });

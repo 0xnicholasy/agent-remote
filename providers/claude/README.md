@@ -20,6 +20,12 @@ process per turn. It never attaches to a terminal the user already has open.
   `process.cwd()` when unset.
 - Claude Code's own auth (`claude login` / an API key in the environment) must already be
   configured; the adapter does not manage authentication.
+- `AGENTREMOTE_HOST` — the hostname `bridge/src/server.ts` binds to. When unset and
+  `AGENTREMOTE_PROVIDER=claude`, the bridge defaults to `127.0.0.1` (loopback only), because
+  the claude provider executes real tool calls on this host and the bridge itself has no
+  authentication. Set `AGENTREMOTE_HOST` explicitly to bind elsewhere; binding the claude
+  provider to a non-loopback address logs a startup warning. The mock provider is left on
+  Bun's own default (all interfaces) when `AGENTREMOTE_HOST` is unset, unchanged from before.
 
 ## `canUseTool` mapping
 

@@ -1,14 +1,19 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type {
+  AgentCapabilities,
   AgentEvent,
+  AgentProvider,
   ApprovalBinding,
   Command,
   CommandResponse,
   EventsResponse,
+  Project,
+  ProviderHost,
+  Session,
   SessionsResponse,
 } from "@agentremote/protocol";
 
-import { createBridge, type Bridge } from "./server";
+import { createBridge, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
 
 let bridge: Bridge;
 
@@ -305,5 +310,154 @@ describe("bridge HTTP surface", () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toBe("unknown_session");
     expect(await eventsAfter(0)).toEqual([]);
+  });
+});
+
+/** A scripted stand-in for `ClaudeProvider`, wired through `createClaudeProvider` so these
+ * tests exercise the AGENTREMOTE_PROVIDER=claude branch without spawning the real SDK
+ * subprocess. */
+class StubClaudeProvider implements AgentProvider {
+  readonly id = "claude";
+  readonly capabilities: AgentCapabilities = {
+    approvals: true,
+    questions: true,
+    resumeSession: false,
+    streaming: true,
+    usage: true,
+  };
+
+  private readonly host: ProviderHost;
+  private readonly projects: Project[];
+  private readonly sessions = new Map<string, Session>();
+
+  constructor(host: ProviderHost, options: { projects: Project[] }) {
+    this.host = host;
+    this.projects = options.projects;
+  }
+
+  seedSession(session: Session): void {
+    this.sessions.set(session.id, session);
+  }
+
+  async listProjects(): Promise<Project[]> {
+    return this.projects;
+  }
+
+  async listSessions(): Promise<Session[]> {
+    return [...this.sessions.values()];
+  }
+
+  async createSession(projectId: string): Promise<Session> {
+    const now = new Date().toISOString();
+    const session: Session = {
+      id: "ses_stub",
+      projectId,
+      provider: this.id,
+      state: "idle",
+      createdAt: now,
+      updatedAt: now,
+      title: "stub",
+    };
+    this.sessions.set(session.id, session);
+    return session;
+  }
+
+  async sendPrompt(sessionId: string): Promise<void> {
+    this.host.emit(sessionId, "agent.message", {
+      messageId: "msg_stub",
+      role: "assistant",
+      text: "stub reply",
+      final: true,
+    });
+  }
+
+  async approve(): Promise<void> {}
+  async reject(): Promise<void> {}
+  async cancel(): Promise<void> {}
+  async answerQuestion(): Promise<void> {}
+
+  subscribe(): AsyncIterable<AgentEvent> {
+    return {
+      [Symbol.asyncIterator]() {
+        return { next: () => Promise.resolve({ done: true as const, value: undefined }) };
+      },
+    };
+  }
+}
+
+describe("AGENTREMOTE_PROVIDER selection", () => {
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+
+  function restoreProviderEnv(): void {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+  }
+
+  test("an unrecognized AGENTREMOTE_PROVIDER throws at startup instead of defaulting to mock", () => {
+    process.env.AGENTREMOTE_PROVIDER = "claud"; // typo
+    try {
+      expect(() => createBridge()).toThrow(/invalid AGENTREMOTE_PROVIDER/);
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("AGENTREMOTE_PROVIDER=claude wires the claude provider and tags events with provider.id", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+      };
+      const claudeBridge = createBridge(options);
+      expect(claudeBridge.session.provider).toBe("claude");
+      expect(claudeBridge.provider.id).toBe("claude");
+
+      const response = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            commandId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            sessionId: claudeBridge.session.id,
+            type: "prompt.send",
+            timestamp: new Date().toISOString(),
+            payload: { text: "hello" },
+          } satisfies Command),
+        }),
+      );
+      expect(response.status).toBe(200);
+
+      const eventsResponse = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/events?after=0"),
+      );
+      const body = (await eventsResponse.json()) as EventsResponse;
+      expect(body.events.length).toBeGreaterThan(0);
+      for (const event of body.events) {
+        expect(event.provider).toBe("claude");
+      }
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+});
+
+describe("resolveBindHost", () => {
+  test("defaults the claude provider to loopback when AGENTREMOTE_HOST is unset", () => {
+    expect(resolveBindHost("claude", undefined)).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
+  });
+
+  test("leaves the mock provider on Bun's own default when AGENTREMOTE_HOST is unset", () => {
+    expect(resolveBindHost("mock", undefined)).toEqual({ hostname: undefined, warnNoAuth: false });
+  });
+
+  test("an explicit non-loopback AGENTREMOTE_HOST with the claude provider warns", () => {
+    expect(resolveBindHost("claude", "0.0.0.0")).toEqual({ hostname: "0.0.0.0", warnNoAuth: true });
+  });
+
+  test("an explicit loopback AGENTREMOTE_HOST never warns", () => {
+    expect(resolveBindHost("claude", "127.0.0.1")).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
   });
 });

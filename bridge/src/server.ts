@@ -52,6 +52,21 @@ export interface Bridge {
   readonly provider: AgentProvider;
 }
 
+/** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
+ * test wire `AGENTREMOTE_PROVIDER=claude` without constructing a real `ClaudeProvider`, which
+ * would spawn the Claude Agent SDK's subprocess. Production code never passes it, so the
+ * default keeps building the real `ClaudeProvider` exactly as before. */
+export interface CreateBridgeOptions {
+  createClaudeProvider?: (host: ProviderHost, options: { projects: Project[] }) => SeedableProvider;
+}
+
+const VALID_PROVIDER_IDS = ["mock", "claude"] as const;
+type ValidProviderId = (typeof VALID_PROVIDER_IDS)[number];
+
+function isValidProviderId(value: string): value is ValidProviderId {
+  return (VALID_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
 // Derives a stable project id from an absolute directory: the basename for readability, plus
 // a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
 // both named "app") never collide.
@@ -72,8 +87,19 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-export function createBridge(): Bridge {
-  const providerId = (process.env.AGENTREMOTE_PROVIDER ?? "mock").trim() || "mock";
+export function createBridge(options: CreateBridgeOptions = {}): Bridge {
+  // Only an UNSET AGENTREMOTE_PROVIDER may default to "mock". A set-but-unrecognized value
+  // (e.g. a typo) must fail startup loudly instead of silently running MockProvider, which
+  // would look like a healthy real session to anyone watching the event log.
+  const rawProviderId = process.env.AGENTREMOTE_PROVIDER;
+  const providerId = rawProviderId === undefined ? "mock" : rawProviderId.trim();
+  if (!isValidProviderId(providerId)) {
+    throw new Error(
+      `invalid AGENTREMOTE_PROVIDER: "${providerId}" (valid values: ${VALID_PROVIDER_IDS.join(", ")})`,
+    );
+  }
+  console.log(`Agent Remote bridge selected provider: ${providerId}`);
+
   const log: AgentEvent[] = [];
   const waiters = new Set<() => void>();
   const processed = new Map<string, CommandResponse>();
@@ -81,6 +107,10 @@ export function createBridge(): Bridge {
   // the same time cannot both pass the `processed` check and run the command twice.
   const inFlight = new Set<string>();
   let nextEventId = 1;
+  // Set once the provider instance exists (below); host.emit reads it lazily so an event's
+  // `provider` tag always reflects what actually constructed/ran the session (provider.id),
+  // never the raw env string, and so it can never diverge from session.provider.
+  let emittedProviderId: string = providerId;
 
   const wake = (): void => {
     for (const waiter of [...waiters]) {
@@ -101,7 +131,7 @@ export function createBridge(): Bridge {
       const event = {
         eventId: nextEventId++,
         sessionId,
-        provider: providerId,
+        provider: emittedProviderId,
         type,
         timestamp: new Date().toISOString(),
         payload,
@@ -136,12 +166,14 @@ export function createBridge(): Bridge {
       .map((dir) => dir.trim())
       .filter((dir) => dir.length > 0);
     const projects: Project[] = dirs.map((dir) => ({ id: projectIdFor(dir), name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir, path: dir }));
-    provider = new ClaudeProvider(host, { projects });
+    const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
+    provider = createClaudeProvider(host, { projects });
     seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
   } else {
     provider = new MockProvider(host);
     seedProjectId = "prj_demo";
   }
+  emittedProviderId = provider.id;
 
   const now = new Date().toISOString();
   const session: Session = {
@@ -303,10 +335,41 @@ export function createBridge(): Bridge {
   };
 }
 
+/** Picks the hostname `Bun.serve` binds to, and whether that choice needs a no-auth warning.
+ * Exported for testing; `import.meta.main` below is the only production caller.
+ *
+ * `AGENTREMOTE_HOST` unset: the claude provider (which executes real host tool calls) defaults
+ * to loopback-only; the mock provider is left on Bun's own default (binds all interfaces),
+ * matching its pre-existing behavior. `AGENTREMOTE_HOST` set explicitly always wins, and a
+ * non-loopback value with the claude provider is flagged since this bridge has no auth. */
+export function resolveBindHost(
+  providerId: string,
+  envHost: string | undefined,
+): { hostname: string | undefined; warnNoAuth: boolean } {
+  const explicit = envHost?.trim();
+  if (explicit !== undefined && explicit.length > 0) {
+    const isLoopback = explicit === "127.0.0.1" || explicit === "localhost" || explicit === "::1";
+    return { hostname: explicit, warnNoAuth: providerId === "claude" && !isLoopback };
+  }
+  if (providerId === "claude") {
+    return { hostname: "127.0.0.1", warnNoAuth: false };
+  }
+  return { hostname: undefined, warnNoAuth: false };
+}
+
 if (import.meta.main) {
   const bridge = createBridge();
+  const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);
+  if (warnNoAuth) {
+    console.warn(
+      `Agent Remote bridge is binding to ${hostname} with the claude provider: this endpoint ` +
+        "has no authentication and can execute real tool calls on this host. Set " +
+        "AGENTREMOTE_HOST=127.0.0.1 (or run it behind a trusted network/proxy) unless this is intentional.",
+    );
+  }
   const server = Bun.serve({
     port: Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10),
+    ...(hostname === undefined ? {} : { hostname }),
     idleTimeout: 0,
     fetch: bridge.fetch,
   });
