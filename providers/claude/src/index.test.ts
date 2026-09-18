@@ -882,6 +882,60 @@ describe("ClaudeProvider", () => {
     ).rejects.toThrow(/no pending question/);
   });
 
+  test("answerQuestion throws for an unknown optionId and leaves the question pending (E-018)", async () => {
+    let updatedInputSeen: unknown;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const input = {
+          questions: [
+            {
+              question: "Which library?",
+              header: "Library",
+              options: [
+                { label: "date-fns", description: "smaller" },
+                { label: "luxon", description: "more features" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        };
+        const result = await args.options!.canUseTool!("AskUserQuestion", input, callOpts());
+        if (result === null) {
+          throw new Error("canUseTool returned null");
+        }
+        if (result.behavior === "allow") {
+          updatedInputSeen = result.updatedInput;
+        }
+        yield fakeResult("picked");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "pick a library");
+    await delay();
+    const requested = events.find((event) => event.type === "question.requested");
+    if (requested === undefined || requested.type !== "question.requested") {
+      throw new Error("no question.requested event was emitted");
+    }
+
+    await expect(
+      provider.answerQuestion(session.id, { questionId: requested.payload.questionId, optionId: "opt_9" }),
+    ).rejects.toBeInstanceOf(ApprovalBindingMismatchError);
+
+    // The canUseTool promise must still be unresolved: the invalid answer did not consume the
+    // pending question, so updatedInputSeen was never set and the SDK's turn hasn't advanced.
+    expect(updatedInputSeen).toBeUndefined();
+
+    await provider.answerQuestion(session.id, { questionId: requested.payload.questionId, optionId: "opt_1" });
+    await delay();
+    expect(updatedInputSeen).toMatchObject({ answers: { "Which library?": "luxon" } });
+  });
+
   test("approve/reject/sendPrompt throw for an unknown session id (E-013)", async () => {
     const { host } = createHost();
     const provider = new ClaudeProvider(host, {

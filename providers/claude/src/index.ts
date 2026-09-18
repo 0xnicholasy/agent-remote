@@ -277,11 +277,22 @@ export class ClaudeProvider implements AgentProvider {
     if (pending === undefined || pending.questionId !== answer.questionId) {
       throw new ApprovalBindingMismatchError(`no pending question ${answer.questionId}`);
     }
+    let optionLabel: string | undefined;
+    if (answer.optionId !== undefined) {
+      const match = /^opt_(\d+)$/.exec(answer.optionId);
+      const optionIndex = match === undefined || match === null ? undefined : Number.parseInt(match[1] as string, 10);
+      optionLabel = optionIndex === undefined ? undefined : pending.question.options[optionIndex]?.label;
+      if (optionLabel === undefined) {
+        // Invalid optionId: leave pendingQuestion intact so the caller can retry with a valid
+        // one instead of silently losing the interaction to a typo or stale option list.
+        throw new ApprovalBindingMismatchError(
+          `option ${answer.optionId} is not a valid option for question ${answer.questionId}`,
+        );
+      }
+    }
     conversation.pendingQuestion = undefined;
 
-    const optionIndex = answer.optionId === undefined ? undefined : Number.parseInt(answer.optionId.replace("opt_", ""), 10);
-    const optionLabel = optionIndex === undefined ? undefined : pending.question.options[optionIndex]?.label;
-    const answerText = optionLabel ?? answer.text ?? answer.optionId ?? "";
+    const answerText = optionLabel ?? answer.text ?? "";
 
     this.host.emit(sessionId, "question.answered", { questionId: answer.questionId, answer: answerText });
 
