@@ -18,6 +18,13 @@ actor FakeBridgeClient: BridgeClientProtocol {
     /// One page per call, returned in order; the last one repeats once the list is exhausted.
     private var eventsResults: [Result<EventsPage, any Error & Sendable>] = []
     private(set) var sentCalls: [RecordedSend] = []
+    private var eventsCallCount = 0
+    /// When set, the events() call at this 1-based count suspends until `openGate()` is
+    /// called, so a test can simulate a network response that lands late (e.g. after a
+    /// reconnect superseded the task that issued it).
+    private var gateAtCall: Int?
+    private var gateOpened = false
+    private var gateContinuation: CheckedContinuation<Void, Never>?
 
     func setSendResult(_ result: SendResult) {
         sendResult = result
@@ -28,13 +35,39 @@ actor FakeBridgeClient: BridgeClientProtocol {
         eventsResults = results
     }
 
+    /// Arms the events() call at `callNumber` (1-based) to block until `openGate()` runs.
+    func gateEventsCall(_ callNumber: Int) {
+        gateAtCall = callNumber
+    }
+
+    func openGate() {
+        gateOpened = true
+        gateContinuation?.resume()
+        gateContinuation = nil
+    }
+
     func setBaseURL(_ url: URL) async {}
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
-        guard !eventsResults.isEmpty else {
-            return EventsPage(events: [], lastEventId: after, skipped: 0)
+        eventsCallCount += 1
+        let currentCall = eventsCallCount
+        let result: Result<EventsPage, any Error & Sendable>
+        if eventsResults.isEmpty {
+            result = .success(EventsPage(events: [], lastEventId: after, skipped: 0))
+        } else if eventsResults.count > 1 {
+            result = eventsResults.removeFirst()
+        } else {
+            result = eventsResults[0]
         }
-        let result = eventsResults.count > 1 ? eventsResults.removeFirst() : eventsResults[0]
+        if gateAtCall == currentCall {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if gateOpened {
+                    continuation.resume()
+                } else {
+                    gateContinuation = continuation
+                }
+            }
+        }
         switch result {
         case .success(let page): return page
         case .failure(let error): throw error
@@ -231,5 +264,68 @@ final class SessionStoreDecisionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(store.statusKind, .reconnecting)
+    }
+
+    /// Regression for R-008: a poll task superseded by reconnect() must not be able to
+    /// re-bind sessionId when its in-flight request finally resolves.
+    func testStalePollGenerationDoesNotRebindAfterReconnect() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+
+        let sessionAStarted = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_a", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        let staleSessionAStarted = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_a", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+
+        // Call 1 (generation 1) binds sess_a. Call 2 (generation 1, still) is gated so it
+        // stays in flight while reconnect() moves the store to generation 2. Call 3+
+        // (generation 2) sees an empty page, so generation 2 never rebinds on its own.
+        await client.setEventsResults([
+            .success(EventsPage(events: [sessionAStarted], lastEventId: 1, skipped: 0)),
+            .success(EventsPage(events: [staleSessionAStarted], lastEventId: 2, skipped: 0)),
+            .success(EventsPage(events: [], lastEventId: 2, skipped: 0)),
+        ])
+        await client.gateEventsCall(2)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(store.sessionId, "sess_a")
+
+        await store.reconnect()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(store.sessionId)
+
+        // Let the gated (generation 1) call finally resolve with sess_a's session.started.
+        await client.openGate()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertNil(store.sessionId, "a stale generation's late response must not rebind sessionId")
+    }
+
+    /// Regression for R-007: a session ending while a card is pending must clear that card
+    /// too, or answer()/approve() would silently no-op forever once sessionId is nil.
+    func testSessionCompletedClearsPendingApproval() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let completed = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "session.completed",
+            "payload": { "reason": "completed" }
+        }
+        """)
+        store.apply(completed)
+
+        XCTAssertNil(store.pendingApproval)
     }
 }

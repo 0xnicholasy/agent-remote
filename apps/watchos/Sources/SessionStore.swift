@@ -65,6 +65,9 @@ final class SessionStore {
     let speaker: Speaker
     @ObservationIgnored private let client: any BridgeClientProtocol
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
+    /// tell its own results are stale even when it was not cancelled in time to observe it.
+    @ObservationIgnored private var pollGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
 
@@ -83,13 +86,16 @@ final class SessionStore {
 
     func start() {
         guard pollTask == nil else { return }
-        pollTask = Task { [weak self] in await self?.pollLoop() }
+        pollGeneration += 1
+        let generation = pollGeneration
+        pollTask = Task { [weak self] in await self?.pollLoop(generation: generation) }
     }
 
     /// Applies a new host from Settings and restarts the poll loop against it.
     func reconnect() async {
         pollTask?.cancel()
         pollTask = nil
+        pollGeneration += 1
         if let url = BridgeClient.parseBaseURL(hostText) {
             await client.setBaseURL(url)
         }
@@ -105,11 +111,14 @@ final class SessionStore {
         start()
     }
 
-    private func pollLoop() async {
+    private func pollLoop(generation: Int) async {
         var backoff: Double = 1
         while !Task.isCancelled {
             do {
                 let response = try await client.events(after: lastSeenEventId, wait: 20)
+                // The old task's request can complete successfully after reconnect() moved on
+                // to a new generation; drop it so it cannot re-bind sessionId to a stale bridge.
+                if Task.isCancelled || generation != pollGeneration { return }
                 connected = true
                 backoff = 1
                 // A restarted bridge numbers events from one again, so a cursor from the
@@ -213,14 +222,22 @@ final class SessionStore {
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
             // The session is over: release the binding so a later session.started (bridge- or
-            // user-initiated) can rebind instead of being dropped by the guard above.
+            // user-initiated) can rebind instead of being dropped by the guard above. A
+            // terminal session has no bridge left to ack a pending card, so drop it here too
+            // instead of leaving it stuck on screen with a no-op approve()/answer().
             sessionId = nil
+            pendingApproval = nil
+            pendingQuestion = nil
         case .error(let payload):
             turnState = .error
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
             // in-flight events for it are still applied.
-            if payload.fatal { sessionId = nil }
+            if payload.fatal {
+                sessionId = nil
+                pendingApproval = nil
+                pendingQuestion = nil
+            }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
         case .fileModified(let payload):
@@ -270,9 +287,11 @@ final class SessionStore {
         defer { isSending = false }
         do {
             try await perform(.approvalAccept(ApprovalAcceptPayload(binding: request.binding)), sessionId: request.binding.sessionId)
-            pendingApproval = nil
+            // A newer approval could have arrived (via the poll loop) while this send was in
+            // flight; only clear the card if it's still the one this call answered.
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingApproval = nil
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
             statusLine = "Request no longer valid"
             statusKind = .requestInvalid
         } catch {
@@ -287,9 +306,9 @@ final class SessionStore {
         let payload = ApprovalRejectPayload(binding: request.binding, reason: "Denied from the Watch")
         do {
             try await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
-            pendingApproval = nil
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingApproval = nil
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
             statusLine = "Request no longer valid"
             statusKind = .requestInvalid
         } catch {
@@ -304,9 +323,11 @@ final class SessionStore {
         let payload = QuestionAnswerPayload(questionId: question.questionId, optionId: optionId)
         do {
             try await perform(.questionAnswer(payload), sessionId: target)
-            pendingQuestion = nil
+            // A newer question could have arrived while this send was in flight; only clear
+            // the card if it's still the one this call answered.
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingQuestion = nil
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
             statusLine = "Request no longer valid"
             statusKind = .requestInvalid
         } catch {
@@ -321,9 +342,9 @@ final class SessionStore {
         let payload = QuestionAnswerPayload(questionId: question.questionId, text: text)
         do {
             try await perform(.questionAnswer(payload), sessionId: target)
-            pendingQuestion = nil
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingQuestion = nil
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
             statusLine = "Request no longer valid"
             statusKind = .requestInvalid
         } catch {
