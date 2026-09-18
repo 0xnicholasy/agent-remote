@@ -103,12 +103,19 @@ final class SessionStore {
         // A new host means a different bridge and session space: drop the old binding and
         // its state, or every event from the new bridge's session would be silently
         // dropped by the cross-session guard in apply() until relaunch.
-        sessionId = nil
+        resetSessionState()
         transcript.removeAll()
-        pendingApproval = nil
-        pendingQuestion = nil
         turnState = .idle
         start()
+    }
+
+    /// Clears the session binding and its pending UI state. Shared by reconnect(), the terminal
+    /// event branches in apply(), and the bridge-restart path in pollLoop() so a session that no
+    /// longer has a live bridge behind it never leaves a stuck card or a dangling binding.
+    private func resetSessionState() {
+        sessionId = nil
+        pendingApproval = nil
+        pendingQuestion = nil
     }
 
     private func pollLoop(generation: Int) async {
@@ -125,6 +132,10 @@ final class SessionStore {
                 // previous run would silently skip the whole new log.
                 if response.lastEventId < lastSeenEventId {
                     resetCursor()
+                    // The bridge restarted under the same host: the old sessionId (and any
+                    // pending card bound to it) has no live session behind it anymore, or it
+                    // would be stuck forever behind the cross-session guard in apply().
+                    resetSessionState()
                     continue
                 }
                 for event in response.events {
@@ -141,7 +152,7 @@ final class SessionStore {
                     statusKind = .connected
                 }
             } catch {
-                if Task.isCancelled { return }
+                if Task.isCancelled || generation != pollGeneration { return }
                 connected = false
                 statusLine = "Reconnecting: \(error)"
                 statusKind = .reconnecting
@@ -225,18 +236,14 @@ final class SessionStore {
             // user-initiated) can rebind instead of being dropped by the guard above. A
             // terminal session has no bridge left to ack a pending card, so drop it here too
             // instead of leaving it stuck on screen with a no-op approve()/answer().
-            sessionId = nil
-            pendingApproval = nil
-            pendingQuestion = nil
+            resetSessionState()
         case .error(let payload):
             turnState = .error
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
             // in-flight events for it are still applied.
             if payload.fatal {
-                sessionId = nil
-                pendingApproval = nil
-                pendingQuestion = nil
+                resetSessionState()
             }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
@@ -256,10 +263,18 @@ final class SessionStore {
     @discardableResult
     func createSession() async -> String? {
         let placeholder = UUID().uuidString
+        let generation = pollGeneration
         let payload = SessionCreatePayload(projectId: SessionStore.projectId, provider: SessionStore.provider)
         do {
             let response = try await client.send(.sessionCreate(payload), sessionId: placeholder)
-            if let created = response.sessionId { sessionId = created }
+            // reconnect() or a session.started for another session can run during the await
+            // above; only bind if nothing has claimed sessionId since, or a poll loop hasn't
+            // moved on to a new generation, otherwise this would rebind to a stale session.
+            if let created = response.sessionId,
+               generation == pollGeneration,
+               sessionId == nil || sessionId == created {
+                sessionId = created
+            }
             return response.sessionId
         } catch {
             report(error)

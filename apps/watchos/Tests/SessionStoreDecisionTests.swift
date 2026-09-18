@@ -25,6 +25,12 @@ actor FakeBridgeClient: BridgeClientProtocol {
     private var gateAtCall: Int?
     private var gateOpened = false
     private var gateContinuation: CheckedContinuation<Void, Never>?
+    /// Same idea as the events() gate above, but for send() -- lets a test hold a
+    /// createSession() response in flight while a reconnect() runs concurrently.
+    private var sendGateAtCall: Int?
+    private var sendGateOpened = false
+    private var sendGateContinuation: CheckedContinuation<Void, Never>?
+    private var sendCallCount = 0
 
     func setSendResult(_ result: SendResult) {
         sendResult = result
@@ -44,6 +50,17 @@ actor FakeBridgeClient: BridgeClientProtocol {
         gateOpened = true
         gateContinuation?.resume()
         gateContinuation = nil
+    }
+
+    /// Arms the send() call at `callNumber` (1-based) to block until `openSendGate()` runs.
+    func gateSendCall(_ callNumber: Int) {
+        sendGateAtCall = callNumber
+    }
+
+    func openSendGate() {
+        sendGateOpened = true
+        sendGateContinuation?.resume()
+        sendGateContinuation = nil
     }
 
     func setBaseURL(_ url: URL) async {}
@@ -76,6 +93,17 @@ actor FakeBridgeClient: BridgeClientProtocol {
 
     func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
         sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId))
+        sendCallCount += 1
+        let currentCall = sendCallCount
+        if sendGateAtCall == currentCall {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if sendGateOpened {
+                    continuation.resume()
+                } else {
+                    sendGateContinuation = continuation
+                }
+            }
+        }
         switch sendResult {
         case .success(let response): return response
         case .failure(let error): throw error
@@ -327,5 +355,48 @@ final class SessionStoreDecisionTests: XCTestCase {
         store.apply(completed)
 
         XCTAssertNil(store.pendingApproval)
+    }
+
+    /// Regression for the round-2 critical finding: createSession()'s response can land after
+    /// reconnect() has already bumped pollGeneration and cleared sessionId. The stale create
+    /// must not rebind sessionId to a session the new generation knows nothing about.
+    func testCreateSessionDoesNotRebindAfterConcurrentReconnect() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        await client.gateSendCall(1)
+
+        let createTask = Task { await store.createSession() }
+        // Give createSession() a chance to reach the gated send before reconnect() runs.
+        try await Task.sleep(for: .milliseconds(20))
+
+        await store.reconnect()
+        XCTAssertNil(store.sessionId)
+
+        await client.openSendGate()
+        let created = await createTask.value
+
+        XCTAssertEqual(created, "sess_created", "the call itself should still succeed")
+        XCTAssertNil(store.sessionId, "a stale generation's create response must not rebind sessionId")
+    }
+
+    /// Regression for the round-2 high finding: a bridge restart (event cursor rollback) must
+    /// clear the session binding and any pending card the same way reconnect() does, or the
+    /// store stays bound to a dead session with a stuck approval.
+    func testBridgeRestartRollbackClearsSessionAndPendingApproval() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        XCTAssertEqual(store.sessionId, "sess_1")
+        XCTAssertNotNil(store.pendingApproval)
+
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 100_000, skipped: 0)),
+            .success(EventsPage(events: [], lastEventId: 1, skipped: 0)),
+        ])
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.sessionId, "bridge restart must drop the dead session's binding")
+        XCTAssertNil(store.pendingApproval, "bridge restart must not leave a stuck approval card")
     }
 }
