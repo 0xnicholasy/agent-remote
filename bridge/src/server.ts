@@ -72,7 +72,7 @@ function isValidProviderId(value: string): value is ValidProviderId {
 // Derives a stable project id from an absolute directory: the basename for readability, plus
 // a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
 // both named "app") never collide.
-function projectIdFor(dir: string): string {
+export function projectIdFor(dir: string): string {
   const base = dir.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
   const slug = base.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
   const suffix = digest(dir).replace("sha256:", "").slice(0, 8);
@@ -163,7 +163,12 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   let provider: SeedableProvider;
   let seedProjectId: string;
   if (providerId === "claude") {
-    const dirs = (process.env.AGENTREMOTE_PROJECT_DIRS ?? process.cwd())
+    // A blank or whitespace-only value is treated the same as unset, so a stray
+    // `AGENTREMOTE_PROJECT_DIRS=` in the environment falls back to cwd instead of leaving
+    // projects empty and crashing seedSession's later "unknown projectId" lookup.
+    const rawDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+    const dirsSource = rawDirs === undefined || rawDirs.trim().length === 0 ? process.cwd() : rawDirs;
+    const dirs = dirsSource
       .split(",")
       .map((dir) => dir.trim())
       .filter((dir) => dir.length > 0);
@@ -220,6 +225,23 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     return sessions.some((session) => session.id === sessionId);
   }
 
+  // Maps the protocol error types a provider call can throw to the HTTP response both
+  // handleCommand and the cancel route return for them, so the two call sites stay in sync.
+  // Returns undefined for anything else, which the caller should rethrow.
+  function mapProviderError(error: unknown): Response | undefined {
+    if (
+      error instanceof ApprovalBindingMismatchError ||
+      error instanceof InteractionPendingError ||
+      error instanceof TurnInProgressError
+    ) {
+      return json({ error: error.message }, 409);
+    }
+    if (error instanceof UnknownSessionError) {
+      return json({ error: error.message }, 404);
+    }
+    return undefined;
+  }
+
   async function handleCommand(request: Request): Promise<Response> {
     // The body is untrusted network input: parse it as unknown JSON first (never asserted as
     // Command) and let the ajv schema validator, not a type cast, decide whether it is one.
@@ -249,8 +271,20 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       }
     }
 
-    if (command.type === "session.create" && command.payload.provider !== provider.id) {
-      return json({ error: `unknown provider: ${command.payload.provider}` }, 400);
+    if (command.type === "session.create") {
+      if (command.payload.provider !== provider.id) {
+        return json({ error: `unknown provider: ${command.payload.provider}` }, 400);
+      }
+      const projects = await provider.listProjects();
+      if (!projects.some((project) => project.id === command.payload.projectId)) {
+        return json(
+          {
+            error: "invalid_command",
+            details: [{ instancePath: "/payload/projectId", message: `unknown projectId: ${command.payload.projectId}` }],
+          },
+          400,
+        );
+      }
     }
 
     const previous = processed.get(command.commandId);
@@ -269,15 +303,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       createdSessionId = await execute(command);
     } catch (error) {
       inFlight.delete(command.commandId);
-      if (
-        error instanceof ApprovalBindingMismatchError ||
-        error instanceof InteractionPendingError ||
-        error instanceof TurnInProgressError
-      ) {
-        return json({ error: error.message }, 409);
-      }
-      if (error instanceof UnknownSessionError) {
-        return json({ error: error.message }, 404);
+      const mapped = mapProviderError(error);
+      if (mapped !== undefined) {
+        return mapped;
       }
       throw error;
     }
@@ -335,7 +363,17 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         if (!(await sessionExists(sessionId))) {
           return json({ error: "unknown_session" }, 404);
         }
-        await provider.cancel(sessionId);
+        try {
+          await provider.cancel(sessionId);
+        } catch (error) {
+          // sessionExists and cancel are two separate provider calls, so a session that existed
+          // a moment ago can still disappear (or otherwise fail to cancel) before this runs.
+          const mapped = mapProviderError(error);
+          if (mapped !== undefined) {
+            return mapped;
+          }
+          throw error;
+        }
         return json({ cancelled: true, sessionId });
       }
 

@@ -6,7 +6,7 @@ import {
   UnknownSessionError,
 } from "@agentremote/protocol";
 import type { AgentEvent, ApprovalBinding, Project, ProviderHost } from "@agentremote/protocol";
-import type { CanUseTool, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeProvider, type QueryFn } from "./index";
 
@@ -969,5 +969,188 @@ describe("ClaudeProvider", () => {
 
     await expect(provider.cancel("ses_missing")).rejects.toBeInstanceOf(UnknownSessionError);
     expect(events.some((event) => event.type === "session.completed")).toBe(false);
+  });
+
+  test("an approval title for a Bash call reflects the command, matching the digested actionText (R-028)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "rm -rf /tmp/x" }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "clean up");
+    await delay();
+
+    const requested = events.find((event) => event.type === "approval.requested");
+    expect(requested?.payload).toMatchObject({ title: "rm -rf /tmp/x" });
+  });
+
+  test("a generator that ends mid-turn without a result is treated as an abnormal teardown (R-031)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        // Ends without ever yielding a `result`: the turn is still in progress.
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const types = events.map((event) => event.type);
+    expect(types).toContain("error");
+    expect(types).toContain("session.completed");
+    expect((await provider.listSessions()).map((s) => s.id)).not.toContain(session.id);
+  });
+
+  test("a generator that ends right after a normal result does not tear the session down (R-031)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeResult("done");
+        // Generator ends normally right after the result: `turnInProgress` is already false here.
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const types = events.map((event) => event.type);
+    expect(types).toContain("turn.completed");
+    expect(types).not.toContain("session.completed");
+    expect(types).not.toContain("error");
+    expect((await provider.listSessions()).map((s) => s.id)).toContain(session.id);
+  });
+
+  test("aborting a pending canUseTool call releases the interaction lock for the next call (R-032)", async () => {
+    const controller = new AbortController();
+    let secondResolved: PermissionResult | null | undefined;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const first = args.options!.canUseTool!("Bash", { command: "one" }, callOpts({ signal: controller.signal }));
+        // Let the interaction lock actually register the pending approval (emitting
+        // `approval.requested`) before aborting, so this exercises "abort while pending" rather
+        // than an abort that beats registration.
+        await delay(5);
+        controller.abort();
+        await first;
+        const second = await args.options!.canUseTool!("Bash", { command: "two" }, callOpts());
+        secondResolved = second;
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run two things");
+    await delay();
+
+    // The second call is only ever reached if the abort released the interaction lock rather
+    // than leaving `pendingApproval` occupied forever.
+    const requestedForSecond = events.find(
+      (event) => event.type === "approval.requested" && event.payload.title === "two",
+    );
+    expect(requestedForSecond).toBeDefined();
+    if (requestedForSecond !== undefined && requestedForSecond.type === "approval.requested") {
+      await provider.approve(session.id, requestedForSecond.payload.binding);
+      await delay();
+    }
+    expect(secondResolved).toMatchObject({ behavior: "allow" });
+  });
+
+  test("listSessions(projectId) filters to sessions in that project (R-037)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        // Never yields: no prompt is sent in this test, so nothing should be read from it.
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1"), project("p2", "/tmp/p2")],
+      query: queryFn,
+    });
+
+    const s1 = await provider.createSession("p1");
+    const s2 = await provider.createSession("p2");
+
+    const p1Sessions = await provider.listSessions("p1");
+    expect(p1Sessions.map((s) => s.id)).toEqual([s1.id]);
+    const p2Sessions = await provider.listSessions("p2");
+    expect(p2Sessions.map((s) => s.id)).toEqual([s2.id]);
+    const allSessions = await provider.listSessions();
+    expect(allSessions.map((s) => s.id).sort()).toEqual([s1.id, s2.id].sort());
+  });
+
+  test("session.state tracks the conversation through prompt, pending approval, approve, and result (R-038)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const result = await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult(result?.behavior === "allow" ? "ran ls" : "denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+    expect(session.state).toBe("idle");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    const midFlight = (await provider.listSessions()).find((s) => s.id === session.id);
+    expect(midFlight?.state).toBe("waiting");
+
+    const binding = bindingOf(events);
+    await provider.approve(session.id, binding);
+    await delay();
+
+    const afterResult = (await provider.listSessions()).find((s) => s.id === session.id);
+    expect(afterResult?.state).toBe("idle");
+  });
+
+  test("only the last assistant text block before the result is marked final (R-039)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeAssistant("first block", "u1");
+        yield fakeAssistant("second block", "u2");
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const messages = events.filter((event) => event.type === "agent.message");
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.payload).toMatchObject({ text: "first block", final: false });
+    expect(messages[1]?.payload).toMatchObject({ text: "second block", final: true });
   });
 });

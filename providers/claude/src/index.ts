@@ -25,6 +25,7 @@ import {
   type QuestionAnswerPayload,
   type Session,
   type SessionCompletedPayload,
+  type SessionState,
 } from "@agentremote/protocol";
 
 export {
@@ -72,6 +73,10 @@ interface Conversation {
   turnId?: string;
   pendingApproval?: PendingApproval | undefined;
   pendingQuestion?: PendingQuestion | undefined;
+  /** The most recently emitted assistant text block, held back until the next block or the
+   * turn's `result` message tells us whether it was the last one. Flushed with `final: true`
+   * only then, since "last" cannot be known at the moment a block is first seen. */
+  pendingAssistantMessage?: { messageId: string; text: string } | undefined;
   /** True from `sendPrompt` until the matching `result` message arrives. Guards against a
    * second prompt silently overwriting `turnId` while the SDK is still streaming a reply and
    * no approval/question is pending yet. */
@@ -123,6 +128,26 @@ function createPushableIterable<T>(): { iterable: AsyncIterable<T>; push: (item:
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const ACTION_TEXT_MAX_LENGTH = 200;
+
+function truncateActionText(text: string): string {
+  return text.length > ACTION_TEXT_MAX_LENGTH ? `${text.slice(0, ACTION_TEXT_MAX_LENGTH - 1)}…` : text;
+}
+
+/** Derives the text shown to the user for an approval card from the same `toolName`+`input`
+ * that `actionDigest` is computed over, so the binding the user approves always matches what
+ * they were shown. Bash surfaces the command itself; Edit/Write surface the file path; anything
+ * else falls back to the tool name plus its input, never a generic placeholder. */
+function deriveActionText(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === "Bash" && typeof input.command === "string") {
+    return truncateActionText(input.command);
+  }
+  if ((toolName === "Edit" || toolName === "Write") && typeof input.file_path === "string") {
+    return truncateActionText(input.file_path);
+  }
+  return truncateActionText(`${toolName} ${JSON.stringify(input)}`);
 }
 
 function userMessage(text: string): SDKUserMessage {
@@ -231,6 +256,7 @@ export class ClaudeProvider implements AgentProvider {
     const turnId = `trn_${++this.counter}`;
     conversation.turnId = turnId;
     conversation.turnInProgress = true;
+    this.setSessionState(sessionId, "running");
     this.host.emit(sessionId, "turn.started", { turnId, prompt: text });
     conversation.push(userMessage(text));
   }
@@ -318,6 +344,50 @@ export class ClaudeProvider implements AgentProvider {
     }
   }
 
+  /** Updates the session's reported `state` in place, or does nothing if the session was already
+   * removed (e.g. this races a concurrent termination). */
+  private setSessionState(sessionId: string, state: SessionState): void {
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) {
+      return;
+    }
+    session.state = state;
+    session.updatedAt = new Date().toISOString();
+  }
+
+  /** Awaits one `canUseTool`/`AskUserQuestion` decision, racing it against `signal` (the SDK's
+   * per-call `AbortSignal`, from `callOptions`). `register` occupies the pending slot and emits
+   * the request event; `clearPending` releases that slot. On abort — before or after `register`
+   * runs — the pending slot is cleared and this resolves with a deny, so the interaction lock is
+   * released instead of waiting forever on a decision the SDK has already given up on. */
+  private awaitInteraction(
+    signal: AbortSignal,
+    clearPending: () => void,
+    register: (settle: (result: PermissionResult) => void) => void,
+  ): Promise<PermissionResult> {
+    return new Promise<PermissionResult>((resolve) => {
+      let settled = false;
+      const settle = (result: PermissionResult): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+      const onAbort = (): void => {
+        clearPending();
+        settle({ behavior: "deny", message: "aborted", interrupt: true });
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort);
+      register(settle);
+    });
+  }
+
   /** Looks up the conversation for `sessionId`, failing closed on a conversation that is
    * mid-teardown. `terminateConversation` flips `terminal` synchronously before its first
    * `await`, so a `sendPrompt`/`approve`/`reject`/`answerQuestion` racing that teardown sees the
@@ -377,6 +447,8 @@ export class ClaudeProvider implements AgentProvider {
     // must already be true by then rather than racing the resolve.
     conversation.terminal = true;
     conversation.turnInProgress = false;
+    this.setSessionState(sessionId, reason === "error" ? "failed" : "completed");
+    this.flushPendingAssistantMessage(sessionId, conversation);
     if (conversation.pendingApproval !== undefined) {
       conversation.pendingApproval.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
       conversation.pendingApproval = undefined;
@@ -432,6 +504,21 @@ export class ClaudeProvider implements AgentProvider {
           return;
         }
       }
+      // The SDK's async generator ended without ever yielding a `result` message while a turn was
+      // still in progress. Gated on `turnInProgress` rather than merely `!terminal`: a generator
+      // that ends right after a normal successful `result` already has `turnInProgress` false and
+      // must not be treated as an abnormal teardown. Not a thrown error, but the conversation is
+      // over all the same: without this, the session and its subprocess would be left registered
+      // as alive forever.
+      const conversation = this.conversations.get(sessionId);
+      if (conversation !== undefined && !conversation.terminal && conversation.turnInProgress) {
+        this.host.emit(sessionId, "error", {
+          code: "provider_error",
+          message: "conversation ended without a result",
+          fatal: true,
+        });
+        await this.terminateConversation(sessionId, conversation, "error");
+      }
     } catch (error) {
       this.host.emit(sessionId, "error", {
         code: "provider_error",
@@ -445,6 +532,23 @@ export class ClaudeProvider implements AgentProvider {
     }
   }
 
+  /** Emits the conversation's held-back assistant text block, if any, with `final: true`. Called
+   * once we know no further assistant text will follow it in the same turn: on the terminating
+   * `result` message, or on conversation teardown when a `result` never arrives at all. */
+  private flushPendingAssistantMessage(sessionId: string, conversation: Conversation | undefined): void {
+    const pending = conversation?.pendingAssistantMessage;
+    if (pending === undefined || conversation === undefined) {
+      return;
+    }
+    conversation.pendingAssistantMessage = undefined;
+    this.host.emit(sessionId, "agent.message", {
+      messageId: pending.messageId,
+      role: "assistant",
+      text: pending.text,
+      final: true,
+    });
+  }
+
   private handleMessage(sessionId: string, message: SDKMessage): void {
     const conversation = this.conversations.get(sessionId);
     const turnId = conversation?.turnId ?? `trn_${this.counter}`;
@@ -452,20 +556,41 @@ export class ClaudeProvider implements AgentProvider {
     if (message.type === "assistant") {
       for (const block of message.message.content) {
         if (block.type === "text") {
-          this.host.emit(sessionId, "agent.message", {
-            messageId: message.uuid,
-            role: "assistant",
-            text: block.text,
-            final: true,
-          });
+          // Whether this block is the last assistant text of the turn is unknowable here: more
+          // assistant messages may still follow before the terminating `result`. Flush whatever
+          // was held back as non-final (it is now known not to be last) and hold this one back in
+          // its place, so only the block actually followed by `result` is ever marked final.
+          if (conversation !== undefined) {
+            const previous = conversation.pendingAssistantMessage;
+            if (previous !== undefined) {
+              this.host.emit(sessionId, "agent.message", {
+                messageId: previous.messageId,
+                role: "assistant",
+                text: previous.text,
+                final: false,
+              });
+            }
+            conversation.pendingAssistantMessage = { messageId: message.uuid, text: block.text };
+          } else {
+            // No conversation to hold this back against (already torn down): emit immediately,
+            // since there is nowhere to buffer it and nothing left that could still follow it.
+            this.host.emit(sessionId, "agent.message", {
+              messageId: message.uuid,
+              role: "assistant",
+              text: block.text,
+              final: true,
+            });
+          }
         }
       }
       return;
     }
 
     if (message.type === "result") {
+      this.flushPendingAssistantMessage(sessionId, conversation);
       if (conversation !== undefined) {
         conversation.turnInProgress = false;
+        this.setSessionState(sessionId, "idle");
       }
       if (message.subtype === "success") {
         this.host.emit(sessionId, "turn.completed", {
@@ -555,16 +680,23 @@ export class ClaudeProvider implements AgentProvider {
           return { behavior: "deny", message: "session terminated", interrupt: true };
         }
         const questionId = `qst_${++this.counter}`;
-        const result = await new Promise<PermissionResult>((resolve) => {
-          conversation.pendingQuestion = { questionId, turnId, resolve, question };
-          this.host.emit(sessionId, "question.requested", {
-            questionId,
-            turnId,
-            text: question.question,
-            options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
-            allowFreeText: true,
-          });
-        });
+        this.setSessionState(sessionId, "waiting");
+        const result = await this.awaitInteraction(
+          callOptions.signal,
+          () => {
+            conversation.pendingQuestion = undefined;
+          },
+          (settle) => {
+            conversation.pendingQuestion = { questionId, turnId, resolve: settle, question };
+            this.host.emit(sessionId, "question.requested", {
+              questionId,
+              turnId,
+              text: question.question,
+              options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
+              allowFreeText: true,
+            });
+          },
+        );
         if (result.behavior === "deny") {
           return result;
         }
@@ -591,7 +723,7 @@ export class ClaudeProvider implements AgentProvider {
       };
     }
 
-    const actionText = callOptions.title ?? `${toolName} ${JSON.stringify(input)}`;
+    const actionText = callOptions.title ?? deriveActionText(toolName, input);
     const approvalId = `apr_${++this.counter}`;
     const binding: ApprovalBinding = {
       approvalId,
@@ -601,16 +733,25 @@ export class ClaudeProvider implements AgentProvider {
       actionDigest: digest(actionText),
       expiresAt: new Date(Date.now() + this.approvalTtlMs).toISOString(),
     };
-    return new Promise<PermissionResult>((resolve) => {
-      conversation.pendingApproval = { binding, resolve };
-      this.host.emit(sessionId, "approval.requested", {
-        binding,
-        kind: "other",
-        title: callOptions.title ?? `Run ${toolName}`,
-        ...(callOptions.description === undefined ? {} : { detail: callOptions.description }),
-        ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
-      });
-    });
+    this.setSessionState(sessionId, "waiting");
+    return this.awaitInteraction(
+      callOptions.signal,
+      () => {
+        conversation.pendingApproval = undefined;
+      },
+      (settle) => {
+        conversation.pendingApproval = { binding, resolve: settle };
+        this.host.emit(sessionId, "approval.requested", {
+          binding,
+          kind: "other",
+          // Always the same text the digest was computed over, so the card the user sees is
+          // exactly what they are binding their decision to.
+          title: actionText,
+          ...(callOptions.description === undefined ? {} : { detail: callOptions.description }),
+          ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
+        });
+      },
+    );
   }
 
   /** Looks up the pending approval and refuses the decision unless every field of the binding

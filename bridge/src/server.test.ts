@@ -14,7 +14,7 @@ import type {
 } from "@agentremote/protocol";
 import { TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
 
-import { createBridge, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
+import { createBridge, projectIdFor, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
 
 let bridge: Bridge;
 
@@ -332,6 +332,8 @@ class StubClaudeProvider implements AgentProvider {
   private readonly sessions = new Map<string, Session>();
   /** Set by a test to make the next sendPrompt call throw instead of emitting a reply. */
   sendPromptError: Error | undefined;
+  /** Set by a test to make the next cancel call throw instead of resolving. */
+  cancelError: Error | undefined;
 
   constructor(host: ProviderHost, options: { projects: Project[] }) {
     this.host = host;
@@ -379,7 +381,11 @@ class StubClaudeProvider implements AgentProvider {
 
   async approve(): Promise<void> {}
   async reject(): Promise<void> {}
-  async cancel(): Promise<void> {}
+  async cancel(): Promise<void> {
+    if (this.cancelError !== undefined) {
+      throw this.cancelError;
+    }
+  }
   async answerQuestion(): Promise<void> {}
 
   subscribe(): AsyncIterable<AgentEvent> {
@@ -514,6 +520,124 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       expect(body.error).toBe("unknown session: " + claudeBridge.session.id);
     } finally {
       restoreProviderEnv();
+    }
+  });
+
+  test("a cancel that races the session disappearing after sessionExists is rejected with 404", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.cancelError = new UnknownSessionError("unknown session: " + claudeBridge.session.id);
+
+      const response = await claudeBridge.fetch(
+        new Request(`http://bridge.local/v1/sessions/${claudeBridge.session.id}/cancel`, { method: "POST" }),
+      );
+      expect(response.status).toBe(404);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe("unknown session: " + claudeBridge.session.id);
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("session.create with an unknown projectId is rejected with 400", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+      };
+      const claudeBridge = createBridge(options);
+
+      const response = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            commandId: "cccccccc-cccc-4ccc-8ccc-cccccccccccd",
+            sessionId: "ses_placeholder",
+            type: "session.create",
+            timestamp: new Date().toISOString(),
+            payload: { projectId: "prj_does_not_exist", provider: "claude" },
+          } satisfies Command),
+        }),
+      );
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe("invalid_command");
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+});
+
+describe("projectIdFor", () => {
+  test("produces a prj_<slug>_<hex> id built from the directory's basename and a path digest", () => {
+    const id = projectIdFor("/Users/dev/checkouts/watch-2-code");
+    expect(id).toMatch(/^prj_watch-2-code_[0-9a-f]{8}$/);
+  });
+
+  test("two directories sharing a basename get different ids", () => {
+    const first = projectIdFor("/Users/dev/one/app");
+    const second = projectIdFor("/Users/dev/two/app");
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^prj_app_[0-9a-f]{8}$/);
+    expect(second).toMatch(/^prj_app_[0-9a-f]{8}$/);
+  });
+});
+
+describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+  const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+
+  function restoreEnv(): void {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+    if (originalDirs === undefined) {
+      delete process.env.AGENTREMOTE_PROJECT_DIRS;
+    } else {
+      process.env.AGENTREMOTE_PROJECT_DIRS = originalDirs;
+    }
+  }
+
+  test("comma-separated dirs with surrounding spaces and blank entries are trimmed and registered", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    process.env.AGENTREMOTE_PROJECT_DIRS = " /repos/one , , /repos/two ,";
+    try {
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+      };
+      const claudeBridge = createBridge(options);
+      const projectsResponse = await claudeBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      const projects = ((await projectsResponse.json()) as { projects: Project[] }).projects;
+      expect(projects.map((project) => project.path)).toEqual(["/repos/one", "/repos/two"]);
+      expect(projects.map((project) => project.id)).toEqual([projectIdFor("/repos/one"), projectIdFor("/repos/two")]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("a blank AGENTREMOTE_PROJECT_DIRS falls back to cwd instead of leaving projects empty", () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    process.env.AGENTREMOTE_PROJECT_DIRS = "   ";
+    try {
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+      };
+      expect(() => createBridge(options)).not.toThrow();
+      const claudeBridge = createBridge(options);
+      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
+    } finally {
+      restoreEnv();
     }
   });
 });
