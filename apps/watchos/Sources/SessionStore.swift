@@ -136,6 +136,9 @@ final class SessionStore {
                     // pending card bound to it) has no live session behind it anymore, or it
                     // would be stuck forever behind the cross-session guard in apply().
                     resetSessionState()
+                    // The dead session's transcript belongs to a session this bridge no longer
+                    // knows about, or it would persist on screen alongside whatever starts next.
+                    transcript.removeAll()
                     continue
                 }
                 for event in response.events {
@@ -175,7 +178,11 @@ final class SessionStore {
         if case .sessionStarted = event.payload {
             // Already tracking a session: a session.started for a different id belongs to
             // someone else's session and must not reset this one's card, status, or transcript.
-            if let current = sessionId, current != event.sessionId { return }
+            if let current = sessionId, current != event.sessionId {
+                statusLine = "Ignored session \(event.sessionId) (still on \(current))"
+                statusKind = .skippedEvents
+                return
+            }
             sessionId = event.sessionId
             transcript.removeAll()
             pendingApproval = nil
@@ -270,12 +277,16 @@ final class SessionStore {
             // reconnect() or a session.started for another session can run during the await
             // above; only bind if nothing has claimed sessionId since, or a poll loop hasn't
             // moved on to a new generation, otherwise this would rebind to a stale session.
-            if let created = response.sessionId,
-               generation == pollGeneration,
-               sessionId == nil || sessionId == created {
-                sessionId = created
+            guard let created = response.sessionId,
+                  generation == pollGeneration,
+                  sessionId == nil || sessionId == created else {
+                // The rebind guard rejected this response: the id it carries is not (and must
+                // not become) the store's session, so callers like sendPrompt() must not treat
+                // it as a valid target either.
+                return nil
             }
-            return response.sessionId
+            sessionId = created
+            return created
         } catch {
             report(error)
             return nil

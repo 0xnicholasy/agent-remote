@@ -376,7 +376,7 @@ final class SessionStoreDecisionTests: XCTestCase {
         await client.openSendGate()
         let created = await createTask.value
 
-        XCTAssertEqual(created, "sess_created", "the call itself should still succeed")
+        XCTAssertNil(created, "a rejected rebind must not hand back the stale id as if it were bound")
         XCTAssertNil(store.sessionId, "a stale generation's create response must not rebind sessionId")
     }
 
@@ -435,5 +435,138 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale 409")
         XCTAssertEqual(store.statusLine, statusLineBeforeStale409, "the newer card's status line must not be stomped by the stale 409")
         XCTAssertNotEqual(store.statusKind, .requestInvalid)
+    }
+
+    /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
+    /// reconnect() moved on to a new generation while the send was in flight), the stale id it
+    /// carries must not be returned to sendPrompt() as a valid target.
+    func testCreateSessionReturnsNilWhenRebindRejected() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        await client.gateSendCall(1)
+
+        let createTask = Task { await store.createSession() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await store.reconnect()
+        await client.openSendGate()
+        let created = await createTask.value
+
+        XCTAssertNil(created, "a rejected rebind must not hand back the stale id")
+        XCTAssertNil(store.sessionId)
+    }
+
+    /// Regression for R-017: a session.started for a different id while already bound must
+    /// surface a status line instead of being dropped with no trace.
+    func testCrossSessionStartedSetsStatusLine() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let otherStarted = try decodeEvent("""
+        {
+            "eventId": 5, "sessionId": "sess_other", "provider": "mock",
+            "timestamp": "2026-09-17T00:04:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(otherStarted)
+
+        XCTAssertEqual(store.sessionId, "sess_1", "the current session must not be replaced")
+        XCTAssertEqual(store.statusKind, .skippedEvents)
+        XCTAssertTrue(store.statusLine.contains("sess_other"))
+    }
+
+    /// Regression for R-019: a fatal .error event must reset the session binding and clear the
+    /// pending card, while a recoverable one keeps the binding so in-flight events still apply.
+    func testFatalErrorResetsSessionState() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let fatalError = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "fatal boom", "fatal": true }
+        }
+        """)
+        store.apply(fatalError)
+
+        XCTAssertNil(store.sessionId)
+        XCTAssertNil(store.pendingApproval)
+    }
+
+    func testRecoverableErrorKeepsSessionBound() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let recoverableError = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "recoverable boom", "fatal": false }
+        }
+        """)
+        store.apply(recoverableError)
+
+        XCTAssertEqual(store.sessionId, "sess_1")
+        XCTAssertNotNil(store.pendingApproval, "a recoverable error must not clear an unrelated pending card")
+    }
+
+    /// Regression for R-020: reject()'s 409 branch was never exercised; mirrors the existing
+    /// approve() 409 test.
+    func testRejectStaleBindingClearsCardAndSetsStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 409, message: "stale binding")))
+
+        await store.reject()
+
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.statusKind, .requestInvalid)
+        XCTAssertFalse(store.isSending)
+    }
+
+    /// Regression for R-021: apply() must bind to the sessionId of the first event it sees even
+    /// when that event is not session.started, for example right after relaunch with a cursor
+    /// already past that event.
+    func testApplyBindsToFirstEventWhenNotSessionStarted() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+
+        let turnStarted = try decodeEvent("""
+        {
+            "eventId": 7, "sessionId": "sess_mid", "provider": "mock",
+            "timestamp": "2026-09-17T00:05:00.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """)
+        store.apply(turnStarted)
+
+        XCTAssertEqual(store.sessionId, "sess_mid")
+    }
+
+    /// Regression for R-022: an apply()-driven bind to a different session during the await in
+    /// createSession() must not be overwritten by the create response.
+    func testCreateSessionDoesNotOverwriteConcurrentApplyBind() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        await client.gateSendCall(1)
+
+        let createTask = Task { await store.createSession() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_other", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+        XCTAssertEqual(store.sessionId, "sess_other")
+
+        await client.openSendGate()
+        let created = await createTask.value
+
+        XCTAssertNil(created, "same-generation create must not overwrite a session bound by apply()")
+        XCTAssertEqual(store.sessionId, "sess_other", "the concurrently bound session must survive")
     }
 }
