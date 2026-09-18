@@ -158,6 +158,38 @@ final class SessionStoreDecisionTests: XCTestCase {
         return (store, client)
     }
 
+    /// Builds a store already bound to "sess_1" with a pending question card, backed by a
+    /// fake client whose next `send` result is under the test's control.
+    private func makeStoreWithPendingQuestion() async throws -> (SessionStore, FakeBridgeClient) {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+
+        let questionRequested = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_1", "turnId": "turn_1", "text": "Continue?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """)
+        store.apply(questionRequested)
+
+        XCTAssertNotNil(store.pendingQuestion, "setup should leave a pending question card")
+        return (store, client)
+    }
+
     func testStaleBindingClearsCardAndSetsStatus() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()
         await client.setSendResult(.failure(BridgeError.http(status: 409, message: "stale binding")))
@@ -439,6 +471,72 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotEqual(store.statusKind, .requestInvalid)
     }
 
+    /// Regression for R-026: a stale 409 for answer(optionId:) must not stomp the status line
+    /// for a newer, still-valid question card that replaced it while the send was in flight.
+    func testAnswerOptionIdStale409DoesNotStompNewerCardStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(BridgeError.http(status: 409, message: "stale binding")))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(optionId: "yes") }
+        // Give answer() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerQuestionRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_2", "turnId": "turn_1", "text": "Continue anyway?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """)
+        store.apply(newerQuestionRequested)
+        let statusLineBeforeStale409 = store.statusLine
+
+        await client.openSendGate()
+        await answerTask.value
+
+        XCTAssertEqual(store.pendingQuestion?.questionId, "q_2", "the newer card must survive the stale 409")
+        XCTAssertEqual(store.statusLine, statusLineBeforeStale409, "the newer card's status line must not be stomped by the stale 409")
+        XCTAssertNotEqual(store.statusKind, .requestInvalid)
+    }
+
+    /// Regression for R-026: a stale 409 for answer(text:) must not stomp the status line for a
+    /// newer, still-valid question card that replaced it while the send was in flight.
+    func testAnswerTextStale409DoesNotStompNewerCardStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(BridgeError.http(status: 409, message: "stale binding")))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(text: "Sure") }
+        // Give answer() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerQuestionRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_2", "turnId": "turn_1", "text": "Continue anyway?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """)
+        store.apply(newerQuestionRequested)
+        let statusLineBeforeStale409 = store.statusLine
+
+        await client.openSendGate()
+        await answerTask.value
+
+        XCTAssertEqual(store.pendingQuestion?.questionId, "q_2", "the newer card must survive the stale 409")
+        XCTAssertEqual(store.statusLine, statusLineBeforeStale409, "the newer card's status line must not be stomped by the stale 409")
+        XCTAssertNotEqual(store.statusKind, .requestInvalid)
+    }
+
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
     /// reconnect() moved on to a new generation while the send was in flight), the stale id it
     /// carries must not be returned to sendPrompt() as a valid target.
@@ -451,12 +549,17 @@ final class SessionStoreDecisionTests: XCTestCase {
         let createTask = Task { await store.createSession() }
         try await Task.sleep(for: .milliseconds(20))
 
+        // Hold reconnect()'s own poll loop's first events() call in flight, or its "Connected"
+        // status write would race the guard's status write below.
+        await client.gateEventsCall(1)
         await store.reconnect()
         await client.openSendGate()
         let created = await createTask.value
 
         XCTAssertNil(created, "a rejected rebind must not hand back the stale id")
         XCTAssertNil(store.sessionId)
+        XCTAssertEqual(store.statusLine, "Session changed; prompt not sent")
+        XCTAssertEqual(store.statusKind, .skippedEvents)
     }
 
     /// Regression for R-017: a session.started for a different id while already bound must
@@ -542,6 +645,32 @@ final class SessionStoreDecisionTests: XCTestCase {
         store.apply(turnStarted)
 
         XCTAssertEqual(store.sessionId, "sess_mid")
+    }
+
+    /// Regression for R-024: pollLoop's post-loop Connected/Skipped status write used to run
+    /// after applying the batch's events, clobbering the "Ignored session" status apply() sets
+    /// for a cross-session session.started. The status write now happens before the loop, so
+    /// apply()'s message must survive an otherwise-clean batch.
+    func testCrossSessionStartedStatusSurvivesPollLoopBatch() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+
+        let otherStarted = try decodeEvent("""
+        {
+            "eventId": 5, "sessionId": "sess_other", "provider": "mock",
+            "timestamp": "2026-09-17T00:04:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(events: [otherStarted], lastEventId: 5, skipped: 0)),
+        ])
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(store.sessionId, "sess_1", "the current session must not be replaced")
+        XCTAssertEqual(store.statusKind, .skippedEvents)
+        XCTAssertTrue(store.statusLine.contains("sess_other"), "apply()'s Ignored session status must survive the batch")
     }
 
     /// Regression for R-022: an apply()-driven bind to a different session during the await in

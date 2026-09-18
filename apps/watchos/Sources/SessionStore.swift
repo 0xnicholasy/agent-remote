@@ -144,12 +144,9 @@ final class SessionStore {
                     turnState = .idle
                     continue
                 }
-                for event in response.events {
-                    apply(event)
-                }
-                // Advances past skipped (undecodable) events too, not just the decoded ones.
-                lastSeenEventId = max(lastSeenEventId, response.lastEventId)
-                UserDefaults.standard.set(lastSeenEventId, forKey: SessionStore.cursorKey)
+                // Set before applying events, or this would unconditionally clobber a more
+                // specific status (e.g. "Ignored session") that apply() sets while handling
+                // one of the events below.
                 if response.skipped > 0 {
                     statusLine = "Skipped \(response.skipped) unreadable events"
                     statusKind = .skippedEvents
@@ -157,6 +154,12 @@ final class SessionStore {
                     statusLine = "Connected"
                     statusKind = .connected
                 }
+                for event in response.events {
+                    apply(event)
+                }
+                // Advances past skipped (undecodable) events too, not just the decoded ones.
+                lastSeenEventId = max(lastSeenEventId, response.lastEventId)
+                UserDefaults.standard.set(lastSeenEventId, forKey: SessionStore.cursorKey)
             } catch {
                 if Task.isCancelled || generation != pollGeneration { return }
                 connected = false
@@ -286,6 +289,8 @@ final class SessionStore {
                 // The rebind guard rejected this response: the id it carries is not (and must
                 // not become) the store's session, so callers like sendPrompt() must not treat
                 // it as a valid target either.
+                statusLine = "Session changed; prompt not sent"
+                statusKind = .skippedEvents
                 return nil
             }
             sessionId = created
