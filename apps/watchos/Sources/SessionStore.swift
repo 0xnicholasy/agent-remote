@@ -139,6 +139,9 @@ final class SessionStore {
                     // The dead session's transcript belongs to a session this bridge no longer
                     // knows about, or it would persist on screen alongside whatever starts next.
                     transcript.removeAll()
+                    // Mirrors reconnect(): no live session remains behind the old turn, so a
+                    // stale .waiting/.thinking pill must not linger on screen after the reset.
+                    turnState = .idle
                     continue
                 }
                 for event in response.events {

@@ -387,6 +387,7 @@ final class SessionStoreDecisionTests: XCTestCase {
         let (store, client) = try await makeStoreWithPendingApproval()
         XCTAssertEqual(store.sessionId, "sess_1")
         XCTAssertNotNil(store.pendingApproval)
+        XCTAssertEqual(store.turnState, .waiting)
 
         await client.setEventsResults([
             .success(EventsPage(events: [], lastEventId: 100_000, skipped: 0)),
@@ -398,6 +399,7 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertNil(store.sessionId, "bridge restart must drop the dead session's binding")
         XCTAssertNil(store.pendingApproval, "bridge restart must not leave a stuck approval card")
+        XCTAssertEqual(store.turnState, .idle, "bridge restart must not leave a stale waiting/thinking pill")
     }
 
     /// Regression for R-014: a 409 for a stale approve() must not stomp the status line for a
