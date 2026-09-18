@@ -49,6 +49,9 @@ export interface ClaudeProviderOptions {
   /** Overrides the shared approval TTL. Exists for tests that need to exercise expiry
    * deterministically instead of waiting out `APPROVAL_TTL_MS`. */
   approvalTtlMs?: number;
+  /** Overrides `TERMINATE_TIMEOUT_MS`. Exists for tests that need to exercise the
+   * cancel/teardown timeout deterministically instead of waiting out the production default. */
+  terminateTimeoutMs?: number;
 }
 
 interface PendingApproval {
@@ -136,6 +139,34 @@ function truncateActionText(text: string): string {
   return text.length > ACTION_TEXT_MAX_LENGTH ? `${text.slice(0, ACTION_TEXT_MAX_LENGTH - 1)}…` : text;
 }
 
+/** Bounds how long `cancel`/`terminateConversation` wait on the SDK's `interrupt()`/`return()`
+ * before giving up on the underlying subprocess and proceeding with cleanup anyway. A wedged
+ * subprocess must not be able to hang the `cancel` HTTP request (or teardown) forever. */
+const TERMINATE_TIMEOUT_MS = 5000;
+
+/** Races `promise` against a `timeoutMs` deadline. Resolves/rejects with whichever settles
+ * first; on timeout, rejects with a `TimeoutError` so callers can tell a timeout apart from the
+ * promise's own rejection. The timer is always cleared so it never keeps the process alive. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      // `unknown`: a rejected promise can reject with any thrown value, not just an `Error`; this
+      // just forwards it to `reject` untouched.
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** Derives the text shown to the user for an approval card from the same `toolName`+`input`
  * that `actionDigest` is computed over, so the binding the user approves always matches what
  * they were shown. Bash surfaces the command itself; Edit/Write surface the file path; anything
@@ -184,6 +215,7 @@ export class ClaudeProvider implements AgentProvider {
   private readonly queryFn: QueryFn;
   private readonly permissionMode: PermissionMode | undefined;
   private readonly approvalTtlMs: number;
+  private readonly terminateTimeoutMs: number;
   private readonly sessions = new Map<string, Session>();
   private readonly conversations = new Map<string, Conversation>();
   private counter = 0;
@@ -194,6 +226,7 @@ export class ClaudeProvider implements AgentProvider {
     this.queryFn = options.query ?? realQuery;
     this.permissionMode = options.permissionMode;
     this.approvalTtlMs = options.approvalTtlMs ?? APPROVAL_TTL_MS;
+    this.terminateTimeoutMs = options.terminateTimeoutMs ?? TERMINATE_TIMEOUT_MS;
   }
 
   /** Registers a session the bridge already knows about and starts its conversation, without
@@ -286,7 +319,7 @@ export class ClaudeProvider implements AgentProvider {
     // session.completed for a session that never existed.
     const conversation = this.requireConversation(sessionId);
     try {
-      await conversation.queryHandle.interrupt();
+      await withTimeout(conversation.queryHandle.interrupt(), this.terminateTimeoutMs, "interrupt");
     } catch (error) {
       this.host.emit(sessionId, "error", {
         code: "provider_error",
@@ -459,10 +492,18 @@ export class ClaudeProvider implements AgentProvider {
     }
     try {
       // `Query` extends `AsyncGenerator`; `.return()` is its close/dispose method (there is no
-      // separate `close()` on the interface) and stops the underlying subprocess.
-      await conversation.queryHandle.return(undefined);
-    } catch {
-      // Best effort: the generator/process may already be gone.
+      // separate `close()` on the interface) and stops the underlying subprocess. Bounded by
+      // `TERMINATE_TIMEOUT_MS` so a wedged subprocess cannot hang teardown (and the `cancel` HTTP
+      // request that may be awaiting this) forever; cleanup below still runs on timeout.
+      await withTimeout(conversation.queryHandle.return(undefined), this.terminateTimeoutMs, "queryHandle.return");
+    } catch (error) {
+      // Best effort: the generator/process may already be gone, or the timeout above fired.
+      // Non-fatal: mirrors the `interrupt` catch path in `cancel` above.
+      this.host.emit(sessionId, "error", {
+        code: "provider_error",
+        message: `queryHandle.return failed: ${errorMessage(error)}`,
+        fatal: false,
+      });
     }
     this.conversations.delete(sessionId);
     this.sessions.delete(sessionId);

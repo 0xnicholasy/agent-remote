@@ -460,6 +460,38 @@ describe("ClaudeProvider", () => {
     await expect(provider.sendPrompt(session.id, "another one")).rejects.toBeInstanceOf(UnknownSessionError);
   });
 
+  test("cancel() resolves within the timeout when the SDK's return() never settles (R-040)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      const wrapped = asQuery(gen());
+      // Simulates a wedged SDK subprocess: `.return()` never settles.
+      wrapped.query.return = (() => new Promise(() => {})) as Query["return"];
+      return wrapped.query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      terminateTimeoutMs: 20,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    await provider.cancel(session.id);
+
+    const errorEvent = events.find((event) => event.type === "error");
+    expect(errorEvent?.type === "error" ? errorEvent.payload.message : undefined).toContain("queryHandle.return");
+    expect(events.map((event) => event.type)).toContain("session.completed");
+    expect((await provider.listSessions()).map((s) => s.id)).not.toContain(session.id);
+  });
+
   test("cancelling one session leaves another session's pending approval intact", async () => {
     const queryFn: QueryFn = ((args) => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {

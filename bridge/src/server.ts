@@ -228,6 +228,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   // Maps the protocol error types a provider call can throw to the HTTP response both
   // handleCommand and the cancel route return for them, so the two call sites stay in sync.
   // Returns undefined for anything else, which the caller should rethrow.
+  // `unknown`: this narrows a caught value (a catch clause's type), not an unchecked passthrough.
   function mapProviderError(error: unknown): Response | undefined {
     if (
       error instanceof ApprovalBindingMismatchError ||
