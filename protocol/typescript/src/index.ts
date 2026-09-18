@@ -393,6 +393,16 @@ export class TurnInProgressError extends Error {
   }
 }
 
+/** Thrown by `createSession` when the provider already holds as many live sessions as it allows.
+ * Distinct from the errors above: nothing about the request is wrong, the host is simply at
+ * capacity, so the client should retry after cancelling a session rather than fixing the call. */
+export class SessionLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionLimitError";
+  }
+}
+
 /** Thrown by a mutating call (`sendPrompt`, `approve`, `reject`, `cancel`, `answerQuestion`)
  * made against a session id that has no live conversation: it was never created, or it already
  * terminated (crashed, cancelled, or hit an unrecoverable error). */

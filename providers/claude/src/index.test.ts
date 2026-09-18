@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ApprovalBindingMismatchError,
   InteractionPendingError,
+  SessionLimitError,
   TurnInProgressError,
   UnknownSessionError,
 } from "@agentremote/protocol";
@@ -719,6 +720,9 @@ describe("ClaudeProvider", () => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         yield fakeResult("done");
+        // Keeps the stream open so the cancel below is what terminates the session, not the
+        // idle-end teardown (R-031).
+        await delay(200);
       }
       return asQuery(gen()).query;
     }) as QueryFn;
@@ -758,6 +762,9 @@ describe("ClaudeProvider", () => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         yield fakeResult("done");
+        // Keeps the stream open past the result so this test exercises the cancel race rather
+        // than the idle-end teardown (R-031).
+        await delay(200);
       }
       const wrapped = asQuery(gen());
       const originalReturn = wrapped.query.return;
@@ -1046,12 +1053,14 @@ describe("ClaudeProvider", () => {
     expect((await provider.listSessions()).map((s) => s.id)).not.toContain(session.id);
   });
 
-  test("a generator that ends right after a normal result does not tear the session down (R-031)", async () => {
+  test("a session whose stream is still open stays live after a normal result (R-031)", async () => {
     const queryFn: QueryFn = ((args) => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         yield fakeResult("done");
-        // Generator ends normally right after the result: `turnInProgress` is already false here.
+        // The stream stays open after the result, which is the only case in which the session may
+        // keep serving prompts: an ended stream is torn down (see the R-031 idle-end test).
+        await new Promise<void>(() => {});
       }
       return asQuery(gen()).query;
     }) as QueryFn;
@@ -1113,7 +1122,9 @@ describe("ClaudeProvider", () => {
   test("listSessions(projectId) filters to sessions in that project (R-037)", async () => {
     const queryFn: QueryFn = (() => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {
-        // Never yields: no prompt is sent in this test, so nothing should be read from it.
+        // Never yields: no prompt is sent in this test, so nothing should be read from it. The
+        // stream stays open, since an ended stream tears its session down (R-031).
+        await new Promise<void>(() => {});
       }
       return asQuery(gen()).query;
     }) as QueryFn;
@@ -1140,6 +1151,9 @@ describe("ClaudeProvider", () => {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         const result = await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
         yield fakeResult(result?.behavior === "allow" ? "ran ls" : "denied");
+        // Held open so the session is still live for the post-result state assertion: an ended
+        // stream tears its session down (R-031).
+        await new Promise<void>(() => {});
       }
       return asQuery(gen()).query;
     }) as QueryFn;
@@ -1184,5 +1198,212 @@ describe("ClaudeProvider", () => {
     expect(messages).toHaveLength(2);
     expect(messages[0]?.payload).toMatchObject({ text: "first block", final: false });
     expect(messages[1]?.payload).toMatchObject({ text: "second block", final: true });
+  });
+  test("a generator that ends while idle still tears the conversation down (R-031)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeResult("done");
+        // Ends right after a normal result: no turn is in progress, but the subprocess behind the
+        // generator is gone all the same, so the conversation cannot serve another prompt.
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const types = events.map((event) => event.type);
+    expect(types).toContain("turn.completed");
+    const completed = events.find((event) => event.type === "session.completed");
+    expect(completed?.payload).toMatchObject({ reason: "completed", message: "provider stream ended" });
+    expect((await provider.listSessions()).map((s) => s.id)).not.toContain(session.id);
+    // The point of the teardown: the next prompt fails fast instead of hanging on an iterable
+    // nothing is reading any more.
+    await expect(provider.sendPrompt(session.id, "again")).rejects.toBeInstanceOf(UnknownSessionError);
+  });
+
+  test("a stream that fails as part of a concurrent cancel does not emit a fatal error (R-041)", async () => {
+    // A `Query` double whose pending `next()` rejects when the handle is disposed: exactly what a
+    // cancel does to the pump, which must not be reported as a crash the session never had.
+    const queryFn: QueryFn = (() => {
+      let rejectNext: ((error: unknown) => void) | undefined;
+      const query = {
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+        next: () =>
+          new Promise<IteratorResult<SDKMessage, void>>((_resolve, reject) => {
+            rejectNext = reject;
+          }),
+        return: async () => {
+          rejectNext?.(new Error("stream torn down"));
+          return { done: true as const, value: undefined };
+        },
+        interrupt: async () => undefined,
+      };
+      return query as unknown as Query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.cancel(session.id);
+    await delay();
+
+    const fatal = events.filter((event) => event.type === "error" && event.payload.fatal);
+    expect(fatal).toHaveLength(0);
+    const completions = events.filter((event) => event.type === "session.completed");
+    expect(completions).toHaveLength(1);
+    expect(completions[0]?.payload).toMatchObject({ reason: "cancelled" });
+  });
+
+  test("createSession refuses to exceed maxSessions (R-042)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      maxSessions: 1,
+      // The held-open generator never acknowledges disposal, so the cancel below relies on the
+      // teardown timeout rather than waiting out the production default.
+      terminateTimeoutMs: 20,
+    });
+    const first = await provider.createSession("p1");
+
+    await expect(provider.createSession("p1")).rejects.toBeInstanceOf(SessionLimitError);
+    // Cancelling frees the slot, so the cap bounds live sessions rather than total creations.
+    await provider.cancel(first.id);
+    await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
+  });
+
+  test("a pending question force-resolved by teardown is reported to the client (R-043)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!(
+          "AskUserQuestion",
+          { questions: [{ question: "Which one?", options: [{ label: "a" }, { label: "b" }] }] },
+          callOpts(),
+        );
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "pick one");
+    await delay();
+    const requested = events.find((event) => event.type === "question.requested");
+    expect(requested).toBeDefined();
+
+    await provider.cancel(session.id);
+    await delay();
+
+    // Without an outcome event for the question the watch would keep showing its card forever.
+    const answered = events.find((event) => event.type === "question.answered");
+    expect(answered?.payload).toMatchObject({
+      questionId: requested?.type === "question.requested" ? requested.payload.questionId : "",
+      answer: "(session terminated)",
+    });
+  });
+
+  test("a cancel whose interrupt times out is not reported as a clean cancel (R-044)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await new Promise<void>(() => {});
+      }
+      const wrapped = asQuery(gen());
+      // Simulates a wedged subprocess: `interrupt()` never settles, so the timeout fires.
+      wrapped.query.interrupt = (() => new Promise(() => {})) as Query["interrupt"];
+      return wrapped.query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      terminateTimeoutMs: 20,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+    await provider.cancel(session.id);
+
+    const errorEvent = events.find((event) => event.type === "error");
+    expect(errorEvent?.payload).toMatchObject({ code: "provider_error", fatal: false });
+    expect(errorEvent?.type === "error" ? errorEvent.payload.message : "").toContain("interrupt failed");
+    // The terminal event has to carry the failure: the interrupted work may still be running.
+    expect(events.find((event) => event.type === "session.completed")?.payload).toMatchObject({
+      reason: "cancelled",
+      message: "interrupt_timeout",
+    });
+  });
+
+  test("approving an approval puts the session back to running for the rest of the turn (R-045)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        // Keeps the turn in progress after the approval, so the session's state after approve is
+        // observable rather than immediately overwritten by a result.
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("waiting");
+
+    await provider.approve(session.id, bindingOf(events));
+    await delay();
+
+    // "waiting" means a decision is pending; the agent is working again, so it must not stay set.
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("running");
+  });
+
+  test("the fallback turnId is a fresh id per turn, not a reused counter value (R-046)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        // Results with no matching sendPrompt: `conversation.turnId` is undefined, so both turn
+        // ids come from the fallback.
+        yield fakeResult("first");
+        yield fakeResult("second");
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    await provider.createSession("p1");
+    await delay();
+
+    const turnIds = events
+      .filter((event) => event.type === "turn.completed")
+      .map((event) => (event.type === "turn.completed" ? event.payload.turnId : ""));
+    expect(turnIds).toHaveLength(2);
+    expect(turnIds[0]).not.toBe(turnIds[1]);
   });
 });

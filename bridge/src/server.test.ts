@@ -12,7 +12,7 @@ import type {
   Session,
   SessionsResponse,
 } from "@agentremote/protocol";
-import { TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
+import { SessionLimitError, TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
 
 import { createBridge, projectIdFor, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
 
@@ -334,6 +334,8 @@ class StubClaudeProvider implements AgentProvider {
   sendPromptError: Error | undefined;
   /** Set by a test to make the next cancel call throw instead of resolving. */
   cancelError: Error | undefined;
+  /** Set by a test to make the next createSession call throw instead of returning a session. */
+  createSessionError: Error | undefined;
 
   constructor(host: ProviderHost, options: { projects: Project[] }) {
     this.host = host;
@@ -353,6 +355,9 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async createSession(projectId: string): Promise<Session> {
+    if (this.createSessionError !== undefined) {
+      throw this.createSessionError;
+    }
     const now = new Date().toISOString();
     const session: Session = {
       id: "ses_stub",
@@ -571,6 +576,42 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       expect(response.status).toBe(400);
       const body = (await response.json()) as { error: string };
       expect(body.error).toBe("invalid_command");
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("session.create past the provider's session limit is rejected with 429 (R-042)", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.createSessionError = new SessionLimitError("session limit reached");
+
+      const response = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            commandId: "cccccccc-cccc-4ccc-8ccc-ccccccccccce",
+            sessionId: "ses_placeholder",
+            type: "session.create",
+            timestamp: new Date().toISOString(),
+            payload: { projectId: claudeBridge.session.projectId, provider: "claude" },
+          } satisfies Command),
+        }),
+      );
+      // 429, not 409/400: nothing about the request is wrong, the host is at capacity.
+      expect(response.status).toBe(429);
+      const body = (await response.json()) as { error: string; code: string };
+      expect(body.code).toBe("session_limit");
+      expect(body.error).toBe("session limit reached");
     } finally {
       restoreProviderEnv();
     }

@@ -15,6 +15,7 @@ import {
   type ProviderHost,
   type Session,
   type SessionsResponse,
+  SessionLimitError,
   TurnInProgressError,
   UnknownSessionError,
 } from "@agentremote/protocol";
@@ -239,6 +240,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     }
     if (error instanceof UnknownSessionError) {
       return json({ error: error.message }, 404);
+    }
+    // Capacity, not a bad request: 429 tells the client to retry later (after cancelling a
+    // session) rather than to change what it sent.
+    if (error instanceof SessionLimitError) {
+      return json({ error: error.message, code: "session_limit" }, 429);
     }
     return undefined;
   }

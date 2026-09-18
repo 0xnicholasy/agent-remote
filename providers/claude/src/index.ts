@@ -14,6 +14,7 @@ import {
   ApprovalBindingMismatchError,
   digest,
   InteractionPendingError,
+  SessionLimitError,
   TurnInProgressError,
   UnknownSessionError,
   type AgentCapabilities,
@@ -31,6 +32,7 @@ import {
 export {
   ApprovalBindingMismatchError,
   InteractionPendingError,
+  SessionLimitError,
   TurnInProgressError,
   UnknownSessionError,
   type ProviderHost,
@@ -52,6 +54,10 @@ export interface ClaudeProviderOptions {
   /** Overrides `TERMINATE_TIMEOUT_MS`. Exists for tests that need to exercise the
    * cancel/teardown timeout deterministically instead of waiting out the production default. */
   terminateTimeoutMs?: number;
+  /** Overrides `DEFAULT_MAX_SESSIONS`, the ceiling on live sessions (each one owns a Claude Code
+   * subprocess). Injectable the same way as the two timeouts above so tests can exercise the
+   * limit without opening eight conversations. */
+  maxSessions?: number;
 }
 
 interface PendingApproval {
@@ -144,13 +150,27 @@ function truncateActionText(text: string): string {
  * subprocess must not be able to hang the `cancel` HTTP request (or teardown) forever. */
 const TERMINATE_TIMEOUT_MS = 5000;
 
+/** Ceiling on live sessions, each of which owns a Claude Code subprocess. Keeps a client (or a
+ * retry loop) from spawning processes until the Mac is out of resources. */
+const DEFAULT_MAX_SESSIONS = 8;
+
+/** Marks a rejection that came from `withTimeout`'s deadline rather than from the awaited call
+ * failing on its own, so teardown can report "the subprocess never answered" distinctly from
+ * "the subprocess answered with an error". */
+class TimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
 /** Races `promise` against a `timeoutMs` deadline. Resolves/rejects with whichever settles
  * first; on timeout, rejects with a `TimeoutError` so callers can tell a timeout apart from the
  * promise's own rejection. The timer is always cleared so it never keeps the process alive. */
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+      reject(new TimeoutError(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     promise.then(
       (value) => {
@@ -216,6 +236,7 @@ export class ClaudeProvider implements AgentProvider {
   private readonly permissionMode: PermissionMode | undefined;
   private readonly approvalTtlMs: number;
   private readonly terminateTimeoutMs: number;
+  private readonly maxSessions: number;
   private readonly sessions = new Map<string, Session>();
   private readonly conversations = new Map<string, Conversation>();
   private counter = 0;
@@ -227,6 +248,7 @@ export class ClaudeProvider implements AgentProvider {
     this.permissionMode = options.permissionMode;
     this.approvalTtlMs = options.approvalTtlMs ?? APPROVAL_TTL_MS;
     this.terminateTimeoutMs = options.terminateTimeoutMs ?? TERMINATE_TIMEOUT_MS;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
   }
 
   /** Registers a session the bridge already knows about and starts its conversation, without
@@ -253,6 +275,14 @@ export class ClaudeProvider implements AgentProvider {
     const project = this.projects.find((candidate) => candidate.id === projectId);
     if (project === undefined) {
       throw new Error(`unknown projectId: ${projectId}`);
+    }
+    // Every live session owns a Claude Code subprocess, so an unbounded create path lets a
+    // client spawn processes until the Mac runs out of resources. Refused here rather than in the
+    // bridge so any transport hitting the provider is covered by the same ceiling.
+    if (this.sessions.size >= this.maxSessions) {
+      throw new SessionLimitError(
+        `session limit reached: ${this.sessions.size} of ${this.maxSessions} sessions are live; cancel one first`,
+      );
     }
     const now = new Date().toISOString();
     const session: Session = {
@@ -298,6 +328,7 @@ export class ClaudeProvider implements AgentProvider {
     const conversation = this.requireConversation(sessionId);
     const pending = this.takeApproval(sessionId, conversation, binding);
     this.host.emit(sessionId, "approval.resolved", { approvalId: binding.approvalId, decision: "accepted" });
+    this.restoreRunningState(sessionId, conversation);
     // Never returns `updatedInput` here: the protocol marks a modified action as unsupported
     // for approvals, since the modified action can no longer satisfy the binding shown to the user.
     pending.resolve({ behavior: "allow" });
@@ -311,6 +342,7 @@ export class ClaudeProvider implements AgentProvider {
       decision: "rejected",
       ...(reason === undefined ? {} : { reason }),
     });
+    this.restoreRunningState(sessionId, conversation);
     pending.resolve({ behavior: "deny", message: reason ?? "Rejected by user" });
   }
 
@@ -318,16 +350,21 @@ export class ClaudeProvider implements AgentProvider {
     // Mirrors approve/reject: an unknown session id throws rather than emitting a phantom
     // session.completed for a session that never existed.
     const conversation = this.requireConversation(sessionId);
+    // A failed or timed-out interrupt means the subprocess may still be running whatever the user
+    // asked to stop, so the terminal event must not read as a clean cancel: the failure is carried
+    // into `session.completed.message` as well as the non-fatal error event below.
+    let cancelMessage: string | undefined;
     try {
       await withTimeout(conversation.queryHandle.interrupt(), this.terminateTimeoutMs, "interrupt");
     } catch (error) {
+      cancelMessage = error instanceof TimeoutError ? "interrupt_timeout" : "interrupt_failed";
       this.host.emit(sessionId, "error", {
         code: "provider_error",
         message: `interrupt failed: ${errorMessage(error)}`,
         fatal: false,
       });
     }
-    await this.terminateConversation(sessionId, conversation, "cancelled");
+    await this.terminateConversation(sessionId, conversation, "cancelled", cancelMessage);
   }
 
   async answerQuestion(sessionId: string, answer: QuestionAnswerPayload): Promise<void> {
@@ -354,6 +391,7 @@ export class ClaudeProvider implements AgentProvider {
     const answerText = optionLabel ?? answer.text ?? "";
 
     this.host.emit(sessionId, "question.answered", { questionId: answer.questionId, answer: answerText });
+    this.restoreRunningState(sessionId, conversation);
 
     pending.resolve({
       behavior: "allow",
@@ -375,6 +413,18 @@ export class ClaudeProvider implements AgentProvider {
       }
       await this.host.waitForChange(1000);
     }
+  }
+
+  /** Puts the session back into `running` once the interaction that made it `waiting` has been
+   * resolved and the turn it belongs to is still going. `waiting` means "a decision is pending":
+   * leaving it set after approve/reject/answerQuestion would report a session as blocked on the
+   * user while the agent is in fact working. A conversation with no turn in progress keeps
+   * whatever state it already has (idle/completed/failed). */
+  private restoreRunningState(sessionId: string, conversation: Conversation): void {
+    if (conversation.terminal || !conversation.turnInProgress) {
+      return;
+    }
+    this.setSessionState(sessionId, "running");
   }
 
   /** Updates the session's reported `state` in place, or does nothing if the session was already
@@ -471,6 +521,7 @@ export class ClaudeProvider implements AgentProvider {
     sessionId: string,
     conversation: Conversation,
     reason: SessionCompletedPayload["reason"],
+    message?: string,
   ): Promise<void> {
     if (conversation.terminal) {
       return;
@@ -483,13 +534,18 @@ export class ClaudeProvider implements AgentProvider {
     this.setSessionState(sessionId, reason === "error" ? "failed" : "completed");
     this.flushPendingAssistantMessage(sessionId, conversation);
     if (conversation.pendingApproval !== undefined) {
-      conversation.pendingApproval.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
+      const pending = conversation.pendingApproval;
       conversation.pendingApproval = undefined;
+      this.resolvePendingApprovalEvent(sessionId, pending.binding.approvalId, "session terminated");
+      pending.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
     }
     if (conversation.pendingQuestion !== undefined) {
-      conversation.pendingQuestion.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
+      const pending = conversation.pendingQuestion;
       conversation.pendingQuestion = undefined;
+      this.resolvePendingQuestionEvent(sessionId, pending.questionId, "session terminated");
+      pending.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
     }
+    let terminalMessage = message;
     try {
       // `Query` extends `AsyncGenerator`; `.return()` is its close/dispose method (there is no
       // separate `close()` on the interface) and stops the underlying subprocess. Bounded by
@@ -498,7 +554,12 @@ export class ClaudeProvider implements AgentProvider {
       await withTimeout(conversation.queryHandle.return(undefined), this.terminateTimeoutMs, "queryHandle.return");
     } catch (error) {
       // Best effort: the generator/process may already be gone, or the timeout above fired.
-      // Non-fatal: mirrors the `interrupt` catch path in `cancel` above.
+      // Non-fatal: mirrors the `interrupt` catch path in `cancel` above. A timeout here means the
+      // subprocess never acknowledged disposal, which the terminal event must say rather than
+      // reporting an orderly shutdown.
+      if (error instanceof TimeoutError) {
+        terminalMessage = "interrupt_timeout";
+      }
       this.host.emit(sessionId, "error", {
         code: "provider_error",
         message: `queryHandle.return failed: ${errorMessage(error)}`,
@@ -507,7 +568,27 @@ export class ClaudeProvider implements AgentProvider {
     }
     this.conversations.delete(sessionId);
     this.sessions.delete(sessionId);
-    this.host.emit(sessionId, "session.completed", { reason });
+    this.host.emit(sessionId, "session.completed", {
+      reason,
+      ...(terminalMessage === undefined ? {} : { message: terminalMessage }),
+    });
+  }
+
+  /** Tells the client that a pending approval it is still showing a card for was resolved for it,
+   * without a user decision (teardown, or the SDK aborting the tool call). Reuses the
+   * `approval.resolved` shape the expiry path already emits: `ApprovalDecision` has no
+   * "cancelled" member in the schema, so the forced outcome is reported as `expired` with the
+   * real cause in `reason`, which is what lets the watch clear the card. */
+  private resolvePendingApprovalEvent(sessionId: string, approvalId: string, reason: string): void {
+    this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "expired", reason });
+  }
+
+  /** The question-side counterpart. The protocol has no separate question-cancelled event, and
+   * `question.answered` is the only outcome event for a question, so the forced resolve is
+   * reported through it with the cause in place of an answer — otherwise the watch keeps showing
+   * a question card for an interaction the agent has already given up on. */
+  private resolvePendingQuestionEvent(sessionId: string, questionId: string, reason: string): void {
+    this.host.emit(sessionId, "question.answered", { questionId, answer: `(${reason})` });
   }
 
   /** Chains `fn` onto the conversation's interaction lock so a second concurrent
@@ -545,31 +626,41 @@ export class ClaudeProvider implements AgentProvider {
           return;
         }
       }
-      // The SDK's async generator ended without ever yielding a `result` message while a turn was
-      // still in progress. Gated on `turnInProgress` rather than merely `!terminal`: a generator
-      // that ends right after a normal successful `result` already has `turnInProgress` false and
-      // must not be treated as an abnormal teardown. Not a thrown error, but the conversation is
-      // over all the same: without this, the session and its subprocess would be left registered
-      // as alive forever.
+      // The SDK's async generator ended. Either way the subprocess behind it is gone, so the
+      // conversation must be torn down: leaving it registered would let a later `sendPrompt` push
+      // into an iterable nothing is reading any more and hang instead of failing fast.
       const conversation = this.conversations.get(sessionId);
-      if (conversation !== undefined && !conversation.terminal && conversation.turnInProgress) {
-        this.host.emit(sessionId, "error", {
-          code: "provider_error",
-          message: "conversation ended without a result",
-          fatal: true,
-        });
-        await this.terminateConversation(sessionId, conversation, "error");
+      if (conversation !== undefined && !conversation.terminal) {
+        if (conversation.turnInProgress) {
+          // Ended mid-turn without ever yielding a `result`: an abnormal teardown, reported as a
+          // fatal error and a failed session.
+          this.host.emit(sessionId, "error", {
+            code: "provider_error",
+            message: "conversation ended without a result",
+            fatal: true,
+          });
+          await this.terminateConversation(sessionId, conversation, "error");
+        } else {
+          // Ended while idle (e.g. right after a normal `result`): nothing failed, but the session
+          // cannot serve another prompt, so it completes with the cause named rather than being
+          // left behind as a session whose next prompt would hang.
+          await this.terminateConversation(sessionId, conversation, "completed", "provider stream ended");
+        }
       }
     } catch (error) {
+      const conversation = this.conversations.get(sessionId);
+      // Checked before emitting: a concurrent `cancel()`/teardown disposes the generator, which
+      // surfaces here as a throw. That conversation has already emitted its own terminal event, so
+      // a fatal error event now would report a crash the session never had.
+      if (conversation === undefined || conversation.terminal) {
+        return;
+      }
       this.host.emit(sessionId, "error", {
         code: "provider_error",
         message: errorMessage(error),
         fatal: true,
       });
-      const conversation = this.conversations.get(sessionId);
-      if (conversation !== undefined) {
-        await this.terminateConversation(sessionId, conversation, "error");
-      }
+      await this.terminateConversation(sessionId, conversation, "error");
     }
   }
 
@@ -592,7 +683,7 @@ export class ClaudeProvider implements AgentProvider {
 
   private handleMessage(sessionId: string, message: SDKMessage): void {
     const conversation = this.conversations.get(sessionId);
-    const turnId = conversation?.turnId ?? `trn_${this.counter}`;
+    const turnId = conversation?.turnId ?? `trn_${++this.counter}`;
 
     if (message.type === "assistant") {
       for (const block of message.message.content) {
@@ -725,7 +816,12 @@ export class ClaudeProvider implements AgentProvider {
         const result = await this.awaitInteraction(
           callOptions.signal,
           () => {
-            conversation.pendingQuestion = undefined;
+            // Only emits when this question is the one still occupying the slot: an abort that
+            // beats registration has no outstanding card for the client to clear.
+            if (conversation.pendingQuestion?.questionId === questionId) {
+              conversation.pendingQuestion = undefined;
+              this.resolvePendingQuestionEvent(sessionId, questionId, "cancelled by agent");
+            }
           },
           (settle) => {
             conversation.pendingQuestion = { questionId, turnId, resolve: settle, question };
@@ -778,7 +874,11 @@ export class ClaudeProvider implements AgentProvider {
     return this.awaitInteraction(
       callOptions.signal,
       () => {
-        conversation.pendingApproval = undefined;
+        // Same guard as the question path: nothing to report if the abort beat registration.
+        if (conversation.pendingApproval?.binding.approvalId === approvalId) {
+          conversation.pendingApproval = undefined;
+          this.resolvePendingApprovalEvent(sessionId, approvalId, "cancelled by agent");
+        }
       },
       (settle) => {
         conversation.pendingApproval = { binding, resolve: settle };
