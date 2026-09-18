@@ -306,9 +306,13 @@ final class SessionStore {
             // flight; only clear the card if it's still the one this call answered.
             if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
-            statusLine = "Request no longer valid"
-            statusKind = .requestInvalid
+            // Only touch the card/status if a newer approval hasn't already replaced this one,
+            // or a still-valid card's status line would be stomped with a stale-request message.
+            if pendingApproval?.binding.approvalId == request.binding.approvalId {
+                pendingApproval = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -323,9 +327,11 @@ final class SessionStore {
             try await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
             if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
-            statusLine = "Request no longer valid"
-            statusKind = .requestInvalid
+            if pendingApproval?.binding.approvalId == request.binding.approvalId {
+                pendingApproval = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -342,9 +348,11 @@ final class SessionStore {
             // the card if it's still the one this call answered.
             if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
-            statusLine = "Request no longer valid"
-            statusKind = .requestInvalid
+            if pendingQuestion?.questionId == question.questionId {
+                pendingQuestion = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -359,9 +367,11 @@ final class SessionStore {
             try await perform(.questionAnswer(payload), sessionId: target)
             if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
-            statusLine = "Request no longer valid"
-            statusKind = .requestInvalid
+            if pendingQuestion?.questionId == question.questionId {
+                pendingQuestion = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }

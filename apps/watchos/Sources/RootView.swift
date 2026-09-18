@@ -24,7 +24,8 @@ struct ConversationView: View {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 2) {
                                 statePill
-                                if !store.connected || store.statusKind == .skippedEvents {
+                                if !store.connected
+                                    || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
                                     Text(store.statusLine)
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)

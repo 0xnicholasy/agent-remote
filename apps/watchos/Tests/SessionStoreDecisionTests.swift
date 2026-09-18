@@ -399,4 +399,41 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNil(store.sessionId, "bridge restart must drop the dead session's binding")
         XCTAssertNil(store.pendingApproval, "bridge restart must not leave a stuck approval card")
     }
+
+    /// Regression for R-014: a 409 for a stale approve() must not stomp the status line for a
+    /// newer, still-valid card that replaced it while the send was in flight.
+    func testStale409DoesNotStompNewerCardStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 409, message: "stale binding")))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerApprovalRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main --force"
+            }
+        }
+        """)
+        store.apply(newerApprovalRequested)
+        let statusLineBeforeStale409 = store.statusLine
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale 409")
+        XCTAssertEqual(store.statusLine, statusLineBeforeStale409, "the newer card's status line must not be stomped by the stale 409")
+        XCTAssertNotEqual(store.statusKind, .requestInvalid)
+    }
 }
