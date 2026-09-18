@@ -341,9 +341,12 @@ export class ClaudeProvider implements AgentProvider {
    * Ends a conversation for good: resolves any pending approval/question with a deny so the SDK
    * does not hang, disposes the query handle, and removes the conversation so later
    * `sendPrompt`/`approve`/`reject`/`cancel`/`answerQuestion` calls see an unknown session
-   * instead of silently succeeding or hanging. Idempotent, so it is safe to call from `cancel`,
-   * from the `pumpMessages` crash path, and from a `handleMessage` failure without risking a
-   * double `session.completed`.
+   * instead of silently succeeding or hanging. Also removes the session from `this.sessions` (the
+   * map backing `listSessions()`), since the bridge's `sessionExists` gate only checks id
+   * presence there, not `state` — leaving the entry behind would let a terminated session keep
+   * passing that gate forever. Idempotent, so it is safe to call from `cancel`, from the
+   * `pumpMessages` crash path, and from a `handleMessage` failure without risking a double
+   * `session.completed`.
    */
   private async terminateConversation(
     sessionId: string,
@@ -374,6 +377,7 @@ export class ClaudeProvider implements AgentProvider {
       // Best effort: the generator/process may already be gone.
     }
     this.conversations.delete(sessionId);
+    this.sessions.delete(sessionId);
     this.host.emit(sessionId, "session.completed", { reason });
   }
 
@@ -477,13 +481,25 @@ export class ClaudeProvider implements AgentProvider {
     }
   }
 
-  private handleCanUseTool(
+  /**
+   * `async` so a synchronous throw from `requireConversation` (e.g. the conversation was
+   * terminated by a concurrent `cancel()`/pump-crash between the SDK deciding to call this and
+   * actually calling it) becomes a rejected `Promise<PermissionResult>` rather than an uncaught
+   * synchronous exception into the SDK's callback. Denies instead of rejecting outright, since a
+   * missing conversation here just means "already terminal" from the caller's point of view.
+   */
+  private async handleCanUseTool(
     sessionId: string,
     toolName: string,
     input: Record<string, unknown>,
     callOptions: Parameters<CanUseTool>[2],
   ): Promise<PermissionResult> {
-    const conversation = this.requireConversation(sessionId);
+    let conversation: Conversation;
+    try {
+      conversation = this.requireConversation(sessionId);
+    } catch {
+      return { behavior: "deny", message: "session terminated", interrupt: true };
+    }
     return this.withInteractionLock(conversation, () =>
       this.runInteraction(sessionId, conversation, toolName, input, callOptions),
     );
@@ -542,6 +558,13 @@ export class ClaudeProvider implements AgentProvider {
           freeTextResponse = updated.response;
         }
       }
+      // `updatedInput` on an 'allow' result is typed `Record<string, unknown>` in
+      // `PermissionResult` (sdk.d.ts), but for AskUserQuestion specifically there is no separate
+      // "execution" step to feed an input to: the value returned here becomes the tool's result
+      // as seen by the model, so it must match `AskUserQuestionOutput` (sdk-tools.d.ts) —
+      // `{ questions, answers: Record<string, string>, response? }` — not `AskUserQuestionInput`.
+      // The shape below matches `AskUserQuestionOutput` (its `annotations`/`afkTimeoutMs` are
+      // both optional and omitted here).
       return {
         behavior: "allow",
         updatedInput: {

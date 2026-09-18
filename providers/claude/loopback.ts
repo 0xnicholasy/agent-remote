@@ -87,36 +87,50 @@ async function main(): Promise<void> {
   let approved = false;
   let done = false;
 
-  await provider.sendPrompt(session.id, PROMPT);
+  try {
+    await provider.sendPrompt(session.id, PROMPT);
 
-  let cursor = 0;
-  while (!done && Date.now() < deadline) {
-    const batch = host.eventsAfter(cursor).filter((event) => event.sessionId === session.id);
-    for (const event of batch) {
-      cursor = Math.max(cursor, event.eventId);
-      if (event.type === "turn.completed") {
-        done = true;
+    let cursor = 0;
+    while (!done && Date.now() < deadline) {
+      const batch = host.eventsAfter(cursor).filter((event) => event.sessionId === session.id);
+      for (const event of batch) {
+        cursor = Math.max(cursor, event.eventId);
+        if (event.type === "turn.completed") {
+          done = true;
+        }
+        if (event.type === "error" && event.payload.fatal) {
+          done = true;
+        }
+        if (!approved && event.type === "approval.requested") {
+          approved = true;
+          await provider.approve(session.id, event.payload.binding);
+        }
       }
-      if (event.type === "error" && event.payload.fatal) {
-        done = true;
-      }
-      if (!approved && event.type === "approval.requested") {
-        approved = true;
-        await provider.approve(session.id, event.payload.binding);
+      if (!done) {
+        await host.waitForChange(1000);
       }
     }
+
     if (!done) {
-      await host.waitForChange(1000);
+      console.error(`Timed out after ${TIMEOUT_MS}ms waiting for turn.completed`);
+      process.exitCode = 1;
     }
-  }
-
-  if (!done) {
-    console.error(`Timed out after ${TIMEOUT_MS}ms waiting for turn.completed`);
-    process.exitCode = 1;
+  } finally {
+    // The SDK subprocess (queryHandle, started in createSession) and the pumpMessages loop keep
+    // the process referenced even after the turn completes or times out, so the harness would
+    // otherwise hang on exit instead of returning from main(). `cancel` interrupts and disposes
+    // it whether we got a clean `turn.completed` or hit the deadline.
+    await provider.cancel(session.id).catch(() => {
+      // Best effort: the conversation may already be terminal (turn.completed's error path).
+    });
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+main()
+  .catch((error: unknown) => {
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    process.exit(process.exitCode ?? 0);
+  });

@@ -12,6 +12,7 @@ import type {
   Session,
   SessionsResponse,
 } from "@agentremote/protocol";
+import { TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
 
 import { createBridge, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
 
@@ -329,6 +330,8 @@ class StubClaudeProvider implements AgentProvider {
   private readonly host: ProviderHost;
   private readonly projects: Project[];
   private readonly sessions = new Map<string, Session>();
+  /** Set by a test to make the next sendPrompt call throw instead of emitting a reply. */
+  sendPromptError: Error | undefined;
 
   constructor(host: ProviderHost, options: { projects: Project[] }) {
     this.host = host;
@@ -363,6 +366,9 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async sendPrompt(sessionId: string): Promise<void> {
+    if (this.sendPromptError !== undefined) {
+      throw this.sendPromptError;
+    }
     this.host.emit(sessionId, "agent.message", {
       messageId: "msg_stub",
       role: "assistant",
@@ -438,6 +444,74 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       for (const event of body.events) {
         expect(event.provider).toBe("claude");
       }
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("a prompt sent while a turn is in progress is rejected with 409", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.sendPromptError = new TurnInProgressError("turn already in progress");
+
+      const response = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            commandId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            sessionId: claudeBridge.session.id,
+            type: "prompt.send",
+            timestamp: new Date().toISOString(),
+            payload: { text: "hello" },
+          } satisfies Command),
+        }),
+      );
+      expect(response.status).toBe(409);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe("turn already in progress");
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("a prompt sent against a session with no live conversation is rejected with 404", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.sendPromptError = new UnknownSessionError("unknown session: " + claudeBridge.session.id);
+
+      const response = await claudeBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            commandId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            sessionId: claudeBridge.session.id,
+            type: "prompt.send",
+            timestamp: new Date().toISOString(),
+            payload: { text: "hello" },
+          } satisfies Command),
+        }),
+      );
+      expect(response.status).toBe(404);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toBe("unknown session: " + claudeBridge.session.id);
     } finally {
       restoreProviderEnv();
     }

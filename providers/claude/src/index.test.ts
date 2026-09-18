@@ -655,6 +655,68 @@ describe("ClaudeProvider", () => {
     expect(captured.returned?.()).toBe(true);
   });
 
+  test("a terminated session is no longer reported by listSessions, mirroring how the bridge's sessionExists gate reads it (E-015)", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    expect((await provider.listSessions()).map((s) => s.id)).toContain(session.id);
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    await provider.cancel(session.id);
+
+    // `sessionExists` in the bridge checks only id presence in `listSessions()`, not `state`, so
+    // the session must be removed outright rather than left behind with a terminal state.
+    expect((await provider.listSessions()).map((s) => s.id)).not.toContain(session.id);
+  });
+
+  test("canUseTool resolves a deny instead of throwing synchronously when it races a concurrent termination (E-016)", async () => {
+    let capturedCanUseTool: CanUseTool | undefined;
+    const queryFn: QueryFn = ((args) => {
+      capturedCanUseTool = args.options!.canUseTool;
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    // Terminate the conversation, then invoke the SDK's captured `canUseTool` as if the SDK had
+    // already committed to calling it just before termination landed (E-008's "in-flight
+    // parallel tool call" race, but against a session that is now gone).
+    await provider.cancel(session.id);
+
+    let synchronousThrow = false;
+    let result: unknown;
+    try {
+      const pending = capturedCanUseTool!("Bash", { command: "pwd" }, callOpts());
+      // A synchronous throw would have happened above, before `pending` is ever assigned to a
+      // promise; reaching here at all is already part of the assertion.
+      result = await pending;
+    } catch {
+      synchronousThrow = true;
+    }
+
+    expect(synchronousThrow).toBe(false);
+    expect(result).toMatchObject({ behavior: "deny" });
+  });
+
   test("seedSession throws for an unknown projectId (E-003)", () => {
     const { host } = createHost();
     const provider = new ClaudeProvider(host, {

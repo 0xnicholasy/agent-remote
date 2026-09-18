@@ -15,6 +15,8 @@ import {
   type ProviderHost,
   type Session,
   type SessionsResponse,
+  TurnInProgressError,
+  UnknownSessionError,
 } from "@agentremote/protocol";
 import { ClaudeProvider } from "@agentremote/provider-claude";
 
@@ -267,8 +269,15 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       createdSessionId = await execute(command);
     } catch (error) {
       inFlight.delete(command.commandId);
-      if (error instanceof ApprovalBindingMismatchError || error instanceof InteractionPendingError) {
+      if (
+        error instanceof ApprovalBindingMismatchError ||
+        error instanceof InteractionPendingError ||
+        error instanceof TurnInProgressError
+      ) {
         return json({ error: error.message }, 409);
+      }
+      if (error instanceof UnknownSessionError) {
+        return json({ error: error.message }, 404);
       }
       throw error;
     }
