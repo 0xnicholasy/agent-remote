@@ -717,6 +717,45 @@ describe("ClaudeProvider", () => {
     expect(result).toMatchObject({ behavior: "deny" });
   });
 
+  test("sendPrompt racing a concurrent cancel's teardown is rejected instead of hanging (E-017)", async () => {
+    let releaseReturn: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseReturn = resolve;
+    });
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        yield fakeResult("done");
+      }
+      const wrapped = asQuery(gen());
+      const originalReturn = wrapped.query.return;
+      // Defers `.return()` so `terminateConversation` is caught mid-teardown: `terminal` has
+      // already been set synchronously, but the conversation is still in `this.conversations`.
+      wrapped.query.return = (async (value: void) => {
+        await gate;
+        return originalReturn(value);
+      }) as Query["return"];
+      return wrapped.query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "first");
+    await delay();
+
+    const cancelPromise = provider.cancel(session.id);
+    await delay();
+
+    await expect(provider.sendPrompt(session.id, "second")).rejects.toBeInstanceOf(UnknownSessionError);
+
+    releaseReturn();
+    await cancelPromise;
+
+    expect(events.filter((event) => event.type === "turn.started")).toHaveLength(1);
+  });
+
   test("seedSession throws for an unknown projectId (E-003)", () => {
     const { host } = createHost();
     const provider = new ClaudeProvider(host, {

@@ -275,7 +275,7 @@ export class ClaudeProvider implements AgentProvider {
     const conversation = this.requireConversation(sessionId);
     const pending = conversation.pendingQuestion;
     if (pending === undefined || pending.questionId !== answer.questionId) {
-      throw new Error(`no pending question ${answer.questionId}`);
+      throw new ApprovalBindingMismatchError(`no pending question ${answer.questionId}`);
     }
     conversation.pendingQuestion = undefined;
 
@@ -307,9 +307,14 @@ export class ClaudeProvider implements AgentProvider {
     }
   }
 
+  /** Looks up the conversation for `sessionId`, failing closed on a conversation that is
+   * mid-teardown. `terminateConversation` flips `terminal` synchronously before its first
+   * `await`, so a `sendPrompt`/`approve`/`reject`/`answerQuestion` racing that teardown sees the
+   * same `UnknownSessionError` it would get once the conversation is actually removed from the
+   * map, instead of passing this guard and opening an interaction that will never resolve. */
   private requireConversation(sessionId: string): Conversation {
     const conversation = this.conversations.get(sessionId);
-    if (conversation === undefined) {
+    if (conversation === undefined || conversation.terminal) {
       throw new UnknownSessionError(`no conversation for session ${sessionId}`);
     }
     return conversation;
