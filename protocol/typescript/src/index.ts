@@ -6,6 +6,8 @@
  * file is the thing that needs fixing.
  */
 
+import { createHash } from "node:crypto";
+
 /** ISO 8601 timestamp in UTC, for example "2026-09-14T10:15:00.000Z". */
 export type IsoTimestamp = string;
 
@@ -348,4 +350,73 @@ export interface SessionsResponse {
 
 export interface ProjectsResponse {
   projects: Project[];
+}
+
+/**
+ * Everything a provider needs from the bridge. The bridge owns the event log and the event id
+ * sequence, so a provider is handed an emitter rather than numbering its own events. Shared
+ * here, rather than owned by one provider package, so both the bridge and every
+ * `AgentProvider` implementation depend only on the protocol, never on each other.
+ */
+export interface ProviderHost {
+  emit<T extends AgentEventType>(
+    sessionId: string,
+    type: T,
+    payload: AgentEventPayloadMap[T],
+  ): AgentEvent;
+  eventsAfter(after: number): AgentEvent[];
+  waitForChange(timeoutMs: number): Promise<void>;
+}
+
+/** Thrown when an approval or question decision's binding no longer matches the pending one. */
+export class ApprovalBindingMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApprovalBindingMismatchError";
+  }
+}
+
+/** Thrown when `sendPrompt` is called while an approval or question is still pending. */
+export class InteractionPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InteractionPendingError";
+  }
+}
+
+/** Thrown when `sendPrompt` is called while a turn is already running, with no approval or
+ * question pending (e.g. the agent is still streaming a reply). */
+export class TurnInProgressError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TurnInProgressError";
+  }
+}
+
+/** Thrown by `createSession` when the provider already holds as many live sessions as it allows.
+ * Distinct from the errors above: nothing about the request is wrong, the host is simply at
+ * capacity, so the client should retry after cancelling a session rather than fixing the call. */
+export class SessionLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionLimitError";
+  }
+}
+
+/** Thrown by a mutating call (`sendPrompt`, `approve`, `reject`, `cancel`, `answerQuestion`)
+ * made against a session id that has no live conversation: it was never created, or it already
+ * terminated (crashed, cancelled, or hit an unrecoverable error). */
+export class UnknownSessionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnknownSessionError";
+  }
+}
+
+/** Shared TTL for a pending approval before it expires. */
+export const APPROVAL_TTL_MS = 5 * 60 * 1000;
+
+/** Hashes the exact action text shown to the user, so a binding can be checked against it. */
+export function digest(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex").slice(0, 32)}`;
 }

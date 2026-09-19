@@ -1,46 +1,20 @@
-import { createHash } from "node:crypto";
-
-import type {
-  AgentCapabilities,
-  AgentEvent,
-  AgentEventPayloadMap,
-  AgentEventType,
-  AgentProvider,
-  ApprovalBinding,
-  CreateSessionOptions,
-  Project,
-  QuestionAnswerPayload,
-  Session,
+import {
+  APPROVAL_TTL_MS,
+  ApprovalBindingMismatchError,
+  digest,
+  InteractionPendingError,
+  type AgentCapabilities,
+  type AgentEvent,
+  type AgentProvider,
+  type ApprovalBinding,
+  type CreateSessionOptions,
+  type Project,
+  type ProviderHost,
+  type QuestionAnswerPayload,
+  type Session,
 } from "@agentremote/protocol";
 
-/**
- * Everything the provider needs from the bridge. The bridge owns the event log and the
- * event id sequence, so the provider is handed an emitter rather than numbering its own
- * events.
- */
-export interface ProviderHost {
-  emit<T extends AgentEventType>(
-    sessionId: string,
-    type: T,
-    payload: AgentEventPayloadMap[T],
-  ): AgentEvent;
-  eventsAfter(after: number): AgentEvent[];
-  waitForChange(timeoutMs: number): Promise<void>;
-}
-
-export class ApprovalBindingMismatchError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ApprovalBindingMismatchError";
-  }
-}
-
-export class InteractionPendingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "InteractionPendingError";
-  }
-}
+export { ApprovalBindingMismatchError, InteractionPendingError, type ProviderHost } from "@agentremote/protocol";
 
 interface PendingApproval {
   binding: ApprovalBinding;
@@ -50,12 +24,6 @@ interface PendingApproval {
 interface PendingQuestion {
   sessionId: string;
   turnId: string;
-}
-
-const APPROVAL_TTL_MS = 5 * 60 * 1000;
-
-function digest(text: string): string {
-  return `sha256:${createHash("sha256").update(text).digest("hex").slice(0, 32)}`;
 }
 
 /**

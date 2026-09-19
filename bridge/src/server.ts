@@ -1,19 +1,29 @@
+import path from "node:path";
+
 import Ajv2020 from "ajv/dist/2020";
 import addFormats from "ajv-formats";
-import type {
-  AgentEvent,
-  AgentEventEnvelope,
-  AgentEventPayloadMap,
-  AgentEventType,
-  Command,
-  CommandResponse,
-  EventsResponse,
-  ProjectsResponse,
-  Session,
-  SessionsResponse,
+import {
+  digest,
+  type AgentEvent,
+  type AgentEventEnvelope,
+  type AgentEventPayloadMap,
+  type AgentEventType,
+  type AgentProvider,
+  type Command,
+  type CommandResponse,
+  type EventsResponse,
+  type Project,
+  type ProjectsResponse,
+  type ProviderHost,
+  type Session,
+  type SessionsResponse,
+  SessionLimitError,
+  TurnInProgressError,
+  UnknownSessionError,
 } from "@agentremote/protocol";
+import { ClaudeProvider } from "@agentremote/provider-claude";
 
-import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, type ProviderHost } from "./providers/mock";
+import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider } from "./providers/mock";
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
@@ -32,12 +42,44 @@ const validateCommand = ajv.compile<Command>(commandSchema);
 const MAX_WAIT_SECONDS = 30;
 const DEFAULT_PORT = 8787;
 
+/** The bootstrap hook every provider offers so `createBridge` can seed a demo session without
+ * going through `createSession` (which would emit `session.started` before anyone is
+ * listening). Not part of the public `AgentProvider` contract. */
+interface SeedableProvider extends AgentProvider {
+  seedSession(session: Session): void;
+}
+
 export interface Bridge {
   /** The request handler, usable directly in tests or through `Bun.serve`. */
   fetch(request: Request): Promise<Response>;
   /** The seeded session, exposed so callers do not have to guess its identifier. */
   readonly session: Session;
-  readonly provider: MockProvider;
+  readonly provider: AgentProvider;
+}
+
+/** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
+ * test wire `AGENTREMOTE_PROVIDER=claude` without constructing a real `ClaudeProvider`, which
+ * would spawn the Claude Agent SDK's subprocess. Production code never passes it, so the
+ * default keeps building the real `ClaudeProvider` exactly as before. */
+export interface CreateBridgeOptions {
+  createClaudeProvider?: (host: ProviderHost, options: { projects: Project[] }) => SeedableProvider;
+}
+
+const VALID_PROVIDER_IDS = ["mock", "claude"] as const;
+type ValidProviderId = (typeof VALID_PROVIDER_IDS)[number];
+
+function isValidProviderId(value: string): value is ValidProviderId {
+  return (VALID_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+// Derives a stable project id from an absolute directory: the basename for readability, plus
+// a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
+// both named "app") never collide.
+export function projectIdFor(dir: string): string {
+  const base = dir.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
+  const slug = base.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
+  const suffix = digest(dir).replace("sha256:", "").slice(0, 8);
+  return `prj_${slug}_${suffix}`;
 }
 
 // `unknown` is genuinely the right type here: this helper serialises whatever a route hands
@@ -50,7 +92,19 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-export function createBridge(): Bridge {
+export function createBridge(options: CreateBridgeOptions = {}): Bridge {
+  // Only an UNSET AGENTREMOTE_PROVIDER may default to "mock". A set-but-unrecognized value
+  // (e.g. a typo) must fail startup loudly instead of silently running MockProvider, which
+  // would look like a healthy real session to anyone watching the event log.
+  const rawProviderId = process.env.AGENTREMOTE_PROVIDER;
+  const providerId = rawProviderId === undefined ? "mock" : rawProviderId.trim();
+  if (!isValidProviderId(providerId)) {
+    throw new Error(
+      `invalid AGENTREMOTE_PROVIDER: "${providerId}" (valid values: ${VALID_PROVIDER_IDS.join(", ")})`,
+    );
+  }
+  console.log(`Agent Remote bridge selected provider: ${providerId}`);
+
   const log: AgentEvent[] = [];
   const waiters = new Set<() => void>();
   const processed = new Map<string, CommandResponse>();
@@ -58,6 +112,10 @@ export function createBridge(): Bridge {
   // the same time cannot both pass the `processed` check and run the command twice.
   const inFlight = new Set<string>();
   let nextEventId = 1;
+  // Set once the provider instance exists (below); host.emit reads it lazily so an event's
+  // `provider` tag always reflects what actually constructed/ran the session (provider.id),
+  // never the raw env string, and so it can never diverge from session.provider.
+  let emittedProviderId: string = providerId;
 
   const wake = (): void => {
     for (const waiter of [...waiters]) {
@@ -78,7 +136,7 @@ export function createBridge(): Bridge {
       const event = {
         eventId: nextEventId++,
         sessionId,
-        provider: "mock",
+        provider: emittedProviderId,
         type,
         timestamp: new Date().toISOString(),
         payload,
@@ -105,11 +163,42 @@ export function createBridge(): Bridge {
     },
   };
 
-  const provider = new MockProvider(host);
+  let provider: SeedableProvider;
+  let seedProjectId: string;
+  if (providerId === "claude") {
+    // A blank or whitespace-only value is treated the same as unset, so a stray
+    // `AGENTREMOTE_PROJECT_DIRS=` in the environment falls back to cwd instead of leaving
+    // projects empty and crashing seedSession's later "unknown projectId" lookup. The same
+    // fallback applies when the value parses to zero usable directories (e.g. all commas or
+    // whitespace-only entries), so that case cannot crash startup either.
+    const rawDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+    const parsedDirs =
+      rawDirs === undefined
+        ? []
+        : rawDirs
+            .split(",")
+            .map((dir) => dir.trim())
+            .filter((dir) => dir.length > 0);
+    for (const dir of parsedDirs) {
+      if (!path.isAbsolute(dir)) {
+        throw new Error(`AGENTREMOTE_PROJECT_DIRS must contain only absolute paths, got: "${dir}"`);
+      }
+    }
+    const dirs = parsedDirs.length > 0 ? parsedDirs : [process.cwd()];
+    const projects: Project[] = dirs.map((dir) => ({ id: projectIdFor(dir), name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir, path: dir }));
+    const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
+    provider = createClaudeProvider(host, { projects });
+    seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
+  } else {
+    provider = new MockProvider(host);
+    seedProjectId = "prj_demo";
+  }
+  emittedProviderId = provider.id;
+
   const now = new Date().toISOString();
   const session: Session = {
     id: "ses_seed",
-    projectId: "prj_demo",
+    projectId: seedProjectId,
     provider: provider.id,
     state: "idle",
     createdAt: now,
@@ -149,6 +238,29 @@ export function createBridge(): Bridge {
     return sessions.some((session) => session.id === sessionId);
   }
 
+  // Maps the protocol error types a provider call can throw to the HTTP response both
+  // handleCommand and the cancel route return for them, so the two call sites stay in sync.
+  // Returns undefined for anything else, which the caller should rethrow.
+  // `unknown`: this narrows a caught value (a catch clause's type), not an unchecked passthrough.
+  function mapProviderError(error: unknown): Response | undefined {
+    if (
+      error instanceof ApprovalBindingMismatchError ||
+      error instanceof InteractionPendingError ||
+      error instanceof TurnInProgressError
+    ) {
+      return json({ error: error.message }, 409);
+    }
+    if (error instanceof UnknownSessionError) {
+      return json({ error: error.message }, 404);
+    }
+    // Capacity, not a bad request: 429 tells the client to retry later (after cancelling a
+    // session) rather than to change what it sent.
+    if (error instanceof SessionLimitError) {
+      return json({ error: error.message, code: "session_limit" }, 429);
+    }
+    return undefined;
+  }
+
   async function handleCommand(request: Request): Promise<Response> {
     // The body is untrusted network input: parse it as unknown JSON first (never asserted as
     // Command) and let the ajv schema validator, not a type cast, decide whether it is one.
@@ -178,8 +290,20 @@ export function createBridge(): Bridge {
       }
     }
 
-    if (command.type === "session.create" && command.payload.provider !== provider.id) {
-      return json({ error: `unknown provider: ${command.payload.provider}` }, 400);
+    if (command.type === "session.create") {
+      if (command.payload.provider !== provider.id) {
+        return json({ error: `unknown provider: ${command.payload.provider}` }, 400);
+      }
+      const projects = await provider.listProjects();
+      if (!projects.some((project) => project.id === command.payload.projectId)) {
+        return json(
+          {
+            error: "invalid_command",
+            details: [{ instancePath: "/payload/projectId", message: `unknown projectId: ${command.payload.projectId}` }],
+          },
+          400,
+        );
+      }
     }
 
     const previous = processed.get(command.commandId);
@@ -198,8 +322,9 @@ export function createBridge(): Bridge {
       createdSessionId = await execute(command);
     } catch (error) {
       inFlight.delete(command.commandId);
-      if (error instanceof ApprovalBindingMismatchError || error instanceof InteractionPendingError) {
-        return json({ error: error.message }, 409);
+      const mapped = mapProviderError(error);
+      if (mapped !== undefined) {
+        return mapped;
       }
       throw error;
     }
@@ -235,41 +360,93 @@ export function createBridge(): Bridge {
     session,
     provider,
     async fetch(request: Request): Promise<Response> {
-      const url = new URL(request.url);
-      const path = url.pathname;
+      // Catch-all around the whole route table: mapProviderError only translates the protocol's
+      // known error classes, so anything else thrown by a provider or by route logic itself
+      // (an unmapped provider error, a bug in a handler) must not reach Bun's default error
+      // handling, which can render the error's message/stack to the client. Every route,
+      // including the GET routes that call the provider with no try/catch of their own, is
+      // covered by this one wrapper so a future route is covered too.
+      try {
+        const url = new URL(request.url);
+        const path = url.pathname;
 
-      if (request.method === "POST" && path === "/v1/commands") {
-        return handleCommand(request);
-      }
-      if (request.method === "GET" && path === "/v1/events") {
-        return handleEvents(url);
-      }
-      if (request.method === "GET" && path === "/v1/sessions") {
-        return json({ sessions: await provider.listSessions() } satisfies SessionsResponse);
-      }
-      if (request.method === "GET" && path === "/v1/projects") {
-        return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
-      }
-
-      const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
-      if (request.method === "POST" && cancelMatch !== null) {
-        const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
-        if (!(await sessionExists(sessionId))) {
-          return json({ error: "unknown_session" }, 404);
+        if (request.method === "POST" && path === "/v1/commands") {
+          return await handleCommand(request);
         }
-        await provider.cancel(sessionId);
-        return json({ cancelled: true, sessionId });
-      }
+        if (request.method === "GET" && path === "/v1/events") {
+          return await handleEvents(url);
+        }
+        if (request.method === "GET" && path === "/v1/sessions") {
+          return json({ sessions: await provider.listSessions() } satisfies SessionsResponse);
+        }
+        if (request.method === "GET" && path === "/v1/projects") {
+          return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
+        }
 
-      return json({ error: "not found" }, 404);
+        const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
+        if (request.method === "POST" && cancelMatch !== null) {
+          const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
+          if (!(await sessionExists(sessionId))) {
+            return json({ error: "unknown_session" }, 404);
+          }
+          try {
+            await provider.cancel(sessionId);
+          } catch (error) {
+            // sessionExists and cancel are two separate provider calls, so a session that existed
+            // a moment ago can still disappear (or otherwise fail to cancel) before this runs.
+            const mapped = mapProviderError(error);
+            if (mapped !== undefined) {
+              return mapped;
+            }
+            throw error;
+          }
+          return json({ cancelled: true, sessionId });
+        }
+
+        return json({ error: "not found" }, 404);
+      } catch (error) {
+        console.error(`Agent Remote bridge: unhandled error on ${request.method} ${request.url}`, error);
+        return json({ error: "internal" }, 500);
+      }
     },
   };
 }
 
+/** Picks the hostname `Bun.serve` binds to, and whether that choice needs a no-auth warning.
+ * Exported for testing; `import.meta.main` below is the only production caller.
+ *
+ * `AGENTREMOTE_HOST` unset: the claude provider (which executes real host tool calls) defaults
+ * to loopback-only; the mock provider is left on Bun's own default (binds all interfaces),
+ * matching its pre-existing behavior. `AGENTREMOTE_HOST` set explicitly always wins, and a
+ * non-loopback value with the claude provider is flagged since this bridge has no auth. */
+export function resolveBindHost(
+  providerId: string,
+  envHost: string | undefined,
+): { hostname: string | undefined; warnNoAuth: boolean } {
+  const explicit = envHost?.trim();
+  if (explicit !== undefined && explicit.length > 0) {
+    const isLoopback = explicit === "127.0.0.1" || explicit === "localhost" || explicit === "::1";
+    return { hostname: explicit, warnNoAuth: providerId === "claude" && !isLoopback };
+  }
+  if (providerId === "claude") {
+    return { hostname: "127.0.0.1", warnNoAuth: false };
+  }
+  return { hostname: undefined, warnNoAuth: false };
+}
+
 if (import.meta.main) {
   const bridge = createBridge();
+  const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);
+  if (warnNoAuth) {
+    console.warn(
+      `Agent Remote bridge is binding to ${hostname} with the claude provider: this endpoint ` +
+        "has no authentication and can execute real tool calls on this host. Set " +
+        "AGENTREMOTE_HOST=127.0.0.1 (or run it behind a trusted network/proxy) unless this is intentional.",
+    );
+  }
   const server = Bun.serve({
     port: Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10),
+    ...(hostname === undefined ? {} : { hostname }),
     idleTimeout: 0,
     fetch: bridge.fetch,
   });
