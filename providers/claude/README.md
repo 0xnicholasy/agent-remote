@@ -1,11 +1,16 @@
 # Claude Code provider
 
-Last updated: 2026-09-17
+Last updated: 2026-09-19
 
 `@agentremote/provider-claude` implements `AgentProvider` for Claude Code, using the Claude
 Agent SDK (`@anthropic-ai/claude-agent-sdk`, pinned at `0.3.274`). It is registered in the
-bridge behind `AGENTREMOTE_PROVIDER=claude` and passed M2's controlled loopback experiment: see
-the event log below, produced by a real Claude Code session writing a real file.
+bridge behind `AGENTREMOTE_PROVIDER=claude`. Every interactive semantic M2's exit gate names —
+prompt, approval, rejection, provider question, answer by option, answer by supplied text plus a
+follow-up turn, and interrupt — is covered by the CI unit test suite (`src/index.test.ts`) against
+a scripted fake SDK. M2's gate also asks for evidence against the real SDK: the loopback harness
+below exercises the same semantics against a real Claude Code session, but it is a manual,
+operator-run tool, not something CI runs. See "Loopback harness (M2 evidence)" below for what that
+distinction means for the recorded run.
 
 The adapter keeps one SDK conversation (a streaming-input `query()` call) alive per Agent
 Remote session, so `sendPrompt` calls append to the same conversation instead of spawning a
@@ -78,30 +83,81 @@ a question answered by option and by free text; `sendPrompt` refused while an in
 pending; and `cancel` interrupting the query, invalidating its own session's pending approval,
 and leaving a second session's pending approval untouched.
 
+## Every tool must reach the watch
+
+Three SDK defaults resolve a tool call before `canUseTool` runs. Each was measured against the
+real SDK in the loopback harness on 2026-09-19, and each is turned off in `startConversation`:
+
+- `settingSources` omitted loads `~/.claude/settings.json` and the project's settings, so the
+  operator's own permission allow-list and hooks decide the call. Observed: a rejected `Write`
+  was retried as a shell redirect that ran with no second approval. Now `settingSources: []`
+  (SDK isolation mode). Cost: `CLAUDE.md` files are not loaded either; that needs `'project'`
+  here once project settings are trusted.
+- `sandbox.autoAllowBashIfSandboxed` defaults to `true`, so a sandboxable command is
+  auto-allowed. Now `false`.
+- The CLI's own safety classifier auto-approves a command it judges harmless. Observed:
+  `echo hello-from-bash` ran with no `approval.requested`. Now forced back to the permission
+  path with the policy-tier rule `managedSettings: { permissions: { ask: ["Bash"] } }`.
+
+Read-only tools the CLI resolves on its own (for example `Read`) are deliberately left alone:
+v0 asks the watch about shell commands and writes, not about every file read.
+
 ## Loopback harness (M2 evidence)
 
+This is a manual, operator-run harness, not a CI gate. It needs real Claude Code auth and network
+access, is not invoked by any CI workflow, and the log below is a point-in-time transcript from
+one run, not a repeatable check. The semantics it exercises are also asserted, deterministically
+and on every CI run, by the fake-SDK unit tests described under "Tests" above; this harness is
+additional evidence that those same semantics hold against the real SDK, not the thing enforcing
+them.
+
 ```sh
-bun run providers/claude/loopback.ts
+bun run providers/claude/loopback.ts            # every scenario
+bun run providers/claude/loopback.ts reject     # one or more named scenarios
 ```
 
-Starts the bridge components in-process with a real `ClaudeProvider` (the real SDK `query`,
-not the test fake) against a fresh temp directory, sends "Create a file named hello.txt
-containing the word hello", auto-approves the first `approval.requested`, prints every event as
-one JSON line, and exits on `turn.completed` or after 120 seconds. A real run (2026-09-17, with
-Claude Code already authenticated in this environment) produced:
+Each scenario runs the real `ClaudeProvider` (the real SDK `query`, not the test fake) in its
+own session against its own fresh temp directory, prints every event as one JSON line, checks
+its expectations, and the process exits non-zero if any scenario fails. Recorded transcript from
+one manual run, 2026-09-19, with Claude Code already authenticated in this environment — rerunning
+today may print different timings or a different model response, since the scenarios depend on a
+real model's choices:
 
 ```
-{"eventId":1,...,"type":"session.started","payload":{"projectId":"prj_loopback","resumed":false}}
-{"eventId":2,...,"type":"turn.started","payload":{"turnId":"trn_2","prompt":"Create a file named hello.txt containing the word hello"}}
-{"eventId":3,...,"type":"approval.requested","payload":{"binding":{...},"kind":"other","title":"Run Write","detail":"hello.txt"}}
-{"eventId":4,...,"type":"approval.resolved","payload":{"approvalId":"apr_3","decision":"accepted"}}
-{"eventId":5,...,"type":"agent.message","payload":{"text":"`hello.txt` created at `.../hello.txt`, content `hello` (read back, confirmed).","final":true}}
-{"eventId":6,...,"type":"turn.completed","payload":{"turnId":"trn_2","durationMs":19455,"summary":"..."}}
-{"eventId":7,...,"type":"usage.updated","payload":{"inputTokens":34,"outputTokens":437,"costUsd":0.99167055}}
+PASS  approve    5.2s  prompt, approval accepted, tool executed, agent response, turn completed
+PASS  reject     10.4s  approval rejected, the tool call is declined, the turn still completes
+PASS  question   6.8s  provider question, answered by option id, turn completed
+PASS  freetext   8.9s  question answered with supplied text, then a follow-up turn in the same session
+PASS  bash       6.3s  a shell command reaches the watch as an approval instead of running unattended
+PASS  interrupt  5.6s  cancel interrupts a running turn and ends the session as cancelled
 ```
 
-`hello.txt` was written to the temp directory with the expected content, confirming the
-approval → tool-execution → completion path works end to end against the real SDK.
+What each scenario checks beyond the event sequence:
+
+- `approve` — `hello.txt` exists in the temp directory and contains `hello`.
+- `reject` — `approval.resolved` carries `rejected`, the turn still completes, and no file was
+  written. The agent reports the write was declined rather than routing around it.
+- `question` — the SDK's `AskUserQuestion` becomes a `question.requested` with two options; the
+  reply carries the option that was answered by id.
+- `freetext` — the supplied text `gamma.txt` is accepted in place of an option, and a second
+  prompt in the same session recalls it, proving the conversation survives a mid-turn answer.
+- `bash` — a shell command emits `approval.requested` instead of running unattended.
+- `interrupt` — `cancel()` during generation produces `session.completed` with
+  `reason: "cancelled"` and no `turn.completed`.
+
+Sample event lines from the `reject` run:
+
+```
+{"eventId":3,...,"type":"approval.requested","payload":{"binding":{"approvalId":"apr_3",...},"kind":"file.write","title":".../hello.txt","detail":"hello.txt"}}
+{"eventId":4,...,"type":"approval.resolved","payload":{"approvalId":"apr_3","decision":"rejected","reason":"not from the watch"}}
+{"eventId":5,...,"type":"agent.message","payload":{"text":"I wasn't able to create the file - the write to `hello.txt` was rejected by the permission system...","final":true}}
+{"eventId":6,...,"type":"turn.completed","payload":{"turnId":"trn_2","durationMs":6778,...}}
+```
+
+The scenarios depend on a real model's choices, so a prompt can be answered a different way on
+another run (the `interrupt` scenario, for instance, assumes the essay takes longer than five
+seconds). A failure is a signal to read the printed event log before treating it as a
+regression.
 
 Authoritative references:
 

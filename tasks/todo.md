@@ -1,6 +1,6 @@
 # Agent Remote task board
 
-Last updated: 2026-09-17
+Last updated: 2026-09-19
 
 Agent Remote lets a user steer short coding-agent interruptions from an Apple Watch while the Mac remains the authority. The first release targets one real provider and one paired Mac on the local network: tap answers, approve or deny, send reviewed dictation, hear short foreground replies, see current/syncing/disconnected state, and cancel. It controls only sessions created through its bridge, not arbitrary terminal sessions that were already running.
 
@@ -40,10 +40,11 @@ Exit gate: a written feasibility result identifies what works in foreground, wha
 
 Dependencies: foundation; may overlap M1 where it does not assume an unproven delivery path.
 
-- [ ] Keep the mock provider available while evaluating real-provider candidates.
-- [ ] Use a controlled loopback-only harness to prove prompt, approval, rejection, provider question, supplied-text answer or follow-up, agent response, and interrupt behavior.
-- [ ] Verify mid-turn question and follow-up semantics without depending on Watch dictation, pairing, or remote authorization.
+- [x] 2026-09-19: the mock provider stays available; `AGENTREMOTE_PROVIDER` selects mock or claude.
+- [x] 2026-09-19: `providers/claude/loopback.ts` runs six scenarios against the real SDK (approve, reject, question, freetext, bash, interrupt), all passing. Evidence in `providers/claude/README.md`.
+- [x] 2026-09-19: mid-turn question and follow-up verified without Watch dictation, pairing, or remote authorization: the `freetext` scenario answers with supplied text mid-turn and a second prompt in the same session recalls it.
 - [ ] Measure provider interaction fidelity and command outcome latency, then choose the first provider based on the evidence.
+- [ ] Found while running the harness (2026-09-19, fixed in the same change): three SDK defaults resolved a tool call before `canUseTool`, so the command never reached the watch - filesystem settings (`settingSources`), the sandbox Bash auto-allow, and the CLI safety classifier. The fix forces all three back through the permission path; a future provider must be checked for the same class of bypass.
 
 Exit gate: one real provider demonstrates the required interactive semantics through the controlled local harness. This is feasibility evidence only; it does not authorize remote use or count as a task completed away from the Mac.
 

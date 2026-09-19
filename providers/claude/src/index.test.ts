@@ -21,7 +21,14 @@ async function expectApproveRefused(promise: Promise<void>): Promise<void> {
   expect(error instanceof ApprovalBindingMismatchError || error instanceof UnknownSessionError).toBe(true);
 }
 import type { AgentEvent, ApprovalBinding, Project, ProviderHost } from "@agentremote/protocol";
-import type { CanUseTool, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  Options,
+  PermissionResult,
+  Query,
+  SDKMessage,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeProvider, type QueryFn } from "./index";
 
@@ -174,6 +181,92 @@ describe("ClaudeProvider", () => {
     expect(types).toContain("turn.completed");
     const message = events.find((event) => event.type === "agent.message");
     expect(message?.payload).toMatchObject({ text: "hi there", final: true, role: "assistant" });
+  });
+
+  test("every tool is routed through canUseTool: no filesystem settings, no auto-allowed Bash", async () => {
+    // Measured against the real SDK on 2026-09-19: with these options left at their defaults a
+    // Bash command ran with no approval.requested ever emitted, because the user's own settings
+    // allow-list, the sandbox auto-allow and the CLI's safety classifier each resolve a tool call
+    // before canUseTool runs. A watch that never sees the approval cannot withhold it.
+    let seen: Options | undefined;
+    const queryFn: QueryFn = ((args) => {
+      seen = args.options;
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    await provider.createSession("p1");
+
+    expect(seen?.settingSources).toEqual([]);
+    expect(seen?.sandbox).toEqual({ autoAllowBashIfSandboxed: false });
+    expect(seen?.managedSettings).toEqual({ permissions: { ask: ["Bash"] } });
+    expect(typeof seen?.canUseTool).toBe("function");
+  });
+
+  test("the settings/sandbox/Bash-ask enforcement holds even when the caller's own permissionMode conflicts (R-06)", async () => {
+    // A caller-supplied `permissionMode` like "bypassPermissions" is exactly the kind of setting
+    // that could plausibly widen the SDK's own auto-allow behavior; this proves the adapter's
+    // hardcoded enforcement is not overridden or merged away by it.
+    let seen: Options | undefined;
+    const queryFn: QueryFn = ((args) => {
+      seen = args.options;
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      permissionMode: "bypassPermissions",
+    });
+    await provider.createSession("p1");
+
+    expect(seen?.permissionMode).toBe("bypassPermissions");
+    expect(seen?.settingSources).toEqual([]);
+    expect(seen?.sandbox).toEqual({ autoAllowBashIfSandboxed: false });
+    expect(seen?.managedSettings).toEqual({ permissions: { ask: ["Bash"] } });
+  });
+
+  test("a Bash tool call stays pending until explicitly approved, never auto-allowed (R-07)", async () => {
+    // Proves the bypass the R-06 config only configures: with no approve()/reject() call, the
+    // canUseTool promise must not resolve on its own, no matter how long it waits.
+    let settled = false;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const pending = args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        void pending.then(() => {
+          settled = true;
+        });
+        const result = await pending;
+        yield fakeResult(result?.behavior === "allow" ? "ran ls" : "denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay(30);
+
+    expect(settled).toBe(false);
+    const binding = bindingOf(events);
+
+    await provider.approve(session.id, binding);
+    await delay();
+
+    expect(settled).toBe(true);
+    const completed = events.find((event) => event.type === "turn.completed");
+    expect(completed?.payload).toMatchObject({ summary: "ran ls" });
   });
 
   test("an approval request unblocks the tool call once approved", async () => {

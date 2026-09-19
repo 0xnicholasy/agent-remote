@@ -535,6 +535,22 @@ export class ClaudeProvider implements AgentProvider {
     const { iterable, push } = createPushableIterable<SDKUserMessage>();
     const options: Options = {
       cwd: project.path,
+      // SDK isolation mode. With `settingSources` omitted the SDK loads ~/.claude/settings.json
+      // and the project's own settings, whose permission allow-lists and hooks resolve a tool
+      // call before `canUseTool` ever runs: a user who has allowed Bash locally would see the
+      // agent run commands with no approval reaching the watch. Every tool must route through
+      // `canUseTool`, so no filesystem settings are loaded. Cost: CLAUDE.md files are not read
+      // either, which needs `'project'` here once project settings are trusted.
+      settingSources: [],
+      // `sandbox.autoAllowBashIfSandboxed` defaults to true: a Bash command the SDK can run
+      // sandboxed is auto-allowed and never reaches `canUseTool`, so the watch would never see
+      // an approval for it. Measured 2026-09-19 in the loopback harness: `sleep 60` ran with no
+      // approval.requested emitted. Every tool must go to the watch, so the auto-allow is off.
+      sandbox: { autoAllowBashIfSandboxed: false },
+      // The CLI also auto-approves a command its own safety classifier judges harmless, again
+      // without calling `canUseTool`. A policy-tier ask rule for Bash forces every shell command
+      // back through the permission path, so it reaches the watch as an approval.
+      managedSettings: { permissions: { ask: ["Bash"] } },
       canUseTool: ((toolName, input, callOptions) =>
         this.handleCanUseTool(sessionId, toolName, input, callOptions)) satisfies CanUseTool,
       ...(this.permissionMode === undefined ? {} : { permissionMode: this.permissionMode }),
