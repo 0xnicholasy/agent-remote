@@ -20,6 +20,7 @@ import {
   type AgentCapabilities,
   type AgentProvider,
   type ApprovalBinding,
+  type ApprovalKind,
   type CreateSessionOptions,
   type Project,
   type ProviderHost,
@@ -63,6 +64,10 @@ export interface ClaudeProviderOptions {
 interface PendingApproval {
   binding: ApprovalBinding;
   resolve: (result: PermissionResult) => void;
+  /** Fires `APPROVAL_TTL_MS` after the approval was created and auto-resolves it as expired if
+   * nobody has approved/rejected/cancelled it by then (C1-001). Cleared by every path that takes
+   * this approval off `pendingApproval` for any other reason, so it never double-resolves. */
+  expiryTimer: ReturnType<typeof setTimeout>;
 }
 
 /** A single question from `AskUserQuestion`, kept so an answer can be translated back into the
@@ -202,6 +207,21 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
  * that `actionDigest` is computed over, so the binding the user approves always matches what
  * they were shown. Bash surfaces the command itself; Edit/Write surface the file path; anything
  * else falls back to the tool name plus its input, never a generic placeholder. */
+/** Maps an SDK tool name to the protocol's `ApprovalKind` discriminant (C1-003), so the watch
+ * client can render tool-specific icons/copy instead of every approval showing as "other". */
+function deriveApprovalKind(toolName: string): ApprovalKind {
+  if (toolName === "Bash") {
+    return "command";
+  }
+  if (toolName === "Edit" || toolName === "Write" || toolName === "MultiEdit" || toolName === "NotebookEdit") {
+    return "file.write";
+  }
+  if (toolName === "WebFetch" || toolName === "WebSearch") {
+    return "network";
+  }
+  return "other";
+}
+
 function deriveActionText(toolName: string, input: Record<string, unknown>): ActionText {
   if (toolName === "Bash" && typeof input.command === "string") {
     return truncateActionText(input.command);
@@ -562,6 +582,7 @@ export class ClaudeProvider implements AgentProvider {
     this.flushPendingAssistantMessage(sessionId, conversation);
     if (conversation.pendingApproval !== undefined) {
       const pending = conversation.pendingApproval;
+      clearTimeout(pending.expiryTimer);
       conversation.pendingApproval = undefined;
       this.resolvePendingApprovalEvent(sessionId, pending.binding.approvalId, "session terminated");
       pending.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
@@ -929,6 +950,7 @@ export class ClaudeProvider implements AgentProvider {
       () => {
         // Same guard as the question path: nothing to report if the abort beat registration.
         if (conversation.pendingApproval?.binding.approvalId === approvalId) {
+          clearTimeout(conversation.pendingApproval.expiryTimer);
           conversation.pendingApproval = undefined;
           this.resolvePendingApprovalEvent(sessionId, approvalId, "cancelled by agent");
         }
@@ -937,11 +959,35 @@ export class ClaudeProvider implements AgentProvider {
         this.restoreRunningState(sessionId, conversation);
       },
       (settle) => {
-        conversation.pendingApproval = { binding, resolve: settle };
+        // C1-001: nobody may ever call approve()/reject() for this approval (dropped watch
+        // connection, forgotten card). Without an active timer the lazy expiry check in
+        // `takeApproval` never runs on its own, so the `canUseTool` promise — and the interaction
+        // lock and subprocess behind it — would stay blocked past `expiresAt` forever. Arm a timer
+        // that resolves this exact approval as expired the same way a reject does, unless it has
+        // already been taken off `pendingApproval` for some other reason by then.
+        const expiryTimer = setTimeout(() => {
+          if (conversation.pendingApproval?.binding.approvalId !== approvalId) {
+            return;
+          }
+          conversation.pendingApproval = undefined;
+          this.host.emit(sessionId, "approval.resolved", {
+            approvalId,
+            decision: "expired",
+            reason: "expired",
+          });
+          this.restoreRunningState(sessionId, conversation);
+          settle({ behavior: "deny", message: "approval expired" });
+        }, this.approvalTtlMs);
+        // Never keep the process alive just for this timer (Bun/Node timers only; guarded since
+        // `unref` is not part of every timer handle contract).
+        if (typeof expiryTimer.unref === "function") {
+          expiryTimer.unref();
+        }
+        conversation.pendingApproval = { binding, resolve: settle, expiryTimer };
         const detail = `${callOptions.description ?? ""}${truncationNote}`.trim();
         this.host.emit(sessionId, "approval.requested", {
           binding,
-          kind: "other",
+          kind: deriveApprovalKind(toolName),
           // Always the same text the digest was computed over, so the card the user sees is
           // exactly what they are binding their decision to.
           title: actionText,
@@ -971,11 +1017,16 @@ export class ClaudeProvider implements AgentProvider {
       throw new ApprovalBindingMismatchError(`binding does not match approval ${binding.approvalId}`);
     }
     if (Date.parse(expected.expiresAt) < Date.now()) {
+      // Belt-and-braces: the timer armed in `handleCanUseTool` should already have auto-resolved
+      // this approval by the time `expiresAt` passes, but clear it regardless so a race between
+      // the timer firing and this call can never double-resolve `pending`.
+      clearTimeout(pending.expiryTimer);
       conversation.pendingApproval = undefined;
       this.host.emit(sessionId, "approval.resolved", { approvalId: binding.approvalId, decision: "expired" });
       pending.resolve({ behavior: "deny", message: "approval expired" });
       throw new ApprovalBindingMismatchError(`approval ${binding.approvalId} expired`);
     }
+    clearTimeout(pending.expiryTimer);
     conversation.pendingApproval = undefined;
     return pending;
   }

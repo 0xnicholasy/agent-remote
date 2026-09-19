@@ -7,6 +7,19 @@ import {
   TurnInProgressError,
   UnknownSessionError,
 } from "@agentremote/protocol";
+
+/** After an approval auto-expires nobody-answered, the SDK's `canUseTool` call unblocks with a
+ * deny and its turn finishes on its own, which — depending on exactly how far that race has
+ * gotten by the time the test calls `approve()` again — tears the conversation down before or
+ * after the redundant `approve()` arrives. Either way a late `approve()` must fail rather than
+ * double-resolve the same interaction, so both outcomes are accepted here (C1-001). */
+async function expectApproveRefused(promise: Promise<void>): Promise<void> {
+  const error: unknown = await promise.then(
+    () => undefined,
+    (caught: unknown) => caught,
+  );
+  expect(error instanceof ApprovalBindingMismatchError || error instanceof UnknownSessionError).toBe(true);
+}
 import type { AgentEvent, ApprovalBinding, Project, ProviderHost } from "@agentremote/protocol";
 import type { CanUseTool, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -277,8 +290,92 @@ describe("ClaudeProvider", () => {
     await delay();
     const binding = bindingOf(events);
 
-    await expect(provider.approve(session.id, binding)).rejects.toBeInstanceOf(ApprovalBindingMismatchError);
+    // The armed expiry timer (C1-001) may already have resolved this approval and torn the
+    // conversation down by the time this runs, so a late `approve()` can throw either the
+    // binding-mismatch or the unknown-session error; either means it correctly refused to
+    // double-resolve.
+    await expectApproveRefused(provider.approve(session.id, binding));
     expect(events.find((event) => event.type === "approval.resolved")?.payload).toMatchObject({ decision: "expired" });
+  });
+
+  test("C1-001: an approval nobody answers auto-resolves as denied once the TTL elapses", async () => {
+    let toolResult: PermissionResult | null = null;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const result = await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        toolResult = result;
+        yield fakeResult(result?.behavior === "allow" ? "ran ls" : "denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    // A short TTL (constructor option, C1-001) lets this test observe the auto-expiry timer
+    // firing instead of waiting out the real 5-minute `APPROVAL_TTL_MS`.
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      approvalTtlMs: 20,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    const binding = bindingOf(events);
+
+    // Nobody calls approve()/reject(): wait past the TTL for the timer to fire on its own.
+    await delay(60);
+
+    expect(toolResult).toMatchObject({ behavior: "deny" });
+    const resolvedEvents = events.filter((event) => event.type === "approval.resolved");
+    expect(resolvedEvents).toHaveLength(1);
+    expect(resolvedEvents[0]?.payload).toMatchObject({ approvalId: binding.approvalId, decision: "expired" });
+
+    // The binding was already taken off `pendingApproval` by the timer, so a late approve() must
+    // fail rather than double-resolving the same interaction.
+    await expectApproveRefused(provider.approve(session.id, binding));
+    expect(events.filter((event) => event.type === "approval.resolved")).toHaveLength(1);
+  });
+
+  test("C1-003: a Bash approval is emitted with kind \"command\"", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    expect(events.find((event) => event.type === "approval.requested")?.payload).toMatchObject({ kind: "command" });
+  });
+
+  test("C1-003: an unrecognized tool's approval falls back to kind \"other\"", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("SomeCustomTool", { foo: "bar" }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "do something");
+    await delay();
+
+    expect(events.find((event) => event.type === "approval.requested")?.payload).toMatchObject({ kind: "other" });
   });
 
   test("a question is answered by selecting an option", async () => {

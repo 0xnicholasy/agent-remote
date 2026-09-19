@@ -360,43 +360,54 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     session,
     provider,
     async fetch(request: Request): Promise<Response> {
-      const url = new URL(request.url);
-      const path = url.pathname;
+      // Catch-all around the whole route table: mapProviderError only translates the protocol's
+      // known error classes, so anything else thrown by a provider or by route logic itself
+      // (an unmapped provider error, a bug in a handler) must not reach Bun's default error
+      // handling, which can render the error's message/stack to the client. Every route,
+      // including the GET routes that call the provider with no try/catch of their own, is
+      // covered by this one wrapper so a future route is covered too.
+      try {
+        const url = new URL(request.url);
+        const path = url.pathname;
 
-      if (request.method === "POST" && path === "/v1/commands") {
-        return handleCommand(request);
-      }
-      if (request.method === "GET" && path === "/v1/events") {
-        return handleEvents(url);
-      }
-      if (request.method === "GET" && path === "/v1/sessions") {
-        return json({ sessions: await provider.listSessions() } satisfies SessionsResponse);
-      }
-      if (request.method === "GET" && path === "/v1/projects") {
-        return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
-      }
-
-      const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
-      if (request.method === "POST" && cancelMatch !== null) {
-        const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
-        if (!(await sessionExists(sessionId))) {
-          return json({ error: "unknown_session" }, 404);
+        if (request.method === "POST" && path === "/v1/commands") {
+          return await handleCommand(request);
         }
-        try {
-          await provider.cancel(sessionId);
-        } catch (error) {
-          // sessionExists and cancel are two separate provider calls, so a session that existed
-          // a moment ago can still disappear (or otherwise fail to cancel) before this runs.
-          const mapped = mapProviderError(error);
-          if (mapped !== undefined) {
-            return mapped;
+        if (request.method === "GET" && path === "/v1/events") {
+          return await handleEvents(url);
+        }
+        if (request.method === "GET" && path === "/v1/sessions") {
+          return json({ sessions: await provider.listSessions() } satisfies SessionsResponse);
+        }
+        if (request.method === "GET" && path === "/v1/projects") {
+          return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
+        }
+
+        const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
+        if (request.method === "POST" && cancelMatch !== null) {
+          const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
+          if (!(await sessionExists(sessionId))) {
+            return json({ error: "unknown_session" }, 404);
           }
-          throw error;
+          try {
+            await provider.cancel(sessionId);
+          } catch (error) {
+            // sessionExists and cancel are two separate provider calls, so a session that existed
+            // a moment ago can still disappear (or otherwise fail to cancel) before this runs.
+            const mapped = mapProviderError(error);
+            if (mapped !== undefined) {
+              return mapped;
+            }
+            throw error;
+          }
+          return json({ cancelled: true, sessionId });
         }
-        return json({ cancelled: true, sessionId });
-      }
 
-      return json({ error: "not found" }, 404);
+        return json({ error: "not found" }, 404);
+      } catch (error) {
+        console.error(`Agent Remote bridge: unhandled error on ${request.method} ${request.url}`, error);
+        return json({ error: "internal" }, 500);
+      }
     },
   };
 }

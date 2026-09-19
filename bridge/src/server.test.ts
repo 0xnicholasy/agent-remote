@@ -336,6 +336,8 @@ class StubClaudeProvider implements AgentProvider {
   cancelError: Error | undefined;
   /** Set by a test to make the next createSession call throw instead of returning a session. */
   createSessionError: Error | undefined;
+  /** Set by a test to make the next listSessions call throw instead of returning sessions. */
+  listSessionsError: Error | undefined;
 
   constructor(host: ProviderHost, options: { projects: Project[] }) {
     this.host = host;
@@ -351,6 +353,9 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async listSessions(): Promise<Session[]> {
+    if (this.listSessionsError !== undefined) {
+      throw this.listSessionsError;
+    }
     return [...this.sessions.values()];
   }
 
@@ -612,6 +617,31 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       const body = (await response.json()) as { error: string; code: string };
       expect(body.code).toBe("session_limit");
       expect(body.error).toBe("session limit reached");
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("C1-002: an unmapped provider error on GET /v1/sessions returns a generic 500 with no leaked detail", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      const distinctiveMessage = "boom: unexpected stub failure at /secret/path";
+      stub.current!.listSessionsError = new Error(distinctiveMessage);
+
+      const response = await claudeBridge.fetch(new Request("http://bridge.local/v1/sessions"));
+
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(text).not.toContain(distinctiveMessage);
+      expect(JSON.parse(text)).toEqual({ error: "internal" });
     } finally {
       restoreProviderEnv();
     }
