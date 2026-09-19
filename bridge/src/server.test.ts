@@ -681,6 +681,24 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
       restoreEnv();
     }
   });
+
+  test("an all-delimiter AGENTREMOTE_PROJECT_DIRS behaves like unset and lists exactly the cwd project", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    process.env.AGENTREMOTE_PROJECT_DIRS = ",, ,";
+    try {
+      const options: CreateBridgeOptions = {
+        createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+      };
+      expect(() => createBridge(options)).not.toThrow();
+      const claudeBridge = createBridge(options);
+      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
+      const projectsResponse = await claudeBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      const projects = ((await projectsResponse.json()) as { projects: Project[] }).projects;
+      expect(projects.map((project) => project.path)).toEqual([process.cwd()]);
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 describe("resolveBindHost", () => {

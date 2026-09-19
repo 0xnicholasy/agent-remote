@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ApprovalBindingMismatchError,
+  digest,
   InteractionPendingError,
   SessionLimitError,
   TurnInProgressError,
@@ -1405,5 +1406,168 @@ describe("ClaudeProvider", () => {
       .map((event) => (event.type === "turn.completed" ? event.payload.turnId : ""));
     expect(turnIds).toHaveLength(2);
     expect(turnIds[0]).not.toBe(turnIds[1]);
+  });
+
+  test("a result message delivered after teardown began emits no turn.completed (entry E-003)", async () => {
+    // A hand-rolled Query fake, not `asQuery(gen())`: exercising the real race needs independent
+    // control over when the pump loop's pending `next()` resolves versus when `return()`
+    // resolves, which a real async generator's own return-abort semantics would not give us.
+    const queue: SDKMessage[] = [];
+    const waiters: Array<(result: IteratorResult<SDKMessage>) => void> = [];
+    let releaseReturn: (() => void) | undefined;
+    const query = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next(): Promise<IteratorResult<SDKMessage>> {
+        const item = queue.shift();
+        if (item !== undefined) {
+          return Promise.resolve({ value: item, done: false });
+        }
+        return new Promise((resolve) => waiters.push(resolve));
+      },
+      return(value: void): Promise<IteratorResult<SDKMessage, void>> {
+        return new Promise((resolve) => {
+          releaseReturn = () => resolve({ value, done: true });
+        });
+      },
+      interrupt: async () => undefined,
+    } as unknown as Query;
+    const push = (message: SDKMessage): void => {
+      const waiter = waiters.shift();
+      if (waiter !== undefined) {
+        waiter({ value: message, done: false });
+        return;
+      }
+      queue.push(message);
+    };
+
+    const queryFn: QueryFn = (() => query) as QueryFn;
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "go");
+    await delay();
+
+    const cancelPromise = provider.cancel(session.id);
+    // Lets `cancel()` run past `interrupt()` and into `terminateConversation`, which marks the
+    // conversation `terminal` synchronously and then blocks on `queryHandle.return()` (held open
+    // above), mirroring `queryHandle.return()` racing a buffered `result` message that was already
+    // about to be yielded.
+    await delay();
+
+    push(fakeResult("too late"));
+    await delay();
+
+    releaseReturn?.();
+    await cancelPromise;
+    await delay();
+
+    expect(events.map((event) => event.type)).not.toContain("turn.completed");
+    expect(events.filter((event) => event.type === "session.completed")).toHaveLength(1);
+  });
+
+  test("a truncated approval detail carries a marker; the digest stays computed over the truncated title (entry E-004)", async () => {
+    const longCommand = `echo ${"x".repeat(250)}`;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const result = await args.options!.canUseTool!("Bash", { command: longCommand }, callOpts());
+        yield fakeResult(result?.behavior === "allow" ? "ran it" : "denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run the long command");
+    await delay();
+
+    const requested = events.find((event) => event.type === "approval.requested");
+    if (requested === undefined || requested.type !== "approval.requested") {
+      throw new Error("no approval.requested event was emitted");
+    }
+    // The title (and the digest computed over it) stay truncated to the same 200-char text as
+    // before; only `detail` gains a visible marker of how much was cut.
+    expect(requested.payload.title.length).toBeLessThan(longCommand.length);
+    expect(requested.payload.detail).toContain("more chars");
+    expect(requested.payload.binding.actionDigest).toBe(digest(requested.payload.title));
+  });
+
+  test("abort of a pending question restores the session to running, not stuck waiting (entry E-005)", async () => {
+    const controller = new AbortController();
+    let releaseTurn: (() => void) | undefined;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!(
+          "AskUserQuestion",
+          { questions: [{ question: "Which one?", options: [{ label: "a" }], multiSelect: false }] },
+          callOpts({ signal: controller.signal }),
+        );
+        // Holds the turn open past the abort so the test can observe the state restored to
+        // `running` before the turn's own `result` message would set it to `idle` anyway.
+        await new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "ask something");
+    await delay();
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("waiting");
+    expect(events.map((event) => event.type)).toContain("question.requested");
+
+    // The SDK gives up on this specific question (not the whole session): the conversation keeps
+    // going, so `waiting` must come back to `running` rather than sticking around stale.
+    controller.abort();
+    await delay();
+
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("running");
+    releaseTurn?.();
+  });
+
+  test("abort of a pending approval restores the session to running, not stuck waiting (entry E-006)", async () => {
+    const controller = new AbortController();
+    let releaseTurn: (() => void) | undefined;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts({ signal: controller.signal }));
+        // Same reasoning as the question test above: keeps the turn open past the abort so the
+        // restored state can be observed before the turn's `result` sets it to `idle`.
+        await new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("waiting");
+    expect(events.map((event) => event.type)).toContain("approval.requested");
+
+    // Same reasoning as the question case: the SDK abandoning this one tool call does not end the
+    // conversation, so `waiting` must come back to `running`.
+    controller.abort();
+    await delay();
+
+    expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("running");
+    releaseTurn?.();
   });
 });

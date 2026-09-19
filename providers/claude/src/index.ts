@@ -141,8 +141,19 @@ function errorMessage(error: unknown): string {
 
 const ACTION_TEXT_MAX_LENGTH = 200;
 
-function truncateActionText(text: string): string {
-  return text.length > ACTION_TEXT_MAX_LENGTH ? `${text.slice(0, ACTION_TEXT_MAX_LENGTH - 1)}…` : text;
+/** The truncated text shown on an approval card (and fed to `digest`), plus whether it was cut
+ * short. `fullLength` lets a caller say how much was hidden, since the full, untruncated input is
+ * what actually executes on approval. */
+interface ActionText {
+  text: string;
+  truncated: boolean;
+  fullLength: number;
+}
+
+function truncateActionText(text: string): ActionText {
+  return text.length > ACTION_TEXT_MAX_LENGTH
+    ? { text: `${text.slice(0, ACTION_TEXT_MAX_LENGTH - 1)}…`, truncated: true, fullLength: text.length }
+    : { text, truncated: false, fullLength: text.length };
 }
 
 /** Bounds how long `cancel`/`terminateConversation` wait on the SDK's `interrupt()`/`return()`
@@ -191,7 +202,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
  * that `actionDigest` is computed over, so the binding the user approves always matches what
  * they were shown. Bash surfaces the command itself; Edit/Write surface the file path; anything
  * else falls back to the tool name plus its input, never a generic placeholder. */
-function deriveActionText(toolName: string, input: Record<string, unknown>): string {
+function deriveActionText(toolName: string, input: Record<string, unknown>): ActionText {
   if (toolName === "Bash" && typeof input.command === "string") {
     return truncateActionText(input.command);
   }
@@ -683,7 +694,6 @@ export class ClaudeProvider implements AgentProvider {
 
   private handleMessage(sessionId: string, message: SDKMessage): void {
     const conversation = this.conversations.get(sessionId);
-    const turnId = conversation?.turnId ?? `trn_${++this.counter}`;
 
     if (message.type === "assistant") {
       for (const block of message.message.content) {
@@ -719,11 +729,18 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     if (message.type === "result") {
-      this.flushPendingAssistantMessage(sessionId, conversation);
-      if (conversation !== undefined) {
-        conversation.turnInProgress = false;
-        this.setSessionState(sessionId, "idle");
+      if (conversation === undefined || conversation.terminal) {
+        // The conversation was already torn down (terminal, or removed outright) by a concurrent
+        // `cancel()`/teardown before this trailing SDK message reached the pump loop. There is no
+        // live turn left to complete, and no `turnId` was ever announced for one, so drop the
+        // message instead of emitting `turn.completed`/`usage.updated` with a fabricated turnId
+        // for an already-completed session.
+        return;
       }
+      const turnId = conversation.turnId ?? `trn_${++this.counter}`;
+      this.flushPendingAssistantMessage(sessionId, conversation);
+      conversation.turnInProgress = false;
+      this.setSessionState(sessionId, "idle");
       if (message.subtype === "success") {
         this.host.emit(sessionId, "turn.completed", {
           turnId,
@@ -822,6 +839,10 @@ export class ClaudeProvider implements AgentProvider {
               conversation.pendingQuestion = undefined;
               this.resolvePendingQuestionEvent(sessionId, questionId, "cancelled by agent");
             }
+            // The SDK can abort this specific call (e.g. the agent gives up on its own question)
+            // without the conversation as a whole ending, so `Session.state` must come back from
+            // `waiting` to `running` here too, mirroring answerQuestion's resolved path.
+            this.restoreRunningState(sessionId, conversation);
           },
           (settle) => {
             conversation.pendingQuestion = { questionId, turnId, resolve: settle, question };
@@ -860,7 +881,23 @@ export class ClaudeProvider implements AgentProvider {
       };
     }
 
-    const actionText = callOptions.title ?? deriveActionText(toolName, input);
+    // `callOptions.title`, when the SDK supplies one, is used verbatim and is never run through
+    // `truncateActionText`, so it never needs the truncation marker below.
+    let actionText: string;
+    let truncationNote = "";
+    if (callOptions.title !== undefined) {
+      actionText = callOptions.title;
+    } else {
+      const derived = deriveActionText(toolName, input);
+      actionText = derived.text;
+      // Truncation marker: the digest/title above are computed over the truncated text, but the
+      // full, untruncated input is what actually executes on approval. Surfacing the cut in
+      // `detail` (never in `title`/the digest) lets an approver see the card is not the whole
+      // action.
+      if (derived.truncated) {
+        truncationNote = ` … (+${derived.fullLength - derived.text.length} more chars)`;
+      }
+    }
     const approvalId = `apr_${++this.counter}`;
     const binding: ApprovalBinding = {
       approvalId,
@@ -879,16 +916,20 @@ export class ClaudeProvider implements AgentProvider {
           conversation.pendingApproval = undefined;
           this.resolvePendingApprovalEvent(sessionId, approvalId, "cancelled by agent");
         }
+        // Same reasoning as the question path's abort branch: an SDK-initiated abort of this one
+        // call does not end the conversation, so `waiting` must be restored to `running` here too.
+        this.restoreRunningState(sessionId, conversation);
       },
       (settle) => {
         conversation.pendingApproval = { binding, resolve: settle };
+        const detail = `${callOptions.description ?? ""}${truncationNote}`.trim();
         this.host.emit(sessionId, "approval.requested", {
           binding,
           kind: "other",
           // Always the same text the digest was computed over, so the card the user sees is
           // exactly what they are binding their decision to.
           title: actionText,
-          ...(callOptions.description === undefined ? {} : { detail: callOptions.description }),
+          ...(detail === "" ? {} : { detail }),
           ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
         });
       },

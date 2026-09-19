@@ -29,10 +29,12 @@ process per turn. It never attaches to a terminal the user already has open.
 
 ## `canUseTool` mapping
 
-- `AskUserQuestion` → `question.requested`/`question.answered`. Only the first question in the
-  tool call's `questions` array is surfaced (the protocol's `QuestionRequestedPayload` carries
-  one question); `allowFreeText` is always `true` since the SDK adds an "Other" choice to every
-  `AskUserQuestion` call automatically. An answer resolves the tool call via `canUseTool`'s
+- `AskUserQuestion` → `question.requested`/`question.answered`. The SDK allows 1-4 questions per
+  tool call; the adapter asks each one in turn, one `question.requested`/`question.answered`
+  round trip at a time (never more than one pending question at once), then folds every answer
+  into a single combined result returned to the SDK. `allowFreeText` is always `true` since the
+  SDK adds an "Other" choice to every `AskUserQuestion` call automatically. An answer resolves
+  the tool call via `canUseTool`'s
   `allow` result with `updatedInput` shaped as the SDK's `AskUserQuestionOutput`
   (`questions`, `answers`, and `response` for free text) — this is the SDK's only channel for
   returning a question's answer, and is a different mechanism from an approval's `updatedInput`.
@@ -58,6 +60,9 @@ process per turn. It never attaches to a terminal the user already has open.
 - `resumeSession` — capability is `false`. The adapter keeps one long-lived streaming-input
   conversation per session instead of resuming by SDK session id, so there is nothing to resume
   across bridge restarts yet.
+- `AskUserQuestion`'s per-question `multiSelect` flag — the watch UI is single-select in v0, so a
+  multi-select question is presented and answered as single-select, and the resulting answer
+  carries only one selected option. Protocol-level multi-select support is a follow-up.
 
 ## Tests
 

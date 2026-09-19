@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import Ajv2020 from "ajv/dist/2020";
 import addFormats from "ajv-formats";
 import {
@@ -166,13 +168,23 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   if (providerId === "claude") {
     // A blank or whitespace-only value is treated the same as unset, so a stray
     // `AGENTREMOTE_PROJECT_DIRS=` in the environment falls back to cwd instead of leaving
-    // projects empty and crashing seedSession's later "unknown projectId" lookup.
+    // projects empty and crashing seedSession's later "unknown projectId" lookup. The same
+    // fallback applies when the value parses to zero usable directories (e.g. all commas or
+    // whitespace-only entries), so that case cannot crash startup either.
     const rawDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
-    const dirsSource = rawDirs === undefined || rawDirs.trim().length === 0 ? process.cwd() : rawDirs;
-    const dirs = dirsSource
-      .split(",")
-      .map((dir) => dir.trim())
-      .filter((dir) => dir.length > 0);
+    const parsedDirs =
+      rawDirs === undefined
+        ? []
+        : rawDirs
+            .split(",")
+            .map((dir) => dir.trim())
+            .filter((dir) => dir.length > 0);
+    for (const dir of parsedDirs) {
+      if (!path.isAbsolute(dir)) {
+        throw new Error(`AGENTREMOTE_PROJECT_DIRS must contain only absolute paths, got: "${dir}"`);
+      }
+    }
+    const dirs = parsedDirs.length > 0 ? parsedDirs : [process.cwd()];
     const projects: Project[] = dirs.map((dir) => ({ id: projectIdFor(dir), name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir, path: dir }));
     const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
     provider = createClaudeProvider(host, { projects });
