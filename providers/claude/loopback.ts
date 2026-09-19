@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { UnknownSessionError } from "@agentremote/protocol";
 import type {
   AgentEvent,
   AgentEventEnvelope,
@@ -190,8 +191,13 @@ class Harness {
     return this.provider.cancel(this.sessionId).then(
       () => undefined,
       (error: unknown) => {
-        // Already finished or already cancelled is fine; anything else is worth knowing about,
-        // and must not be reported as a clean pass by the caller.
+        // Already finished or already cancelled is fine: the provider answers a cancel for a
+        // terminal conversation with `UnknownSessionError`, and a scenario that cancels on its
+        // own (e.g. `interrupt`) leaves exactly that state behind. Anything else is worth
+        // knowing about, and must not be reported as a clean pass by the caller.
+        if (error instanceof UnknownSessionError) {
+          return undefined;
+        }
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[${this.name}] dispose: cancel failed:`, error);
         return `dispose: cancel failed: ${message}`;
