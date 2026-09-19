@@ -1289,6 +1289,33 @@ describe("ClaudeProvider", () => {
     await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
   });
 
+  test("a synchronous queryFn throw during createSession leaves no phantom session behind (R1-001)", async () => {
+    let calls = 0;
+    const queryFn: QueryFn = (() => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("sdk validation error");
+      }
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      maxSessions: 1,
+    });
+
+    await expect(provider.createSession("p1")).rejects.toThrow("sdk validation error");
+    // The failed create must not leave a phantom entry counting against maxSessions or showing
+    // up in listSessions.
+    expect(await provider.listSessions()).toHaveLength(0);
+    await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
+  });
+
   test("a pending question force-resolved by teardown is reported to the client (R-043)", async () => {
     const queryFn: QueryFn = ((args) => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {

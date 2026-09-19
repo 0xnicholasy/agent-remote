@@ -269,8 +269,11 @@ export class ClaudeProvider implements AgentProvider {
     if (project === undefined) {
       throw new Error(`unknown projectId: ${session.projectId}`);
     }
-    this.sessions.set(session.id, session);
+    // `startConversation` runs synchronously up to the `queryFn(...)` call; if that throws, this
+    // registers nothing in either map, so the session is only added to `this.sessions` once the
+    // conversation has actually been created (see R1-001).
     this.startConversation(session.id, project);
+    this.sessions.set(session.id, session);
   }
 
   async listProjects(): Promise<Project[]> {
@@ -305,8 +308,11 @@ export class ClaudeProvider implements AgentProvider {
       updatedAt: now,
       ...(options?.title === undefined ? {} : { title: options.title }),
     };
-    this.sessions.set(session.id, session);
+    // Same ordering as `seedSession` above: only register the session once `startConversation`
+    // has succeeded, so a synchronous `queryFn` throw (e.g. SDK validation error) leaves no
+    // phantom entry in `this.sessions` counting against `maxSessions` (R1-001).
     this.startConversation(session.id, project);
+    this.sessions.set(session.id, session);
     this.host.emit(session.id, "session.started", { projectId, resumed: false });
     return session;
   }
