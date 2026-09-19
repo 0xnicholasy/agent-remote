@@ -262,6 +262,17 @@ export class ClaudeProvider implements AgentProvider {
     this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
   }
 
+  /** Throws `SessionLimitError` if registering another session would exceed `maxSessions`.
+   * Shared by `createSession` and `seedSession` (R2-001) so every path that adds to
+   * `this.sessions` is covered by the same subprocess ceiling. */
+  private checkSessionLimit(): void {
+    if (this.sessions.size >= this.maxSessions) {
+      throw new SessionLimitError(
+        `session limit reached: ${this.sessions.size} of ${this.maxSessions} sessions are live; cancel one first`,
+      );
+    }
+  }
+
   /** Registers a session the bridge already knows about and starts its conversation, without
    * emitting `session.started`. Mirrors `MockProvider.seedSession`. */
   seedSession(session: Session): void {
@@ -269,6 +280,9 @@ export class ClaudeProvider implements AgentProvider {
     if (project === undefined) {
       throw new Error(`unknown projectId: ${session.projectId}`);
     }
+    // Same ceiling as `createSession` enforces, so any future caller of `seedSession` (e.g. a
+    // resume-on-restart path) cannot bypass the subprocess limit (R2-001).
+    this.checkSessionLimit();
     // `startConversation` runs synchronously up to the `queryFn(...)` call; if that throws, this
     // registers nothing in either map, so the session is only added to `this.sessions` once the
     // conversation has actually been created (see R1-001).
@@ -293,11 +307,7 @@ export class ClaudeProvider implements AgentProvider {
     // Every live session owns a Claude Code subprocess, so an unbounded create path lets a
     // client spawn processes until the Mac runs out of resources. Refused here rather than in the
     // bridge so any transport hitting the provider is covered by the same ceiling.
-    if (this.sessions.size >= this.maxSessions) {
-      throw new SessionLimitError(
-        `session limit reached: ${this.sessions.size} of ${this.maxSessions} sessions are live; cancel one first`,
-      );
-    }
+    this.checkSessionLimit();
     const now = new Date().toISOString();
     const session: Session = {
       id: `ses_${++this.counter}`,

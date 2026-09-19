@@ -1289,6 +1289,36 @@ describe("ClaudeProvider", () => {
     await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
   });
 
+  test("seedSession refuses to exceed maxSessions (R2-001)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      maxSessions: 1,
+    });
+    await provider.createSession("p1");
+
+    const now = new Date().toISOString();
+    expect(() =>
+      provider.seedSession({
+        id: "ses_seed",
+        projectId: "p1",
+        provider: "claude",
+        state: "idle",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).toThrow(SessionLimitError);
+    expect(await provider.listSessions()).toHaveLength(1);
+  });
+
   test("a synchronous queryFn throw during createSession leaves no phantom session behind (R1-001)", async () => {
     let calls = 0;
     const queryFn: QueryFn = (() => {
