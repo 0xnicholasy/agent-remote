@@ -60,6 +60,9 @@ class Harness {
   private sessionId: string | undefined;
   /** Most recent non-fatal `error` event seen by `waitFor`, surfaced if the wait times out. */
   private lastNonFatalError: AgentEventEnvelope<"error"> | undefined;
+  /** Set once `dispose` has run, so a second call (e.g. an early timeout teardown followed by
+   * the runner's own cleanup) is a no-op instead of a spurious second cancel. */
+  private disposed = false;
 
   constructor(
     private readonly name: string,
@@ -178,14 +181,22 @@ class Harness {
     return this.events.filter((event) => event.type === type) as AgentEventEnvelope<T>[];
   }
 
-  async dispose(): Promise<void> {
-    if (this.sessionId === undefined) {
-      return;
+  /** Resolves to a message describing a teardown failure, or `undefined` if teardown was clean. */
+  async dispose(): Promise<string | undefined> {
+    if (this.sessionId === undefined || this.disposed) {
+      return undefined;
     }
-    await this.provider.cancel(this.sessionId).catch((error: unknown) => {
-      // Already finished or already cancelled is fine; anything else is worth knowing about.
-      console.error(`[${this.name}] dispose: cancel failed:`, error);
-    });
+    this.disposed = true;
+    return this.provider.cancel(this.sessionId).then(
+      () => undefined,
+      (error: unknown) => {
+        // Already finished or already cancelled is fine; anything else is worth knowing about,
+        // and must not be reported as a clean pass by the caller.
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[${this.name}] dispose: cancel failed:`, error);
+        return `dispose: cancel failed: ${message}`;
+      },
+    );
   }
 }
 
@@ -370,11 +381,14 @@ async function runScenario(scenario: Scenario): Promise<ScenarioOutcome> {
   let failure: string | undefined;
   try {
     await harness.createSession();
-    await withTimeout(scenario.run(harness), SCENARIO_TIMEOUT_MS, `scenario ${scenario.name}`);
+    await withTimeout(scenario.run(harness), SCENARIO_TIMEOUT_MS, `scenario ${scenario.name}`, harness);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   } finally {
-    await harness.dispose();
+    const disposeFailure = await harness.dispose();
+    if (disposeFailure !== undefined) {
+      failure = failure === undefined ? disposeFailure : `${failure}; ${disposeFailure}`;
+    }
   }
 
   return {
@@ -386,16 +400,31 @@ async function runScenario(scenario: Scenario): Promise<ScenarioOutcome> {
   };
 }
 
-async function withTimeout<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+async function withTimeout<T>(work: Promise<T>, timeoutMs: number, label: string, harness: Harness): Promise<T> {
   // If `work` loses the race, it keeps running; mark its eventual rejection handled so it
-  // doesn't surface as an unhandled rejection after this function has already returned.
-  work.catch(() => {});
+  // doesn't surface as an unhandled rejection after this function has already returned, but log
+  // it so a genuine scenario error is never silently discarded.
+  work.catch((error: unknown) => {
+    console.error(`[${label}] abandoned scenario rejected:`, error);
+  });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       work,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new ScenarioFailure(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+        timer = setTimeout(() => {
+          // Tear the timed-out scenario's session down before the runner proceeds, so it cannot
+          // overlap the next scenario's session against a live SDK subprocess. The runner's own
+          // `dispose` is a no-op after this one, so a teardown failure here would be lost unless
+          // it is carried on the timeout error itself: report both, timeout first.
+          void harness.dispose().then(
+            (disposeFailure) => {
+              const suffix = disposeFailure === undefined ? "" : `; ${disposeFailure}`;
+              reject(new ScenarioFailure(`${label} exceeded ${timeoutMs}ms${suffix}`));
+            },
+            () => reject(new ScenarioFailure(`${label} exceeded ${timeoutMs}ms`)),
+          );
+        }, timeoutMs);
       }),
     ]);
   } finally {
