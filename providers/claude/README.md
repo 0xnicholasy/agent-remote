@@ -4,10 +4,13 @@ Last updated: 2026-09-19
 
 `@agentremote/provider-claude` implements `AgentProvider` for Claude Code, using the Claude
 Agent SDK (`@anthropic-ai/claude-agent-sdk`, pinned at `0.3.274`). It is registered in the
-bridge behind `AGENTREMOTE_PROVIDER=claude` and passes M2's controlled loopback experiment for
-every interactive semantic the gate names: prompt, approval, rejection, provider question,
-answer by option, answer by supplied text plus a follow-up turn, and interrupt. See the run
-below, produced by real Claude Code sessions.
+bridge behind `AGENTREMOTE_PROVIDER=claude`. Every interactive semantic M2's exit gate names —
+prompt, approval, rejection, provider question, answer by option, answer by supplied text plus a
+follow-up turn, and interrupt — is covered by the CI unit test suite (`src/index.test.ts`) against
+a scripted fake SDK. M2's gate also asks for evidence against the real SDK: the loopback harness
+below exercises the same semantics against a real Claude Code session, but it is a manual,
+operator-run tool, not something CI runs. See "Loopback harness (M2 evidence)" below for what that
+distinction means for the recorded run.
 
 The adapter keeps one SDK conversation (a streaming-input `query()` call) alive per Agent
 Remote session, so `sendPrompt` calls append to the same conversation instead of spawning a
@@ -101,6 +104,13 @@ v0 asks the watch about shell commands and writes, not about every file read.
 
 ## Loopback harness (M2 evidence)
 
+This is a manual, operator-run harness, not a CI gate. It needs real Claude Code auth and network
+access, is not invoked by any CI workflow, and the log below is a point-in-time transcript from
+one run, not a repeatable check. The semantics it exercises are also asserted, deterministically
+and on every CI run, by the fake-SDK unit tests described under "Tests" above; this harness is
+additional evidence that those same semantics hold against the real SDK, not the thing enforcing
+them.
+
 ```sh
 bun run providers/claude/loopback.ts            # every scenario
 bun run providers/claude/loopback.ts reject     # one or more named scenarios
@@ -108,8 +118,10 @@ bun run providers/claude/loopback.ts reject     # one or more named scenarios
 
 Each scenario runs the real `ClaudeProvider` (the real SDK `query`, not the test fake) in its
 own session against its own fresh temp directory, prints every event as one JSON line, checks
-its expectations, and the process exits non-zero if any scenario fails. Full run, 2026-09-19,
-with Claude Code already authenticated in this environment:
+its expectations, and the process exits non-zero if any scenario fails. Recorded transcript from
+one manual run, 2026-09-19, with Claude Code already authenticated in this environment — rerunning
+today may print different timings or a different model response, since the scenarios depend on a
+real model's choices:
 
 ```
 PASS  approve    5.2s  prompt, approval accepted, tool executed, agent response, turn completed

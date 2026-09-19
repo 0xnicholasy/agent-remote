@@ -58,6 +58,8 @@ class Harness {
   /** Events before this id have already been matched by an earlier `waitFor`. */
   private cursor = 0;
   private sessionId: string | undefined;
+  /** Most recent non-fatal `error` event seen by `waitFor`, surfaced if the wait times out. */
+  private lastNonFatalError: AgentEventEnvelope<"error"> | undefined;
 
   constructor(
     private readonly name: string,
@@ -124,8 +126,11 @@ class Harness {
 
   /**
    * Resolves with the first event of `type` at or after the scan cursor, advancing the cursor
-   * past it. A fatal `error` event aborts the wait so a provider crash fails fast instead of
-   * timing out.
+   * past it. A `fatal` `error` event aborts the wait so a provider error fails fast with its
+   * real message instead of the caller timing out waiting for something that will never
+   * arrive. A non-fatal `error` event does not abort the wait (some scenarios, e.g. `cancel`,
+   * emit one before the event the scenario is actually waiting for) but is recorded so a
+   * subsequent timeout can name it instead of failing with a bare timeout message.
    */
   async waitFor<T extends AgentEventType>(type: T, timeoutMs = WAIT_TIMEOUT_MS): Promise<AgentEventEnvelope<T>> {
     const deadline = Date.now() + timeoutMs;
@@ -138,14 +143,21 @@ class Harness {
           this.cursor = event.eventId;
           return event as AgentEventEnvelope<T>;
         }
-        if (event.type === "error" && event.payload.fatal) {
+        if (event.type === "error") {
           this.cursor = event.eventId;
-          throw new ScenarioFailure(`fatal provider error while waiting for ${type}: ${event.payload.message}`);
+          if (event.payload.fatal) {
+            throw new ScenarioFailure(`fatal provider error while waiting for ${type}: ${event.payload.message}`);
+          }
+          this.lastNonFatalError = event as AgentEventEnvelope<"error">;
+          console.log(`[${this.name}] non-fatal provider error while waiting for ${type}: ${event.payload.message}`);
         }
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        throw new ScenarioFailure(`timed out after ${timeoutMs}ms waiting for ${type}`);
+        const cause = this.lastNonFatalError
+          ? `; last non-fatal provider error: ${this.lastNonFatalError.payload.message}`
+          : "";
+        throw new ScenarioFailure(`timed out after ${timeoutMs}ms waiting for ${type}${cause}`);
       }
       await new Promise<void>((resolve) => {
         const waiter = (): void => {
@@ -170,8 +182,9 @@ class Harness {
     if (this.sessionId === undefined) {
       return;
     }
-    await this.provider.cancel(this.sessionId).catch(() => {
-      // Already finished or already cancelled: nothing left to tear down.
+    await this.provider.cancel(this.sessionId).catch((error: unknown) => {
+      // Already finished or already cancelled is fine; anything else is worth knowing about.
+      console.error(`[${this.name}] dispose: cancel failed:`, error);
     });
   }
 }
@@ -303,9 +316,8 @@ const SCENARIOS: Scenario[] = [
       // which case nothing here would ever be emitted and this wait would time out.
       const requested = await harness.waitFor("approval.requested");
       check(
-        requested.payload.title.toLowerCase().includes("bash") ||
-          (requested.payload.detail ?? "").includes("echo"),
-        `expected a Bash approval, got ${JSON.stringify(requested.payload.title)}`,
+        requested.payload.kind === "command",
+        `expected a Bash approval of kind "command", got ${JSON.stringify(requested.payload.kind)}`,
       );
       await harness.provider.approve(harness.session, requested.payload.binding);
       await harness.waitFor("approval.resolved");
@@ -319,8 +331,9 @@ const SCENARIOS: Scenario[] = [
       await harness.provider.sendPrompt(harness.session, SLOW_PROMPT);
       await harness.waitFor("turn.started");
 
-      // Let the turn get genuinely under way, then interrupt it mid-generation.
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      // Wait for the first streamed reply chunk instead of guessing with a flat sleep, so the
+      // interrupt genuinely lands mid-generation rather than assuming timing.
+      await harness.waitFor("agent.message");
       check(
         harness.seen("turn.completed").length === 0,
         "the essay turn finished before it could be interrupted; lengthen SLOW_PROMPT",
@@ -374,6 +387,9 @@ async function runScenario(scenario: Scenario): Promise<ScenarioOutcome> {
 }
 
 async function withTimeout<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  // If `work` loses the race, it keeps running; mark its eventual rejection handled so it
+  // doesn't surface as an unhandled rejection after this function has already returned.
+  work.catch(() => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
