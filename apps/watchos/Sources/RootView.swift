@@ -24,7 +24,8 @@ struct ConversationView: View {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 2) {
                                 statePill
-                                if !store.connected || store.statusLine.hasPrefix("Skipped") {
+                                if !store.connected
+                                    || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
                                     Text(store.statusLine)
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
@@ -58,6 +59,7 @@ struct ConversationView: View {
                 }
             }
             .navigationTitle("Agent Remote")
+            .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $dictating) { DictateView() }
         }
     }

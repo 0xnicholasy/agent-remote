@@ -11,6 +11,17 @@ struct TranscriptItem: Identifiable, Hashable {
     let text: String
 }
 
+/// Explicit status kind for the status line, so views branch on a typed value instead of
+/// matching a substring of the human-readable text.
+enum StatusKind: Equatable {
+    case notConnected
+    case connected
+    case skippedEvents
+    case reconnecting
+    case requestInvalid
+    case error
+}
+
 enum TurnState: String {
     case idle, thinking, running, waiting, completed, error
 
@@ -44,6 +55,7 @@ final class SessionStore {
     private(set) var lastSeenEventId: Int
     private(set) var connected = false
     private(set) var statusLine = "Not connected"
+    private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
 
     var hostText: String {
@@ -51,18 +63,22 @@ final class SessionStore {
     }
 
     let speaker: Speaker
-    @ObservationIgnored private let client: BridgeClient
+    @ObservationIgnored private let client: any BridgeClientProtocol
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
+    /// tell its own results are stale even when it was not cancelled in time to observe it.
+    @ObservationIgnored private var pollGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
 
-    init(speaker: Speaker = Speaker()) {
+    /// `client` is injectable so tests can substitute a fake in place of a real `BridgeClient`.
+    init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker()) {
         let defaults = UserDefaults.standard
         let stored = defaults.string(forKey: SessionStore.hostKey)
         let url = stored.flatMap(BridgeClient.parseBaseURL) ?? BridgeClient.defaultBaseURL
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
-        client = BridgeClient(baseURL: url)
+        self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
     }
 
@@ -70,32 +86,73 @@ final class SessionStore {
 
     func start() {
         guard pollTask == nil else { return }
-        pollTask = Task { [weak self] in await self?.pollLoop() }
+        pollGeneration += 1
+        let generation = pollGeneration
+        pollTask = Task { [weak self] in await self?.pollLoop(generation: generation) }
     }
 
     /// Applies a new host from Settings and restarts the poll loop against it.
     func reconnect() async {
         pollTask?.cancel()
         pollTask = nil
+        pollGeneration += 1
         if let url = BridgeClient.parseBaseURL(hostText) {
             await client.setBaseURL(url)
         }
         resetCursor()
+        // A new host means a different bridge and session space: drop the old binding and
+        // its state, or every event from the new bridge's session would be silently
+        // dropped by the cross-session guard in apply() until relaunch.
+        resetSessionState()
+        transcript.removeAll()
+        turnState = .idle
         start()
     }
 
-    private func pollLoop() async {
+    /// Clears the session binding and its pending UI state. Shared by reconnect(), the terminal
+    /// event branches in apply(), and the bridge-restart path in pollLoop() so a session that no
+    /// longer has a live bridge behind it never leaves a stuck card or a dangling binding.
+    private func resetSessionState() {
+        sessionId = nil
+        pendingApproval = nil
+        pendingQuestion = nil
+    }
+
+    private func pollLoop(generation: Int) async {
         var backoff: Double = 1
         while !Task.isCancelled {
             do {
                 let response = try await client.events(after: lastSeenEventId, wait: 20)
+                // The old task's request can complete successfully after reconnect() moved on
+                // to a new generation; drop it so it cannot re-bind sessionId to a stale bridge.
+                if Task.isCancelled || generation != pollGeneration { return }
                 connected = true
                 backoff = 1
                 // A restarted bridge numbers events from one again, so a cursor from the
                 // previous run would silently skip the whole new log.
                 if response.lastEventId < lastSeenEventId {
                     resetCursor()
+                    // The bridge restarted under the same host: the old sessionId (and any
+                    // pending card bound to it) has no live session behind it anymore, or it
+                    // would be stuck forever behind the cross-session guard in apply().
+                    resetSessionState()
+                    // The dead session's transcript belongs to a session this bridge no longer
+                    // knows about, or it would persist on screen alongside whatever starts next.
+                    transcript.removeAll()
+                    // Mirrors reconnect(): no live session remains behind the old turn, so a
+                    // stale .waiting/.thinking pill must not linger on screen after the reset.
+                    turnState = .idle
                     continue
+                }
+                // Set before applying events, or this would unconditionally clobber a more
+                // specific status (e.g. "Ignored session") that apply() sets while handling
+                // one of the events below.
+                if response.skipped > 0 {
+                    statusLine = "Skipped \(response.skipped) unreadable events"
+                    statusKind = .skippedEvents
+                } else {
+                    statusLine = "Connected"
+                    statusKind = .connected
                 }
                 for event in response.events {
                     apply(event)
@@ -103,11 +160,11 @@ final class SessionStore {
                 // Advances past skipped (undecodable) events too, not just the decoded ones.
                 lastSeenEventId = max(lastSeenEventId, response.lastEventId)
                 UserDefaults.standard.set(lastSeenEventId, forKey: SessionStore.cursorKey)
-                statusLine = response.skipped > 0 ? "Skipped \(response.skipped) unreadable events" : "Connected"
             } catch {
-                if Task.isCancelled { return }
+                if Task.isCancelled || generation != pollGeneration { return }
                 connected = false
                 statusLine = "Reconnecting: \(error)"
+                statusKind = .reconnecting
                 try? await Task.sleep(for: .seconds(backoff))
                 backoff = min(backoff * 2, 15)
             }
@@ -121,8 +178,17 @@ final class SessionStore {
 
     // MARK: - Event application
 
-    private func apply(_ event: AgentEvent) {
+    // Not private: the unit test target compiles this file directly and drives the store
+    // through decoded events instead of a running bridge.
+    func apply(_ event: AgentEvent) {
         if case .sessionStarted = event.payload {
+            // Already tracking a session: a session.started for a different id belongs to
+            // someone else's session and must not reset this one's card, status, or transcript.
+            if let current = sessionId, current != event.sessionId {
+                statusLine = "Ignored session \(event.sessionId) (still on \(current))"
+                statusKind = .skippedEvents
+                return
+            }
             sessionId = event.sessionId
             transcript.removeAll()
             pendingApproval = nil
@@ -131,6 +197,8 @@ final class SessionStore {
             append(.system, "Session \(event.sessionId) started", id: event.eventId)
             return
         }
+        // Binds to the first event seen when no session.started has been observed yet, for
+        // example right after relaunch with a cursor already past that event.
         if sessionId == nil { sessionId = event.sessionId }
         guard event.sessionId == sessionId else { return }
 
@@ -177,9 +245,19 @@ final class SessionStore {
         case .sessionCompleted(let payload):
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
+            // The session is over: release the binding so a later session.started (bridge- or
+            // user-initiated) can rebind instead of being dropped by the guard above. A
+            // terminal session has no bridge left to ack a pending card, so drop it here too
+            // instead of leaving it stuck on screen with a no-op approve()/answer().
+            resetSessionState()
         case .error(let payload):
             turnState = .error
             append(.system, payload.message, id: event.eventId)
+            // Only a fatal error ends the session; a recoverable one keeps the binding so
+            // in-flight events for it are still applied.
+            if payload.fatal {
+                resetSessionState()
+            }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
         case .fileModified(let payload):
@@ -198,11 +276,25 @@ final class SessionStore {
     @discardableResult
     func createSession() async -> String? {
         let placeholder = UUID().uuidString
+        let generation = pollGeneration
         let payload = SessionCreatePayload(projectId: SessionStore.projectId, provider: SessionStore.provider)
         do {
             let response = try await client.send(.sessionCreate(payload), sessionId: placeholder)
-            if let created = response.sessionId { sessionId = created }
-            return response.sessionId
+            // reconnect() or a session.started for another session can run during the await
+            // above; only bind if nothing has claimed sessionId since, or a poll loop hasn't
+            // moved on to a new generation, otherwise this would rebind to a stale session.
+            guard let created = response.sessionId,
+                  generation == pollGeneration,
+                  sessionId == nil || sessionId == created else {
+                // The rebind guard rejected this response: the id it carries is not (and must
+                // not become) the store's session, so callers like sendPrompt() must not treat
+                // it as a valid target either.
+                statusLine = "Session changed; prompt not sent"
+                statusKind = .skippedEvents
+                return nil
+            }
+            sessionId = created
+            return created
         } catch {
             report(error)
             return nil
@@ -229,10 +321,17 @@ final class SessionStore {
         defer { isSending = false }
         do {
             try await perform(.approvalAccept(ApprovalAcceptPayload(binding: request.binding)), sessionId: request.binding.sessionId)
-            pendingApproval = nil
+            // A newer approval could have arrived (via the poll loop) while this send was in
+            // flight; only clear the card if it's still the one this call answered.
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingApproval = nil
-            statusLine = "Request no longer valid"
+            // Only touch the card/status if a newer approval hasn't already replaced this one,
+            // or a still-valid card's status line would be stomped with a stale-request message.
+            if pendingApproval?.binding.approvalId == request.binding.approvalId {
+                pendingApproval = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -245,10 +344,13 @@ final class SessionStore {
         let payload = ApprovalRejectPayload(binding: request.binding, reason: "Denied from the Watch")
         do {
             try await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
-            pendingApproval = nil
+            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingApproval = nil
-            statusLine = "Request no longer valid"
+            if pendingApproval?.binding.approvalId == request.binding.approvalId {
+                pendingApproval = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -261,10 +363,15 @@ final class SessionStore {
         let payload = QuestionAnswerPayload(questionId: question.questionId, optionId: optionId)
         do {
             try await perform(.questionAnswer(payload), sessionId: target)
-            pendingQuestion = nil
+            // A newer question could have arrived while this send was in flight; only clear
+            // the card if it's still the one this call answered.
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingQuestion = nil
-            statusLine = "Request no longer valid"
+            if pendingQuestion?.questionId == question.questionId {
+                pendingQuestion = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -277,10 +384,13 @@ final class SessionStore {
         let payload = QuestionAnswerPayload(questionId: question.questionId, text: text)
         do {
             try await perform(.questionAnswer(payload), sessionId: target)
-            pendingQuestion = nil
+            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
         } catch BridgeError.http(let status, _) where status == 409 {
-            pendingQuestion = nil
-            statusLine = "Request no longer valid"
+            if pendingQuestion?.questionId == question.questionId {
+                pendingQuestion = nil
+                statusLine = "Request no longer valid"
+                statusKind = .requestInvalid
+            }
         } catch {
             report(error)
         }
@@ -311,5 +421,6 @@ final class SessionStore {
     private func report(_ error: any Error) {
         turnState = .error
         statusLine = "\(error)"
+        statusKind = .error
     }
 }

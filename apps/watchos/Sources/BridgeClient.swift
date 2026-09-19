@@ -19,7 +19,7 @@ enum EventsPageDecoder {
             let lastEventId = root["lastEventId"] as? Int,
             let rawEvents = root["events"] as? [[String: Any]]
         else {
-            throw BridgeError.http(status: 0, message: "malformed events response")
+            throw BridgeError.malformedResponse("expected an object with lastEventId and events")
         }
 
         var events: [AgentEvent] = []
@@ -43,31 +43,42 @@ enum EventsPageDecoder {
 
 /// The body of `POST /v1/commands`. A rejected command carries `error` instead of `accepted`.
 struct CommandResponse: Decodable, Sendable {
-    var accepted: Bool?
-    var commandId: String?
-    var duplicate: Bool?
-    var sessionId: String?
-    var error: String?
+    var accepted: Bool? = nil
+    var commandId: String? = nil
+    var duplicate: Bool? = nil
+    var sessionId: String? = nil
+    var error: String? = nil
 }
 
 struct SessionsResponse: Decodable, Sendable {
     var sessions: [Session]
 }
 
-enum BridgeError: Error, CustomStringConvertible {
+enum BridgeError: Error, CustomStringConvertible, Sendable {
     case invalidHost(String)
     case http(status: Int, message: String)
+    case malformedResponse(String)
 
     var description: String {
         switch self {
         case .invalidHost(let value): "Not a usable bridge address: \(value)"
         case .http(let status, let message): "Bridge returned \(status): \(message)"
+        case .malformedResponse(let message): "Bridge sent a response the client could not parse: \(message)"
         }
     }
 }
 
+/// The calls `SessionStore` makes on the bridge client. Lets tests substitute a fake client
+/// without opening a real network connection.
+protocol BridgeClientProtocol: Sendable {
+    func setBaseURL(_ url: URL) async
+    func events(after: Int, wait: Int) async throws -> EventsPage
+    @discardableResult
+    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse
+}
+
 /// Talks to the Mac Agent Bridge over the HTTP long-poll baseline. One instance per app.
-actor BridgeClient {
+actor BridgeClient: BridgeClientProtocol {
     static let defaultBaseURL = URL(string: "http://localhost:8787")!
 
     private var baseURL: URL
