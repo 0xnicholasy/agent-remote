@@ -1,11 +1,19 @@
 /**
- * Manual M2 harness: starts the bridge in-process with the real `ClaudeProvider` (the real
- * Claude Agent SDK `query`, not the test fake) against a temp project directory, sends one
- * prompt, auto-approves the first approval it sees, and prints every event as one JSON line.
+ * M2 loopback harness: drives the real `ClaudeProvider` (the real Claude Agent SDK `query`,
+ * not the test fake) against a fresh temp project directory and proves each interactive
+ * semantic the M2 exit gate names: prompt, approval, rejection, provider question, answer by
+ * option, answer by supplied text plus a follow-up turn, and interrupt.
  *
- * Run with: `bun run providers/claude/loopback.ts`
+ * Every scenario runs in its own session and its own temp directory, prints each event as one
+ * JSON line prefixed with the scenario name, and checks a small set of expectations. The
+ * process exits non-zero if any scenario fails.
+ *
+ * Run with:
+ *   bun run providers/claude/loopback.ts            # every scenario
+ *   bun run providers/claude/loopback.ts reject     # one or more named scenarios
  */
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,114 +23,400 @@ import type {
   AgentEventPayloadMap,
   AgentEventType,
   ProviderHost,
-  Session,
 } from "@agentremote/protocol";
 
 import { ClaudeProvider } from "./src/index";
 
-const TIMEOUT_MS = 120_000;
-const PROMPT = "Create a file named hello.txt containing the word hello";
+/** Per-scenario ceiling. A real turn with one approval took about 20 s in the first M2 run. */
+const SCENARIO_TIMEOUT_MS = 180_000;
+/** Ceiling for a single `waitFor`, kept below the scenario ceiling so a stall names the event. */
+const WAIT_TIMEOUT_MS = 120_000;
 
-async function main(): Promise<void> {
-  const projectDir = await mkdtemp(join(tmpdir(), "agentremote-loopback-"));
+const WRITE_PROMPT = "Create a file named hello.txt containing the word hello. Do not read or write any other file.";
+const QUESTION_PROMPT =
+  "Use the AskUserQuestion tool to ask me which filename to use, with exactly two options: " +
+  "alpha.txt and beta.txt. Do not create, read or write any file; after I answer, reply with " +
+  "the filename I picked and nothing else.";
+const BASH_PROMPT = "Using the Bash tool, run `echo hello-from-bash`. Use no other tool.";
+const SLOW_PROMPT =
+  "Write a detailed 2000-word essay about the history of timekeeping, from sundials to atomic " +
+  "clocks. Use no tools; write the whole essay in your reply.";
 
-  const log: AgentEvent[] = [];
-  const waiters = new Set<() => void>();
-  let nextEventId = 1;
+class ScenarioFailure extends Error {}
 
-  const wake = (): void => {
-    for (const waiter of [...waiters]) {
-      waiters.delete(waiter);
+/**
+ * One scenario's session: an in-process event log that plays the bridge's role, plus the
+ * waiting helpers a scenario needs to react to the provider the way a Watch client would.
+ */
+class Harness {
+  readonly events: AgentEvent[] = [];
+  readonly provider: ClaudeProvider;
+  readonly projectDir: string;
+
+  private readonly waiters = new Set<() => void>();
+  private nextEventId = 1;
+  /** Events before this id have already been matched by an earlier `waitFor`. */
+  private cursor = 0;
+  private sessionId: string | undefined;
+
+  constructor(
+    private readonly name: string,
+    projectDir: string,
+  ) {
+    this.projectDir = projectDir;
+    const host: ProviderHost = {
+      emit: <T extends AgentEventType>(
+        sessionId: string,
+        type: T,
+        payload: AgentEventPayloadMap[T],
+      ): AgentEvent => {
+        const event = {
+          eventId: this.nextEventId++,
+          sessionId,
+          provider: "claude",
+          type,
+          timestamp: new Date().toISOString(),
+          payload,
+        } as AgentEventEnvelope<T> as AgentEvent;
+        this.events.push(event);
+        console.log(`[${this.name}] ${JSON.stringify(event)}`);
+        this.wake();
+        return event;
+      },
+      eventsAfter: (after: number): AgentEvent[] => this.events.filter((event) => event.eventId > after),
+      waitForChange: (timeoutMs: number): Promise<void> =>
+        new Promise((resolve) => {
+          const waiter = (): void => {
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            this.waiters.delete(waiter);
+            resolve();
+          }, timeoutMs);
+          this.waiters.add(waiter);
+        }),
+    };
+
+    this.provider = new ClaudeProvider(host, {
+      projects: [{ id: "prj_loopback", name: "loopback", path: projectDir }],
+    });
+  }
+
+  private wake(): void {
+    for (const waiter of [...this.waiters]) {
+      this.waiters.delete(waiter);
       waiter();
     }
-  };
+  }
 
-  const host: ProviderHost = {
-    emit<T extends AgentEventType>(sessionId: string, type: T, payload: AgentEventPayloadMap[T]): AgentEvent {
-      const event = {
-        eventId: nextEventId++,
-        sessionId,
-        provider: "claude",
-        type,
-        timestamp: new Date().toISOString(),
-        payload,
-      } as AgentEventEnvelope<T> as AgentEvent;
-      log.push(event);
-      console.log(JSON.stringify(event));
-      wake();
-      return event;
-    },
-    eventsAfter(after: number): AgentEvent[] {
-      return log.filter((event) => event.eventId > after);
-    },
-    waitForChange(timeoutMs: number): Promise<void> {
-      return new Promise((resolve) => {
+  get session(): string {
+    if (this.sessionId === undefined) {
+      throw new ScenarioFailure("session was not created");
+    }
+    return this.sessionId;
+  }
+
+  async createSession(): Promise<void> {
+    const session = await this.provider.createSession("prj_loopback");
+    this.sessionId = session.id;
+  }
+
+  /**
+   * Resolves with the first event of `type` at or after the scan cursor, advancing the cursor
+   * past it. A fatal `error` event aborts the wait so a provider crash fails fast instead of
+   * timing out.
+   */
+  async waitFor<T extends AgentEventType>(type: T, timeoutMs = WAIT_TIMEOUT_MS): Promise<AgentEventEnvelope<T>> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      for (const event of this.events) {
+        if (event.eventId <= this.cursor || event.sessionId !== this.sessionId) {
+          continue;
+        }
+        if (event.type === type) {
+          this.cursor = event.eventId;
+          return event as AgentEventEnvelope<T>;
+        }
+        if (event.type === "error" && event.payload.fatal) {
+          this.cursor = event.eventId;
+          throw new ScenarioFailure(`fatal provider error while waiting for ${type}: ${event.payload.message}`);
+        }
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new ScenarioFailure(`timed out after ${timeoutMs}ms waiting for ${type}`);
+      }
+      await new Promise<void>((resolve) => {
         const waiter = (): void => {
           clearTimeout(timer);
           resolve();
         };
         const timer = setTimeout(() => {
-          waiters.delete(waiter);
+          this.waiters.delete(waiter);
           resolve();
-        }, timeoutMs);
-        waiters.add(waiter);
+        }, Math.min(remaining, 1000));
+        this.waiters.add(waiter);
       });
+    }
+  }
+
+  /** Every event of `type` seen so far, in order, ignoring the scan cursor. */
+  seen<T extends AgentEventType>(type: T): AgentEventEnvelope<T>[] {
+    return this.events.filter((event) => event.type === type) as AgentEventEnvelope<T>[];
+  }
+
+  async dispose(): Promise<void> {
+    if (this.sessionId === undefined) {
+      return;
+    }
+    await this.provider.cancel(this.sessionId).catch(() => {
+      // Already finished or already cancelled: nothing left to tear down.
+    });
+  }
+}
+
+function check(condition: boolean, message: string): void {
+  if (!condition) {
+    throw new ScenarioFailure(message);
+  }
+}
+
+interface Scenario {
+  name: string;
+  /** What this scenario is evidence for, printed in the summary. */
+  proves: string;
+  run(harness: Harness): Promise<void>;
+}
+
+const SCENARIOS: Scenario[] = [
+  {
+    name: "approve",
+    proves: "prompt, approval accepted, tool executed, agent response, turn completed",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, WRITE_PROMPT);
+      await harness.waitFor("turn.started");
+
+      const requested = await harness.waitFor("approval.requested");
+      await harness.provider.approve(harness.session, requested.payload.binding);
+
+      const resolved = await harness.waitFor("approval.resolved");
+      check(resolved.payload.decision === "accepted", `expected an accepted approval, got ${resolved.payload.decision}`);
+
+      await harness.waitFor("turn.completed");
+      check(harness.seen("agent.message").length > 0, "expected at least one agent.message");
+
+      const path = join(harness.projectDir, "hello.txt");
+      check(existsSync(path), `expected the approved write to create ${path}`);
+      const contents = (await readFile(path, "utf8")).trim();
+      check(contents.includes("hello"), `expected hello.txt to contain "hello", got ${JSON.stringify(contents)}`);
     },
-  };
+  },
+  {
+    name: "reject",
+    proves: "approval rejected, the tool call is declined, the turn still completes",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, WRITE_PROMPT);
+      await harness.waitFor("turn.started");
 
-  const provider = new ClaudeProvider(host, {
-    projects: [{ id: "prj_loopback", name: "loopback", path: projectDir }],
-  });
+      const requested = await harness.waitFor("approval.requested");
+      await harness.provider.reject(harness.session, requested.payload.binding, "not from the watch");
 
-  let session: Session;
+      const resolved = await harness.waitFor("approval.resolved");
+      check(resolved.payload.decision === "rejected", `expected a rejected approval, got ${resolved.payload.decision}`);
+
+      await harness.waitFor("turn.completed");
+      check(
+        !existsSync(join(harness.projectDir, "hello.txt")),
+        "expected no file after the only write was rejected",
+      );
+    },
+  },
+  {
+    name: "question",
+    proves: "provider question, answered by option id, turn completed",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, QUESTION_PROMPT);
+      await harness.waitFor("turn.started");
+
+      const requested = await harness.waitFor("question.requested");
+      check(requested.payload.options.length >= 2, "expected at least two options on the question");
+      const chosen = requested.payload.options[0]!;
+      await harness.provider.answerQuestion(harness.session, {
+        questionId: requested.payload.questionId,
+        optionId: chosen.id,
+      });
+
+      const answered = await harness.waitFor("question.answered");
+      check(
+        answered.payload.questionId === requested.payload.questionId,
+        "question.answered carried a different questionId",
+      );
+
+      await harness.waitFor("turn.completed");
+      const reply = harness.seen("agent.message").map((event) => event.payload.text).join("\n");
+      check(
+        reply.toLowerCase().includes(chosen.label.toLowerCase()),
+        `expected the reply to carry the chosen option ${JSON.stringify(chosen.label)}, got ${JSON.stringify(reply)}`,
+      );
+    },
+  },
+  {
+    name: "freetext",
+    proves: "question answered with supplied text, then a follow-up turn in the same session",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, QUESTION_PROMPT);
+      await harness.waitFor("turn.started");
+
+      const requested = await harness.waitFor("question.requested");
+      check(requested.payload.allowFreeText, "expected allowFreeText on a provider question");
+      await harness.provider.answerQuestion(harness.session, {
+        questionId: requested.payload.questionId,
+        text: "gamma.txt",
+      });
+
+      const answered = await harness.waitFor("question.answered");
+      check(answered.payload.answer.includes("gamma.txt"), `expected the supplied text in the answer, got ${answered.payload.answer}`);
+      await harness.waitFor("turn.completed");
+
+      // Follow-up turn: the same conversation must still hold what was answered mid-turn.
+      await harness.provider.sendPrompt(
+        harness.session,
+        "Which filename did I pick? Reply with the filename and nothing else.",
+      );
+      await harness.waitFor("turn.started");
+      await harness.waitFor("turn.completed");
+
+      const reply = harness.seen("agent.message").map((event) => event.payload.text).join("\n");
+      check(reply.includes("gamma.txt"), `expected the follow-up reply to recall gamma.txt, got ${JSON.stringify(reply)}`);
+      check(harness.seen("turn.started").length === 2, "expected exactly two turns in the follow-up scenario");
+    },
+  },
+  {
+    name: "bash",
+    proves: "a shell command reaches the watch as an approval instead of running unattended",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, BASH_PROMPT);
+      await harness.waitFor("turn.started");
+
+      // The SDK auto-allows a sandboxable Bash command unless the adapter turns that off, in
+      // which case nothing here would ever be emitted and this wait would time out.
+      const requested = await harness.waitFor("approval.requested");
+      check(
+        requested.payload.title.toLowerCase().includes("bash") ||
+          (requested.payload.detail ?? "").includes("echo"),
+        `expected a Bash approval, got ${JSON.stringify(requested.payload.title)}`,
+      );
+      await harness.provider.approve(harness.session, requested.payload.binding);
+      await harness.waitFor("approval.resolved");
+      await harness.waitFor("turn.completed");
+    },
+  },
+  {
+    name: "interrupt",
+    proves: "cancel interrupts a running turn and ends the session as cancelled",
+    async run(harness) {
+      await harness.provider.sendPrompt(harness.session, SLOW_PROMPT);
+      await harness.waitFor("turn.started");
+
+      // Let the turn get genuinely under way, then interrupt it mid-generation.
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      check(
+        harness.seen("turn.completed").length === 0,
+        "the essay turn finished before it could be interrupted; lengthen SLOW_PROMPT",
+      );
+
+      await harness.provider.cancel(harness.session);
+      const completed = await harness.waitFor("session.completed", 30_000);
+      check(
+        completed.payload.reason === "cancelled",
+        `expected session.completed reason "cancelled", got ${completed.payload.reason}`,
+      );
+      check(
+        harness.seen("turn.completed").length === 0,
+        "expected no turn.completed: the turn was interrupted, not finished",
+      );
+    },
+  },
+];
+
+interface ScenarioOutcome {
+  name: string;
+  proves: string;
+  ok: boolean;
+  failure?: string | undefined;
+  durationMs: number;
+}
+
+async function runScenario(scenario: Scenario): Promise<ScenarioOutcome> {
+  const projectDir = await mkdtemp(join(tmpdir(), `agentremote-loopback-${scenario.name}-`));
+  const harness = new Harness(scenario.name, projectDir);
+  const startedAt = Date.now();
+  console.log(`[${scenario.name}] project dir: ${projectDir}`);
+
+  let failure: string | undefined;
   try {
-    session = await provider.createSession("prj_loopback");
+    await harness.createSession();
+    await withTimeout(scenario.run(harness), SCENARIO_TIMEOUT_MS, `scenario ${scenario.name}`);
   } catch (error) {
-    console.error("Failed to create session:", error instanceof Error ? error.message : error);
+    failure = error instanceof Error ? error.message : String(error);
+  } finally {
+    await harness.dispose();
+  }
+
+  return {
+    name: scenario.name,
+    proves: scenario.proves,
+    ok: failure === undefined,
+    failure,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+async function withTimeout<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new ScenarioFailure(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const requested = process.argv.slice(2);
+  const unknown = requested.filter((name) => !SCENARIOS.some((scenario) => scenario.name === name));
+  if (unknown.length > 0) {
+    console.error(`Unknown scenario(s): ${unknown.join(", ")}`);
+    console.error(`Known scenarios: ${SCENARIOS.map((scenario) => scenario.name).join(", ")}`);
     process.exitCode = 1;
     return;
   }
 
-  const deadline = Date.now() + TIMEOUT_MS;
-  let approved = false;
-  let done = false;
+  const selected = requested.length > 0 ? SCENARIOS.filter((s) => requested.includes(s.name)) : SCENARIOS;
+  const outcomes: ScenarioOutcome[] = [];
+  for (const scenario of selected) {
+    outcomes.push(await runScenario(scenario));
+  }
 
-  try {
-    await provider.sendPrompt(session.id, PROMPT);
-
-    let cursor = 0;
-    while (!done && Date.now() < deadline) {
-      const batch = host.eventsAfter(cursor).filter((event) => event.sessionId === session.id);
-      for (const event of batch) {
-        cursor = Math.max(cursor, event.eventId);
-        if (event.type === "turn.completed") {
-          done = true;
-        }
-        if (event.type === "error" && event.payload.fatal) {
-          done = true;
-        }
-        if (!approved && event.type === "approval.requested") {
-          approved = true;
-          await provider.approve(session.id, event.payload.binding);
-        }
-      }
-      if (!done) {
-        await host.waitForChange(1000);
-      }
+  console.log("");
+  console.log("M2 loopback results");
+  for (const outcome of outcomes) {
+    const status = outcome.ok ? "PASS" : "FAIL";
+    console.log(`${status}  ${outcome.name.padEnd(10)} ${(outcome.durationMs / 1000).toFixed(1)}s  ${outcome.proves}`);
+    if (outcome.failure !== undefined) {
+      console.log(`      ${outcome.failure}`);
     }
+  }
 
-    if (!done) {
-      console.error(`Timed out after ${TIMEOUT_MS}ms waiting for turn.completed`);
-      process.exitCode = 1;
-    }
-  } finally {
-    // The SDK subprocess (queryHandle, started in createSession) and the pumpMessages loop keep
-    // the process referenced even after the turn completes or times out, so the harness would
-    // otherwise hang on exit instead of returning from main(). `cancel` interrupts and disposes
-    // it whether we got a clean `turn.completed` or hit the deadline.
-    await provider.cancel(session.id).catch(() => {
-      // Best effort: the conversation may already be terminal (turn.completed's error path).
-    });
+  if (outcomes.some((outcome) => !outcome.ok)) {
+    process.exitCode = 1;
   }
 }
 

@@ -21,7 +21,14 @@ async function expectApproveRefused(promise: Promise<void>): Promise<void> {
   expect(error instanceof ApprovalBindingMismatchError || error instanceof UnknownSessionError).toBe(true);
 }
 import type { AgentEvent, ApprovalBinding, Project, ProviderHost } from "@agentremote/protocol";
-import type { CanUseTool, PermissionResult, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  Options,
+  PermissionResult,
+  Query,
+  SDKMessage,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeProvider, type QueryFn } from "./index";
 
@@ -174,6 +181,30 @@ describe("ClaudeProvider", () => {
     expect(types).toContain("turn.completed");
     const message = events.find((event) => event.type === "agent.message");
     expect(message?.payload).toMatchObject({ text: "hi there", final: true, role: "assistant" });
+  });
+
+  test("every tool is routed through canUseTool: no filesystem settings, no auto-allowed Bash", async () => {
+    // Measured against the real SDK on 2026-09-19: with these options left at their defaults a
+    // Bash command ran with no approval.requested ever emitted, because the user's own settings
+    // allow-list, the sandbox auto-allow and the CLI's safety classifier each resolve a tool call
+    // before canUseTool runs. A watch that never sees the approval cannot withhold it.
+    let seen: Options | undefined;
+    const queryFn: QueryFn = ((args) => {
+      seen = args.options;
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    await provider.createSession("p1");
+
+    expect(seen?.settingSources).toEqual([]);
+    expect(seen?.sandbox).toMatchObject({ autoAllowBashIfSandboxed: false });
+    expect(seen?.managedSettings?.permissions?.ask).toContain("Bash");
+    expect(seen?.canUseTool).toBeDefined();
   });
 
   test("an approval request unblocks the tool call once approved", async () => {
