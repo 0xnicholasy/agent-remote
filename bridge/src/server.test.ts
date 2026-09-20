@@ -120,6 +120,14 @@ describe("bridge HTTP surface", () => {
     expect(afterSecond.length).toBe(afterFirst.length);
   });
 
+  test("a fresh bridge with no event history never reports a cursor as truncated", async () => {
+    const response = await bridge.fetch(new Request("http://bridge.local/v1/events?after=0"));
+    const body = (await response.json()) as EventsResponse;
+
+    expect(body.firstEventId).toBe(0);
+    expect(body.truncated).toBe(false);
+  });
+
   test("two concurrent retries of one commandId still execute it once", async () => {
     const command = promptCommand("77777777-7777-4777-8777-777777777777");
     const [first, second] = await Promise.all([post(command), post(command)]);
@@ -443,6 +451,13 @@ class StubClaudeProvider implements AgentProvider {
 describe("AGENTREMOTE_PROVIDER selection", () => {
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
 
+  // Every test in this file gets a `bridge` from the top-level beforeEach, pointed at the same
+  // AGENTREMOTE_STATE_DIR this describe's own createBridge calls use by default. Close it first
+  // so this describe's bridges do not collide with it on the single-writer lock.
+  beforeEach(() => {
+    bridge.close();
+  });
+
   function restoreProviderEnv(): void {
     if (originalProvider === undefined) {
       delete process.env.AGENTREMOTE_PROVIDER;
@@ -691,6 +706,11 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
 describe("indeterminate commands", () => {
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
 
+  // See the matching comment in "AGENTREMOTE_PROVIDER selection" above.
+  beforeEach(() => {
+    bridge.close();
+  });
+
   afterEach(() => {
     if (originalProvider === undefined) {
       delete process.env.AGENTREMOTE_PROVIDER;
@@ -756,6 +776,11 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
   const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
 
+  // See the matching comment in "AGENTREMOTE_PROVIDER selection" above.
+  beforeEach(() => {
+    bridge.close();
+  });
+
   function restoreEnv(): void {
     if (originalProvider === undefined) {
       delete process.env.AGENTREMOTE_PROVIDER;
@@ -795,9 +820,11 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
         authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
-      expect(() => createBridge(options)).not.toThrow();
-      const claudeBridge = createBridge(options);
-      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
+      let claudeBridge: Bridge | undefined;
+      expect(() => {
+        claudeBridge = createBridge(options);
+      }).not.toThrow();
+      expect(claudeBridge!.session.projectId).toBe(projectIdFor(process.cwd()));
     } finally {
       restoreEnv();
     }
@@ -811,10 +838,12 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
         authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
-      expect(() => createBridge(options)).not.toThrow();
-      const claudeBridge = createBridge(options);
-      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
-      const projectsResponse = await claudeBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      let claudeBridge: Bridge | undefined;
+      expect(() => {
+        claudeBridge = createBridge(options);
+      }).not.toThrow();
+      expect(claudeBridge!.session.projectId).toBe(projectIdFor(process.cwd()));
+      const projectsResponse = await claudeBridge!.fetch(new Request("http://bridge.local/v1/projects"));
       const projects = ((await projectsResponse.json()) as { projects: Project[] }).projects;
       expect(projects.map((project) => project.path)).toEqual([process.cwd()]);
     } finally {
@@ -1359,6 +1388,7 @@ describe("pairing", () => {
     expect(pairResponse.status).toBe(200);
     const deviceKey = deriveDeviceKey(firstBridge.pairingCode, deviceId, nonce);
 
+    firstBridge.close();
     const secondBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const response = await secondBridge.fetch(
       signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
@@ -1418,9 +1448,14 @@ describe("restart recovery", () => {
     rmSync(stateDir, { recursive: true, force: true });
   });
 
-  /** A second `createBridge` over the same state dir is exactly what a bridge restart is. */
+  /** A second `createBridge` over the same state dir is exactly what a bridge restart is. Closes
+   * the previous instance's single-writer lock first: a real restart's old process is gone by
+   * the time the new one starts, and no test here uses `first` after calling `restart()` again. */
+  let current: Bridge | undefined;
   function restart(): Bridge {
-    return createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+    current?.close();
+    current = createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+    return current;
   }
 
   function commandBody(commandId: string, sessionId: string): Command {
@@ -1507,6 +1542,40 @@ describe("restart recovery", () => {
     expect(continuous.truncated).toBe(false);
   });
 
+  test("an id already reserved by the watermark is never reissued after a crash that lost the event log itself", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a7777777-7777-4777-8777-777777777777", first.session.id));
+    const before = await eventsOf(first, 0);
+    const highestBefore = before.lastEventId;
+    expect(highestBefore).toBeGreaterThan(0);
+
+    // A crash that loses the event log file itself, not just a graceful restart: the log alone
+    // can no longer prove which ids are already spent, which is exactly what the watermark file
+    // is for.
+    rmSync(join(stateDir, "events.jsonl"));
+
+    const second = restart();
+    const afterCrash = await postTo(second, commandBody("a8888888-8888-4888-8888-888888888888", second.session.id));
+    expect(afterCrash.status).toBe(200);
+    for (const emitted of (await eventsOf(second, 0)).events) {
+      expect(emitted.eventId).toBeGreaterThan(highestBefore);
+    }
+  });
+
+  test("a cursor against a log emptied by retention is reported truncated even though ids were already issued", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a9999999-9999-4999-8999-999999999999", first.session.id));
+
+    // Simulate retention having dropped every retained event: the file exists but holds
+    // nothing, so firstEventId reports 0 even though the bridge has already issued many ids.
+    writeFileSync(join(stateDir, "events.jsonl"), "");
+
+    const second = restart();
+    const stale = await eventsOf(second, 0);
+    expect(stale.firstEventId).toBe(0);
+    expect(stale.truncated).toBe(true);
+  });
+
   test("a command the previous process died in the middle of is refused as indeterminate", async () => {
     const command = commandBody("a5555555-5555-4555-8555-555555555555", "ses_seed");
     const rawBody = JSON.stringify(command);
@@ -1537,6 +1606,7 @@ describe("restart recovery", () => {
     const accepted = await first.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
     expect(accepted.status).toBe(200);
 
+    first.close();
     const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const replayed = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
     expect(replayed.status).toBe(401);
@@ -1565,6 +1635,7 @@ describe("restart recovery", () => {
     const createdSessionId = ((await created.json()) as CommandResponse).sessionId;
     expect(createdSessionId).toBeDefined();
 
+    first.close();
     const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const response = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
     expect(response.status).toBe(200);
@@ -1573,5 +1644,34 @@ describe("restart recovery", () => {
     // The restarted provider has no such session, so only the persisted session index can
     // authorize these events; without it the device would reconnect to an empty history.
     expect(page.events.some((event) => event.sessionId === createdSessionId)).toBe(true);
+  });
+});
+
+describe("single-writer state dir lock", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  test("a second bridge refuses to start while the first still holds a live lock", () => {
+    createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
+      /already holds the lock/,
+    );
+  });
+
+  test("a lock file left behind by a dead process is taken over instead of blocking startup", () => {
+    // No real process can hold this pid; it is well past any platform's max pid.
+    writeFileSync(join(stateDir, "bridge.lock"), "999999999", "utf8");
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).not.toThrow();
   });
 });

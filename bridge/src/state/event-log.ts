@@ -135,15 +135,16 @@ export class EventLog {
     return 0;
   }
 
+  /** Persists the watermark before any id in the new block is handed out. Reservation must not
+   * advance in memory unless the write actually landed: a swallowed failure here is exactly how
+   * ids get reused after a crash, so the error is rethrown and takeEventId hands out nothing for
+   * this call. */
   private reserveIds(through: number): void {
-    this.reservedThrough = through;
     if (this.watermarkFilePath === undefined) {
+      this.reservedThrough = through;
       return;
     }
-    try {
-      atomicWriteFileSync(this.watermarkFilePath, JSON.stringify({ reservedThrough: through }));
-    } catch (error) {
-      console.error(`Agent Remote bridge: failed to persist the event id watermark`, error);
-    }
+    atomicWriteFileSync(this.watermarkFilePath, JSON.stringify({ reservedThrough: through }));
+    this.reservedThrough = through;
   }
 }

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -88,10 +88,67 @@ describe("EventLog", () => {
     expect(log.all().length).toBe(0); // both dropped by the 24h window
     expect(log.nextEventId).toBe(43);
   });
+
+  test("crossing the append-count compaction threshold rewrites the journal, and logical content survives it", () => {
+    const filePath = join(stateDir, "events.jsonl");
+    // 999 valid events plus one line load() will silently drop (matching JsonlJournal's "a torn
+    // line costs that record only" behavior above). Since nothing is dropped by time or by the
+    // retention cap, the constructor does not compact, so the corrupt line stays on disk until
+    // the append-count threshold does its own rewrite.
+    const seededCount = 999;
+    const seedLines = Array.from({ length: seededCount }, (_unused, index) => `${JSON.stringify(event(index + 1))}\n`).join(
+      "",
+    );
+    writeFileSync(filePath, `${seedLines}not-json\n`, "utf8");
+
+    const log = new EventLog(filePath, { now: NOW });
+    expect(log.all().length).toBe(seededCount);
+    expect(lineCount(filePath)).toBe(seededCount + 1); // the corrupt line is still physically there
+
+    // COMPACT_AFTER_APPENDS is 1000; this is exactly enough new appends to cross it, and stays
+    // well under MAX_RETAINED_EVENTS so the separate cap-eviction compaction path never fires.
+    for (let index = 0; index < 1000; index += 1) {
+      const id = log.takeEventId();
+      log.append(event(id));
+    }
+
+    expect(log.all().length).toBe(seededCount + 1000);
+    // Without the threshold firing, the file would carry the seed's corrupt line plus 1000
+    // appended lines (2000). Compaction rewrote it down to exactly the live events (1999).
+    expect(lineCount(filePath)).toBe(seededCount + 1000);
+
+    const reloaded = new EventLog(filePath, { now: NOW });
+    expect(reloaded.all().map((entry) => entry.eventId)).toEqual(log.all().map((entry) => entry.eventId));
+  });
 });
 
 describe("CommandJournal", () => {
-  test("the entry count is capped regardless of how many distinct command ids arrive", () => {
+  test("terminal entries are capped, oldest terminal evicted first", () => {
+    const filePath = join(stateDir, "commands.jsonl");
+    const journal = new CommandJournal(filePath, { now: NOW });
+
+    for (let index = 0; index < MAX_COMMANDS + 50; index += 1) {
+      journal.begin(`cmd-${index}`, "dev_a", `digest-${index}`, NOW);
+      journal.complete(`cmd-${index}`, { accepted: true, commandId: `cmd-${index}`, duplicate: false }, NOW);
+    }
+
+    expect(journal.size()).toBe(MAX_COMMANDS);
+    // The oldest terminal ids were evicted, the newest kept.
+    expect(journal.get("cmd-0")).toBeUndefined();
+    expect(journal.get(`cmd-${MAX_COMMANDS + 49}`)).toBeDefined();
+
+    // The journal is append-only and only rewrites the file on eviction or every
+    // COMPACT_AFTER_APPENDS appends, so a `complete()` right after an eviction-triggered
+    // compaction can legitimately leave one stale line on disk until the *next* write forces
+    // another rewrite. Asserting an exact on-disk line count at this arbitrary moment would pin
+    // that compaction timing rather than the cap. Instead, drive one more write (which pushes the
+    // map back over the cap and forces `enforceCap` + `compact` to run again) and assert the file
+    // converges back to the cap, proving the journal does not grow without bound.
+    journal.begin("cmd-cap-sentinel", "dev_a", "digest-sentinel", NOW);
+    expect(lineCount(filePath)).toBe(MAX_COMMANDS);
+  });
+
+  test("in-flight entries are never evicted, even past the cap", () => {
     const filePath = join(stateDir, "commands.jsonl");
     const journal = new CommandJournal(filePath, { now: NOW });
 
@@ -99,11 +156,11 @@ describe("CommandJournal", () => {
       journal.begin(`cmd-${index}`, "dev_a", `digest-${index}`, NOW);
     }
 
-    expect(journal.size()).toBe(MAX_COMMANDS);
-    // The oldest ids were evicted, the newest kept.
-    expect(journal.get("cmd-0")).toBeUndefined();
+    // No terminal record exists to evict, so the cap is exceeded rather than dropping a live
+    // in-flight idempotency record that a retry still depends on.
+    expect(journal.size()).toBe(MAX_COMMANDS + 50);
+    expect(journal.get("cmd-0")).toBeDefined();
     expect(journal.get(`cmd-${MAX_COMMANDS + 49}`)).toBeDefined();
-    expect(lineCount(filePath)).toBeLessThanOrEqual(MAX_COMMANDS);
   });
 
   test("a command left in flight by a dead process becomes indeterminate", () => {
@@ -143,6 +200,31 @@ describe("CommandJournal", () => {
     expect(journal.size()).toBe(0);
     expect(lineCount(filePath)).toBe(0);
   });
+
+  test("a failed complete() rolls the in-memory record back to the prior durable entry, and still throws", () => {
+    const filePath = join(stateDir, "commands.jsonl");
+    const journal = new CommandJournal(filePath, { now: NOW });
+    journal.begin("cmd-4", "dev_a", "digest-d", NOW);
+
+    // Replace the journal file with a directory of the same name: the next append's openSync
+    // call fails with EISDIR, simulating a journal write failure after the in_flight record was
+    // already durably persisted.
+    rmSync(filePath);
+    mkdirSync(filePath);
+
+    expect(() => journal.complete("cmd-4", { accepted: true, commandId: "cmd-4", duplicate: false }, NOW)).toThrow();
+
+    // The pre-existing in_flight record must still be there, not erased by the failed complete():
+    // losing it in memory while the journal on disk still has it would let a retry re-execute the
+    // command.
+    expect(journal.get("cmd-4")).toEqual({
+      commandId: "cmd-4",
+      deviceId: "dev_a",
+      digest: "digest-d",
+      status: "in_flight",
+      at: NOW.getTime(),
+    });
+  });
 });
 
 describe("SessionIndex", () => {
@@ -172,5 +254,48 @@ describe("NonceCache persistence", () => {
     const afterExpiry = new NonceCache({ journal: createNonceJournal(filePath), now: muchLater });
     expect(afterExpiry.has("dev_a", "nonce-fresh", muchLater)).toBe(false);
     expect(lineCount(filePath)).toBe(0);
+  });
+
+  test("crossing the append-count compaction threshold rewrites the journal down to the live set", () => {
+    const filePath = join(stateDir, "nonces.jsonl");
+    const cache = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+
+    // Each call advances `now` past the previous nonce's 300s TTL, so pruneExpired drops it
+    // before the next is recorded: the live set for this device never holds more than one
+    // entry, yet every call still appends its own line, so the raw file would grow to 1000
+    // lines by the time the append-count threshold is reached.
+    let now = NOW;
+    for (let index = 0; index < 1000; index += 1) {
+      now = new Date(now.getTime() + 301_000);
+      cache.record("dev_a", `nonce-${index}`, now);
+    }
+
+    expect(lineCount(filePath)).toBe(1); // compacted to just the one still-live nonce
+    expect(cache.has("dev_a", "nonce-999", now)).toBe(true);
+
+    const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now });
+    expect(reloaded.has("dev_a", "nonce-999", now)).toBe(true);
+  });
+
+  test("the per-device nonce cap and journal persistence agree on who survives a restart", () => {
+    const filePath = join(stateDir, "nonces.jsonl");
+    const MAX_NONCES_PER_DEVICE = 10_000; // mirrors auth/verify.ts's cap, which is not exported
+    const cache = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+
+    const total = MAX_NONCES_PER_DEVICE + 10;
+    for (let index = 0; index < total; index += 1) {
+      cache.record("dev_a", `nonce-${index}`, NOW);
+    }
+
+    // In-memory eviction dropped the oldest 10 before any restart happens at all.
+    expect(cache.has("dev_a", "nonce-9", NOW)).toBe(false);
+    expect(cache.has("dev_a", "nonce-10", NOW)).toBe(true);
+
+    const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+    // The journal must agree with the in-memory eviction: a survivor the cap kept must still be
+    // known after a restart, and one it evicted must not come back as if it were still fresh.
+    expect(reloaded.has("dev_a", "nonce-9", NOW)).toBe(false);
+    expect(reloaded.has("dev_a", "nonce-10", NOW)).toBe(true);
+    expect(reloaded.has("dev_a", `nonce-${total - 1}`, NOW)).toBe(true);
   });
 });

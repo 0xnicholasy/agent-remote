@@ -3,6 +3,16 @@ import { dirname } from "node:path";
 
 import { atomicWriteFileSync } from "../auth/persist";
 
+/** Fsyncs a directory so a crash cannot lose an already-fsynced file's directory entry. */
+function fsyncDirSync(path: string): void {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Append-only JSON Lines store for bridge state that must survive a restart, per
  * docs/durability-v0.md. One JSON object per line; a line that does not parse is skipped on
@@ -38,8 +48,15 @@ export class JsonlJournal<T> {
     let raw: string;
     try {
       raw = readFileSync(this.filePath, "utf8");
-    } catch {
-      return [];
+    } catch (error) {
+      // NodeJS.ErrnoException, not `unknown`/`any`: the only fields read are its own `code`.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        // Legitimately absent (e.g. removed between the existsSync check and this read).
+        return [];
+      }
+      console.error(`Agent Remote bridge: failed to read journal ${this.filePath}`, error);
+      throw error;
     }
 
     const records: T[] = [];
@@ -62,9 +79,8 @@ export class JsonlJournal<T> {
    * loss must not be replayable afterwards. Volumes here are a handful of records per turn, so
    * the cost is not worth trading for that guarantee.
    *
-   * A failed write is reported and swallowed. Losing durability is bad; taking the whole event
-   * emission path down with it (this runs inside `host.emit`, outside any route's try/catch) is
-   * worse, and matches how the device registry already handles a failed `lastSeenAt` persist.
+   * A failed write is reported, then rethrown: a caller believing an unpersisted record made it
+   * to durable storage is worse than a caller that has to decide what to do about the failure.
    */
   append(record: T): void {
     if (this.filePath === undefined) {
@@ -76,8 +92,10 @@ export class JsonlJournal<T> {
       fd = openSync(this.filePath, "a", 0o600);
       writeSync(fd, `${JSON.stringify(record)}\n`);
       fsyncSync(fd);
+      fsyncDirSync(dirname(this.filePath));
     } catch (error) {
       console.error(`Agent Remote bridge: failed to append to ${this.filePath}`, error);
+      throw error;
     } finally {
       if (fd !== undefined) {
         try {
@@ -89,8 +107,9 @@ export class JsonlJournal<T> {
     }
   }
 
-  /** Replaces the file with exactly `records`, atomically. Failures are reported, not thrown,
-   * for the same reason `append` swallows them. */
+  /** Replaces the file with exactly `records`, atomically (temp file then rename, so a failure
+   * before the rename leaves the original journal untouched). Failures are reported, then
+   * rethrown, for the same reason `append` no longer swallows them. */
   rewrite(records: readonly T[]): void {
     if (this.filePath === undefined) {
       return;
@@ -98,8 +117,10 @@ export class JsonlJournal<T> {
     const body = records.map((record) => `${JSON.stringify(record)}\n`).join("");
     try {
       atomicWriteFileSync(this.filePath, body);
+      fsyncDirSync(dirname(this.filePath));
     } catch (error) {
       console.error(`Agent Remote bridge: failed to rewrite ${this.filePath}`, error);
+      throw error;
     }
   }
 }

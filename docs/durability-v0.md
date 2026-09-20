@@ -54,6 +54,19 @@ oldest evicted first — but it now writes through to `nonces.jsonl` and rehydra
 startup, dropping anything already expired. A request replayed across a bridge restart is still
 refused with `401 replayed_request`.
 
+**Known limits.** Two replay edges are intentionally left open here and tracked as follow-up
+work, not fixed in this change:
+
+- **Nonce capacity eviction.** When a device's nonce set hits `MAX_NONCES_PER_DEVICE`
+  (`bridge/src/auth/verify.ts`), the oldest recorded nonce is evicted even if it is still inside
+  its 300 second validity window, so that specific nonce becomes replayable. Reaching the cap
+  requires the attacker to already hold the device key, since a nonce is only recorded after its
+  signature verifies.
+- **Clock rollback.** Nonce expiry and pruning trust the bridge's wall clock. If the host clock
+  jumps forward and then back, nonces can be pruned early and replayed within what should still be
+  their TTL. This requires control of the host, and the envelope's timestamp skew check trusts the
+  same wall clock, so this is not closed by switching the nonce cache alone to a monotonic clock.
+
 ## Command identity
 
 `commandId` remains the idempotency key, and the bridge still stores the SHA-256 of the exact body

@@ -155,9 +155,28 @@ export class CommandJournal {
   }
 
   private write(entry: CommandEntry): void {
+    // Capture the prior record (if any) before overwriting, so a failed append can restore the
+    // map to its exact previous state instead of blindly deleting: `complete`/`abandon` call this
+    // with a commandId that already has a durably-persisted in_flight record, and losing that
+    // record from memory (while it still sits on disk) would make a retry re-execute the command.
+    const previous = this.entries.get(entry.commandId);
     this.entries.delete(entry.commandId); // re-insert so Map order stays oldest-write-first
     this.entries.set(entry.commandId, entry);
-    this.journal.append(entry);
+    try {
+      this.journal.append(entry);
+    } catch (error) {
+      // journal.ts now propagates append failures instead of swallowing them. The caller (e.g.
+      // `begin`) needs this to reach it so it can refuse to execute a command whose idempotency
+      // record was never durably persisted, so it must rethrow rather than be absorbed here. Roll
+      // back the in-memory record too: it must not claim durability the journal does not have,
+      // restoring the previous entry (if there was one) rather than deleting it outright.
+      console.error(`Agent Remote bridge: command journal append failed for ${entry.commandId}`, error);
+      this.entries.delete(entry.commandId);
+      if (previous !== undefined) {
+        this.entries.set(entry.commandId, previous);
+      }
+      throw error;
+    }
     if (this.enforceCap()) {
       this.compact();
       return;
@@ -168,23 +187,43 @@ export class CommandJournal {
     }
   }
 
-  /** Drops the oldest entries until the map is within `MAX_COMMANDS`. Returns whether anything
-   * was dropped, so the caller can decide to compact. */
+  /** Drops the oldest entries until the map is within `MAX_COMMANDS`, never evicting a
+   * non-terminal (`in_flight`) record: evicting one would destroy the idempotency record for a
+   * command that is still executing, so a retry of that command id would re-execute it instead
+   * of returning the recorded outcome. Evicts the oldest terminal record first. If every record
+   * is non-terminal, the cap is exceeded with a logged warning rather than silently dropping an
+   * in-flight command or rejecting new work. Returns whether anything was dropped, so the caller
+   * can decide to compact. */
   private enforceCap(): boolean {
     let dropped = false;
     while (this.entries.size > MAX_COMMANDS) {
-      const oldest = this.entries.keys().next();
-      if (oldest.done) {
+      let oldestTerminalId: string | undefined;
+      for (const [commandId, entry] of this.entries) {
+        if (entry.status !== "in_flight") {
+          oldestTerminalId = commandId;
+          break;
+        }
+      }
+      if (oldestTerminalId === undefined) {
+        console.warn(
+          `Agent Remote bridge: command journal has ${this.entries.size} entries, all in_flight, exceeding MAX_COMMANDS (${MAX_COMMANDS}); growing past cap rather than evicting an in-flight command`,
+        );
         break;
       }
-      this.entries.delete(oldest.value);
+      this.entries.delete(oldestTerminalId);
       dropped = true;
     }
     return dropped;
   }
 
   private compact(): void {
-    this.journal.rewrite([...this.entries.values()]);
+    try {
+      this.journal.rewrite([...this.entries.values()]);
+    } catch (error) {
+      // Same rationale as the append catch above: a rewrite failure is a durability concern,
+      // not a correctness one, since `entries` in memory is unaffected.
+      console.error(`Agent Remote bridge: command journal rewrite failed`, error);
+    }
     this.appendsSinceCompaction = 0;
   }
 }

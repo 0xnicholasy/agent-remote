@@ -97,8 +97,12 @@ export class NonceCache {
     }
 
     const nowMs = (options.now ?? new Date()).getTime();
+    // `load` throws on a filesystem failure (see JsonlJournal). Let it propagate rather than
+    // treating an unreadable journal as an empty one: the latter would silently accept every
+    // nonce this device has ever used, defeating replay protection after a restart.
+    const persistedRecords = this.journal.load();
     let dropped = false;
-    for (const record of this.journal.load()) {
+    for (const record of persistedRecords) {
       if (typeof record?.deviceId !== "string" || typeof record.nonce !== "string" || typeof record.expiresAt !== "number") {
         dropped = true;
         continue;
@@ -113,6 +117,11 @@ export class NonceCache {
         this.perDevice.set(record.deviceId, nonces);
       }
       nonces.set(record.nonce, record.expiresAt);
+    }
+    for (const nonces of this.perDevice.values()) {
+      if (this.evictOverflow(nonces)) {
+        dropped = true;
+      }
     }
     if (dropped) {
       this.compact();
@@ -136,18 +145,17 @@ export class NonceCache {
     }
 
     this.pruneExpired(nonces, now);
-    if (nonces.size >= MAX_NONCES_PER_DEVICE) {
-      const oldest = nonces.keys().next();
-      if (!oldest.done) {
-        nonces.delete(oldest.value);
-      }
-    }
     const expiresAt = now.getTime() + NONCE_TTL_MS;
     nonces.set(nonce, expiresAt);
+    this.evictOverflow(nonces);
 
     if (this.journal === undefined) {
       return;
     }
+    // `append` throws on a filesystem failure (see JsonlJournal). Let it propagate out of
+    // `record` and in turn out of `verifyEnvelope`: a nonce that is not durably recorded must
+    // not be treated as a successfully verified request, or the same envelope replays cleanly
+    // across a bridge restart.
     this.journal.append({ deviceId, nonce, expiresAt });
     this.appendsSinceCompaction += 1;
     if (this.appendsSinceCompaction >= COMPACT_AFTER_APPENDS) {
@@ -164,6 +172,25 @@ export class NonceCache {
     }
   }
 
+  /**
+   * Evicts oldest-first while over the per-device cap. Shared by `record` (evicts at most one,
+   * since insertion happens one nonce at a time) and the constructor's rehydrate path (may evict
+   * many at once), so the cap and its ordering can never drift between the live and reload paths.
+   * Returns whether anything was evicted.
+   */
+  private evictOverflow(nonces: Map<string, number>): boolean {
+    let evicted = false;
+    while (nonces.size > MAX_NONCES_PER_DEVICE) {
+      const oldest = nonces.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      nonces.delete(oldest.value);
+      evicted = true;
+    }
+    return evicted;
+  }
+
   /** Rewrites the journal to exactly the live set, dropping expired and evicted entries. */
   private compact(): void {
     if (this.journal === undefined) {
@@ -175,8 +202,16 @@ export class NonceCache {
         records.push({ deviceId, nonce, expiresAt });
       }
     }
-    this.journal.rewrite(records);
-    this.appendsSinceCompaction = 0;
+    // Unlike `append`, a failed compaction is tolerated: every entry in `records` was already
+    // durably appended one at a time, so the journal on disk is still a correct (just uncompacted)
+    // superset of the live set. Log and retry at the next compaction threshold instead of failing
+    // the request that happened to trigger this compaction.
+    try {
+      this.journal.rewrite(records);
+      this.appendsSinceCompaction = 0;
+    } catch (error) {
+      console.error("Agent Remote bridge: failed to compact nonce journal, will retry later", error);
+    }
   }
 }
 

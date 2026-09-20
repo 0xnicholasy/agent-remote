@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import Ajv2020 from "ajv/dist/2020";
@@ -73,6 +73,10 @@ export interface Bridge {
   readonly pairingCode: string;
   /** ISO timestamp the minted `pairingCode` expires at. */
   readonly pairingCodeExpiresAt: string;
+  /** Releases the single-writer lock (see the "Single-writer lock" comment in `createBridge`)
+   * so the same state dir can be reopened, e.g. by a test's `restart()` helper or a graceful
+   * shutdown. Idempotent; safe to call when there was no state dir to lock. */
+  close(): void;
 }
 
 /** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
@@ -193,6 +197,55 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const journalPath = (name: string): string | undefined =>
     stateDirPath === undefined ? undefined : path.join(stateDirPath, name);
 
+  // Single-writer lock: two bridges pointed at the same state dir would otherwise race on the
+  // nonce/command/event journals and hand out duplicate event ids before EADDRINUSE ever fires
+  // (docs/durability-v0.md). Only enforced when there is a real state dir to protect; an
+  // injected in-memory registry (tests) has nothing to lock.
+  let releaseLock: (() => void) | undefined;
+  if (stateDirPath !== undefined) {
+    const lockPath = path.join(stateDirPath, "bridge.lock");
+    try {
+      writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      const holderPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+      let holderAlive = false;
+      if (Number.isFinite(holderPid)) {
+        try {
+          process.kill(holderPid, 0);
+          holderAlive = true;
+        } catch {
+          holderAlive = false;
+        }
+      }
+      if (holderAlive) {
+        throw new Error(
+          `Another Agent Remote bridge (pid ${holderPid}) already holds the lock at ${lockPath}. ` +
+            "Stop that process before starting a new one against the same state directory.",
+        );
+      }
+      // Lock left behind by a process that died without cleaning up: take it over.
+      writeFileSync(lockPath, String(process.pid), { flag: "w" });
+    }
+    let lockReleased = false;
+    releaseLock = (): void => {
+      if (lockReleased) {
+        return;
+      }
+      lockReleased = true;
+      // Best effort: on process exit a failed unlink cannot be reported anywhere useful, and on
+      // an explicit close() a stale lock is still recovered by the liveness probe above.
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // ignore
+      }
+    };
+    process.on("exit", releaseLock);
+  }
+
   const nonces = new NonceCache({ journal: createNonceJournal(journalPath("nonces.jsonl")), now: now() });
 
   // An injected in-memory registry with no explicit devices path has nowhere durable to keep a
@@ -250,9 +303,31 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         timestamp: new Date().toISOString(),
         payload,
       } as AgentEventEnvelope<T> as AgentEvent;
-      eventLog.append(event);
+      try {
+        eventLog.append(event);
+      } catch (error) {
+        // journal.ts now throws on a real fs failure instead of swallowing it. An event that
+        // could not be persisted must not be reported as delivered (durability contract), but a
+        // single append failure also must not take down the whole bridge process, so it is
+        // surfaced loudly here and then the request path continues to fail below.
+        console.error(
+          `Failed to persist event ${event.eventId} (session ${sessionId}, type ${type}) to the event log:`,
+          error,
+        );
+        throw error;
+      }
       if (type === "session.started") {
-        sessionIndex.record(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, now());
+        try {
+          sessionIndex.record(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, now());
+        } catch (error) {
+          // The event itself is already durably appended above; this binding only backs the
+          // per-device project filter for retained events after a restart, so a failure here must
+          // not undo the emit or crash the caller — it is logged loudly instead of buried.
+          console.error(
+            `Failed to durably record project binding for session ${sessionId} (event ${event.eventId}):`,
+            error,
+          );
+        }
       }
       wake();
       return event;
@@ -318,7 +393,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     title: "demo",
   };
   provider.seedSession(session);
-  sessionIndex.record(session.id, session.projectId, now());
+  try {
+    sessionIndex.record(session.id, session.projectId, now());
+  } catch (error) {
+    // Same rationale as the emit-path guard above: the seeded session itself already exists in
+    // the provider, so a failure here must not crash startup, only be surfaced loudly.
+    console.error(`Failed to durably record project binding for seeded session ${session.id}:`, error);
+  }
 
   /** Runs one command. Returns the new session id when the command created a session. */
   async function execute(command: Command): Promise<string | undefined> {
@@ -487,7 +568,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     }
 
     inFlight.add(command.commandId);
-    commands.begin(command.commandId, deviceId, bodyDigest, now());
+    try {
+      commands.begin(command.commandId, deviceId, bodyDigest, now());
+    } catch (error) {
+      // begin runs BEFORE the provider call: without a durable in_flight record, a client retry
+      // after a crash could re-execute this command, so a failure here must abort before
+      // execution rather than proceed and only warn.
+      inFlight.delete(command.commandId);
+      console.error(`Failed to durably record command ${command.commandId} as in_flight before execution:`, error);
+      return json({ error: "command_journal_unavailable" }, 503);
+    }
     let createdSessionId: string | undefined;
     try {
       createdSessionId = await execute(command);
@@ -496,8 +586,14 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       const mapped = mapProviderError(error);
       if (mapped !== undefined) {
         // A mapped provider error is a refusal before anything was applied, so the command id is
-        // released for a retry rather than left looking indeterminate after a restart.
-        commands.abandon(command.commandId, now());
+        // released for a retry rather than left looking indeterminate after a restart. The
+        // refusal already happened, so it is reported either way; a failure to record it durably
+        // is only logged, since silently dropping a real 409/404/429 response would be worse.
+        try {
+          commands.abandon(command.commandId, now());
+        } catch (abandonError) {
+          console.error(`Failed to durably record command ${command.commandId} as abandoned:`, abandonError);
+        }
         return mapped;
       }
       // An unmapped throw is exactly the indeterminate case: the entry stays `in_flight`, and a
@@ -511,11 +607,20 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       duplicate: false,
       ...(createdSessionId === undefined ? {} : { sessionId: createdSessionId }),
     };
-    commands.complete(command.commandId, response, now());
-    if (createdSessionId !== undefined && command.type === "session.create") {
-      sessionIndex.record(createdSessionId, command.payload.projectId, now());
+    // The provider already applied this command, so `response` is reported either way; a
+    // failure to durably record the outcome (or the session's project binding) below is only
+    // logged, never converted into a failure response for work that already succeeded, and
+    // `inFlight` must still be released regardless so a retry is not stuck as a false duplicate.
+    try {
+      commands.complete(command.commandId, response, now());
+      if (createdSessionId !== undefined && command.type === "session.create") {
+        sessionIndex.record(createdSessionId, command.payload.projectId, now());
+      }
+    } catch (error) {
+      console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
+    } finally {
+      inFlight.delete(command.commandId);
     }
-    inFlight.delete(command.commandId);
     return json(response);
   }
 
@@ -613,6 +718,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         // Live sessions first; the persisted index answers for a session the provider forgot
         // across a restart, which is the only way a retained event stays authorizable.
         const projectId = projectOf.get(event.sessionId) ?? sessionIndex.projectOf(event.sessionId);
+        // The index's binding is first-bind-wins and immutable (SessionIndex.record), so it is
+        // the authoritative project for every event ever emitted under this sessionId. If the
+        // live provider now reports a different project for the same id (the id was reused, or
+        // reassigned), that disagreement means these retained events belong to a project the
+        // requesting device may not be authorized for even though the live session is: fail
+        // closed and drop them rather than trusting the live value for old events.
+        const recordedProjectId = sessionIndex.projectOf(event.sessionId);
+        if (recordedProjectId !== undefined && projectId !== recordedProjectId) {
+          return false;
+        }
         // Fail closed: an event whose session cannot be resolved to a project is dropped for a
         // narrowed device rather than shown, since there is no allowedProjects check to pass.
         return projectId !== undefined && device.allowedProjects.includes(projectId);
@@ -622,7 +737,8 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     // below the retained window (docs/durability-v0.md): polling can never recover those events,
     // so the client must resync from the page it is given instead of assuming continuity.
     const firstEventId = eventLog.firstEventId;
-    const truncated = cursor > 0 && firstEventId > 0 && cursor < firstEventId - 1;
+    const floor = firstEventId > 0 ? firstEventId : eventLog.nextEventId;
+    const truncated = cursor < floor - 1;
     return json({ events, lastEventId, firstEventId, truncated, bridgeId } satisfies EventsResponse);
   }
 
@@ -632,6 +748,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     bridgeId,
     pairingCode,
     pairingCodeExpiresAt,
+    close(): void {
+      releaseLock?.();
+    },
     async fetch(request: Request): Promise<Response> {
       // Catch-all around the whole route table: mapProviderError only translates the protocol's
       // known error classes, so anything else thrown by a provider or by route logic itself
@@ -659,16 +778,27 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
         let device: DeviceRecord | undefined;
         if (authEnabled) {
-          const result = verifyEnvelope({
-            headers: request.headers,
-            method: request.method,
-            pathWithQuery: url.pathname + url.search,
-            rawBody,
-            registry,
-            nonces,
-            now: now(),
-            skewMs: SKEW_MS,
-          });
+          let result: ReturnType<typeof verifyEnvelope>;
+          try {
+            result = verifyEnvelope({
+              headers: request.headers,
+              method: request.method,
+              pathWithQuery: url.pathname + url.search,
+              rawBody,
+              registry,
+              nonces,
+              now: now(),
+              skewMs: SKEW_MS,
+            });
+          } catch (error) {
+            // verifyEnvelope now throws when the nonce could not be durably recorded (fail
+            // closed): the signature may be genuine, but without a durable nonce record a replay
+            // of this exact envelope would verify again after a restart. Treated as "not
+            // verified", never as authorized, and answered the same way every other rejection
+            // reason is, without leaking that it was a storage failure rather than a bad request.
+            console.error("Failed to durably record nonce during envelope verification:", error);
+            return json({ error: "unauthenticated" }, 401);
+          }
           if (!result.ok) {
             return json({ error: result.code }, result.status);
           }
