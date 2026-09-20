@@ -64,6 +64,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
     }
 
     func setBaseURL(_ url: URL) async {}
+    func pair(code: String, deviceName: String) async throws {}
+    func isPaired() async -> Bool { true }
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
         eventsCallCount += 1

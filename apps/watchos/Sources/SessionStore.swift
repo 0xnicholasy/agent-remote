@@ -57,6 +57,8 @@ final class SessionStore {
     private(set) var statusLine = "Not connected"
     private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
+    private(set) var paired = false
+    private(set) var pairingError: String?
 
     var hostText: String {
         didSet { UserDefaults.standard.set(hostText, forKey: SessionStore.hostKey) }
@@ -85,10 +87,28 @@ final class SessionStore {
     // MARK: - Polling
 
     func start() {
+        Task { [weak self] in await self?.refreshPairedState() }
         guard pollTask == nil else { return }
         pollGeneration += 1
         let generation = pollGeneration
         pollTask = Task { [weak self] in await self?.pollLoop(generation: generation) }
+    }
+
+    func refreshPairedState() async {
+        paired = await client.isPaired()
+    }
+
+    /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
+    /// stores the device credential and subsequent requests are signed.
+    func pair(code: String, deviceName: String) async {
+        pairingError = nil
+        do {
+            try await client.pair(code: code, deviceName: deviceName)
+            paired = true
+        } catch {
+            paired = await client.isPaired()
+            pairingError = "\(error)"
+        }
     }
 
     /// Applies a new host from Settings and restarts the poll loop against it.

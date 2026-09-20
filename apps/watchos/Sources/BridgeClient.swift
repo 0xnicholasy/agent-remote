@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import AgentRemoteProtocol
 
@@ -54,24 +55,66 @@ struct SessionsResponse: Decodable, Sendable {
     var sessions: [Session]
 }
 
-enum BridgeError: Error, CustomStringConvertible, Sendable {
+enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case invalidHost(String)
     case http(status: Int, message: String)
     case malformedResponse(String)
+    /// No device credential is stored yet; the request was never sent unsigned.
+    case notPaired
+    case unauthenticated
+    case deviceRevoked
+    case staleRequest
+    case replayedRequest
+    case actionNotAllowed
+    case projectNotAllowed
+    case decisionExpired
+    case commandIdConflict
 
     var description: String {
         switch self {
         case .invalidHost(let value): "Not a usable bridge address: \(value)"
         case .http(let status, let message): "Bridge returned \(status): \(message)"
         case .malformedResponse(let message): "Bridge sent a response the client could not parse: \(message)"
+        case .notPaired: "This Watch is not paired with a bridge yet."
+        case .unauthenticated: "The bridge did not accept this device's credentials."
+        case .deviceRevoked: "This Watch's pairing was revoked."
+        case .staleRequest: "This request's timestamp is too far from the bridge's clock."
+        case .replayedRequest: "The bridge rejected this request as a replay."
+        case .actionNotAllowed: "This Watch is not allowed to do that."
+        case .projectNotAllowed: "This Watch is not allowed to use that project."
+        case .decisionExpired: "That approval or question already expired."
+        case .commandIdConflict: "That command was already sent with different contents."
         }
     }
+
+    /// Maps a bridge JSON error code (docs/pairing-v0.md, "Verification order" and "Command
+    /// authorization") to a specific case, falling back to `.http` for anything else --
+    /// including pre-existing, non-auth error bodies such as a stale approval binding.
+    static func from(status: Int, code: String?, message: String) -> BridgeError {
+        switch code {
+        case "unauthenticated": .unauthenticated
+        case "device_revoked": .deviceRevoked
+        case "stale_request": .staleRequest
+        case "replayed_request": .replayedRequest
+        case "action_not_allowed": .actionNotAllowed
+        case "project_not_allowed": .projectNotAllowed
+        case "decision_expired": .decisionExpired
+        case "command_id_conflict": .commandIdConflict
+        default: .http(status: status, message: message)
+        }
+    }
+}
+
+private struct ErrorBody: Decodable {
+    var error: String?
 }
 
 /// The calls `SessionStore` makes on the bridge client. Lets tests substitute a fake client
 /// without opening a real network connection.
 protocol BridgeClientProtocol: Sendable {
     func setBaseURL(_ url: URL) async
+    func pair(code: String, deviceName: String) async throws
+    func isPaired() async -> Bool
     func events(after: Int, wait: Int) async throws -> EventsPage
     @discardableResult
     func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse
@@ -85,9 +128,13 @@ actor BridgeClient: BridgeClientProtocol {
     private let urlSession: URLSession
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    private let credentialStore: any CredentialStore
+    private var credential: DeviceCredential?
 
-    init(baseURL: URL = BridgeClient.defaultBaseURL) {
+    init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
+        self.credentialStore = credentialStore
+        self.credential = credentialStore.load()
         let configuration = URLSessionConfiguration.ephemeral
         // Long polls hold the connection open for up to 30 seconds, so the request
         // timeout has to sit comfortably above the bridge's own ceiling.
@@ -103,6 +150,56 @@ actor BridgeClient: BridgeClientProtocol {
 
     func currentBaseURL() -> URL {
         baseURL
+    }
+
+    func isPaired() -> Bool {
+        credential != nil
+    }
+
+    /// `POST /v1/pair`: the only signed-off route. Derives the device key locally from the
+    /// pairing code and the bridge's response, and never sends the code or the key over the
+    /// wire (docs/pairing-v0.md, "Enrollment").
+    func pair(code: String, deviceName: String) async throws {
+        struct PairRequestBody: Encodable {
+            var deviceId: String
+            var deviceName: String
+            var nonce: String
+            var proof: String
+        }
+        struct PairResponseBody: Decodable {
+            var deviceId: String
+            var keyId: String
+            var bridgeId: String
+        }
+
+        let normalizedCode = PairingCode.normalize(code)
+        let deviceId = "dev_" + RequestSigning.randomHex(bytes: 8)
+        let nonce = RequestSigning.randomHex(bytes: 16)
+        let proof = RequestSigning.pairingProof(
+            code: normalizedCode, deviceId: deviceId, deviceName: deviceName, nonce: nonce
+        )
+
+        var request = URLRequest(url: baseURL.appending(path: "/v1/pair"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try encoder.encode(
+            PairRequestBody(deviceId: deviceId, deviceName: deviceName, nonce: nonce, proof: proof)
+        )
+
+        let (data, response) = try await urlSession.data(for: request)
+        try Self.checkStatus(response, data: data)
+        let decoded = try decoder.decode(PairResponseBody.self, from: data)
+
+        let deviceKey = RequestSigning.deriveDeviceKey(code: normalizedCode, deviceId: deviceId, nonce: nonce)
+        let newCredential = DeviceCredential(
+            deviceId: decoded.deviceId,
+            keyId: decoded.keyId,
+            deviceKeyData: deviceKey.withUnsafeBytes { Data($0) },
+            bridgeId: decoded.bridgeId,
+            baseURL: baseURL
+        )
+        credentialStore.save(newCredential)
+        credential = newCredential
     }
 
     /// Long polls for events newer than `after`, waiting up to `wait` seconds for the first one.
@@ -131,24 +228,55 @@ actor BridgeClient: BridgeClientProtocol {
             timestamp: BridgeClient.timestamp(),
             payload: payload
         )
-        var request = URLRequest(url: baseURL.appending(path: "/v1/commands"))
-        request.httpMethod = "POST"
+        let body = try encoder.encode(command)
+        var request = try signedRequest(method: "POST", url: baseURL.appending(path: "/v1/commands"), body: body)
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = try encoder.encode(command)
         let (data, response) = try await urlSession.data(for: request)
         let decoded = try decoder.decode(CommandResponse.self, from: data)
         if let status = (response as? HTTPURLResponse)?.statusCode, status >= 300 {
-            throw BridgeError.http(status: status, message: decoded.error ?? "unknown error")
+            throw BridgeError.from(status: status, code: decoded.error, message: decoded.error ?? "unknown error")
         }
         return decoded
     }
 
     private func get(_ url: URL) async throws -> Data {
-        let (data, response) = try await urlSession.data(from: url)
-        if let status = (response as? HTTPURLResponse)?.statusCode, status >= 300 {
-            throw BridgeError.http(status: status, message: String(decoding: data, as: UTF8.self))
-        }
+        let request = try signedRequest(method: "GET", url: url, body: nil)
+        let (data, response) = try await urlSession.data(for: request)
+        try Self.checkStatus(response, data: data)
         return data
+    }
+
+    /// Builds a request carrying the four `X-AgentRemote-*` headers, signed over the method,
+    /// path-and-query exactly as sent, timestamp, nonce and body digest (docs/pairing-v0.md,
+    /// "Signed request envelope"). Throws `.notPaired` instead of ever sending a request unsigned.
+    func signedRequest(method: String, url: URL, body: Data?) throws -> URLRequest {
+        guard let credential else { throw BridgeError.notPaired }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = body
+
+        let nonce = RequestSigning.randomHex(bytes: 16)
+        let timestamp = BridgeClient.timestamp()
+        let bodyHash = RequestSigning.bodySHA256(body)
+        let pathWithQuery = url.path + (url.query.map { "?\($0)" } ?? "")
+        let signingString = RequestSigning.signingString(
+            method: method, pathWithQuery: pathWithQuery, timestamp: timestamp, nonce: nonce, bodySHA256: bodyHash
+        )
+        let signature = RequestSigning.signature(deviceKey: credential.deviceKey, signingString: signingString)
+
+        request.setValue(credential.deviceId, forHTTPHeaderField: "X-AgentRemote-Device")
+        request.setValue(timestamp, forHTTPHeaderField: "X-AgentRemote-Timestamp")
+        request.setValue(nonce, forHTTPHeaderField: "X-AgentRemote-Nonce")
+        request.setValue(signature, forHTTPHeaderField: "X-AgentRemote-Signature")
+        return request
+    }
+
+    private static func checkStatus(_ response: URLResponse, data: Data) throws {
+        guard let status = (response as? HTTPURLResponse)?.statusCode, status >= 300 else { return }
+        let code = try? JSONDecoder().decode(ErrorBody.self, from: data).error
+        let message = code ?? String(decoding: data, as: UTF8.self)
+        throw BridgeError.from(status: status, code: code, message: message)
     }
 
     static func timestamp() -> String {
