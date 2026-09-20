@@ -266,15 +266,21 @@ of these cross-session and concurrent-client invariants are implemented.
 
 The bridge must validate every command against the normative JSON Schema before routing it to a
 provider. TypeScript and Swift bindings must remain conformant with that schema, including
-discriminated payload shapes and the exactly-one rule for question answers. The current
-prototype casts parsed JSON to `Command`; it does not yet provide this runtime boundary.
+discriminated payload shapes and the exactly-one rule for question answers. The bridge validates
+with ajv against `protocol/schema/command.schema.json` as of 2026-09-17.
 
-Current v0 event and command schemas contain no signature, key identity, nonce, encryption or
-bridge-generation fields. Consequently, v0 must not be described as authenticated, replay
-protected or confidential on the wire. Before real LAN control, the project needs a versioned
-authenticated-envelope design that defines canonical signing input, device and bridge key
-identity, replay protection, confidentiality policy, key rotation and pairing recovery. That
-work must update the schemas first and then both language bindings.
+Authentication lives beside the command document rather than inside it. The command and event
+schemas still contain no signature, key identity or nonce field; those travel as
+`X-AgentRemote-*` request headers over a canonical signing string, which is what lets the same
+signed envelope wrap a request on a transport that is not HTTP. The contract is
+[pairing-v0.md](pairing-v0.md) and the reasoning is [ADR 008](adr/008-pairing-and-wire-envelope.md).
+
+What that buys, and what it does not: a request is attributable to an enrolled device, a replayed
+request is rejected, an approval decision past its expiry never reaches a provider, and a
+`commandId` is bound to one device and one command body. The wire is still not confidential, the
+device key is derived once and never rotated, and the bridge does not authenticate itself to a
+client that has not yet paired. v0 must not be described as confidential on the wire, and key
+rotation and pairing recovery remain open.
 
 ## Open questions
 

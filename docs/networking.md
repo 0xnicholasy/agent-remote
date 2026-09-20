@@ -1,6 +1,6 @@
 # Networking
 
-Last updated: 2026-09-16
+Last updated: 2026-09-20
 
 Networking feasibility, especially background notification behavior, is a first-release gate. The
 current prototype implements an HTTP loop against a mock bridge; it does not prove continuous
@@ -77,18 +77,22 @@ The evidence will determine whether the supported first release is foreground-on
 paired iPhone, or can treat the phone as optional with a separate push path. No final background
 solution is claimed today.
 
-## Pairing and wire protection: target requirements
+## Pairing and wire protection
 
-Pairing is design work, not an implemented feature. Before real LAN control, the protocol and
-bridge must define authenticated enrollment, a short-lived pairing code with attempt limits,
-device/key identity and revocation, replay protection and idempotency, per-project authorization,
-a confidentiality policy, and a signed and/or encrypted wire envelope. The initial key exchange
-must itself be authenticated and protected against substitution.
+Pairing is implemented as of 2026-09-20. The contract is [pairing-v0.md](pairing-v0.md) and the
+reasoning is [ADR 008](adr/008-pairing-and-wire-envelope.md). In short: a short-lived pairing code
+with an attempt limit enrolls one device, both sides derive a device key that never crosses the
+wire, and every later request carries a device id, timestamp, nonce and HMAC over a canonical
+signing string. The bridge enforces revocation, a 120-second skew window, a per-device nonce
+cache, per-device allowed actions and projects, approval expiry, and a `commandId` bound to one
+device and one body.
 
-The current event and command envelopes do not carry a complete security envelope or signature
-metadata, and the mock bridge accepts unauthenticated HTTP. Transport-independent semantics do not
-make an unauthenticated transport safe. TLS or another transport protection may be useful, but the
-product still needs an explicit trust and authorization model for direct and forwarded paths.
+Two requirements from the original target list are deliberately unmet and must not be assumed:
+the wire is not confidential, and the initial key exchange is protected only by the entropy of the
+pairing code, so an enrollment captured on the LAN can be attacked offline. Both are recorded as
+accepted limitations in ADR 008. A forwarded path (WatchConnectivity, BLE, relay) inherits the
+envelope but not a confidentiality guarantee, and the internet relay listed as deferred in ADR 003
+must not be built on this envelope alone.
 
 ## Delivery order
 
@@ -96,6 +100,8 @@ product still needs an explicit trust and authorization model for direct and for
 2. Run the physical-device background and alert matrix.
 3. Choose foreground-only, phone-required, or optional-push MVP behavior from those results.
 4. Implement authenticated pairing, authorization, durable recovery, and runtime validation.
+   Pairing, authorization and runtime validation have landed; durable recovery across a bridge
+   restart has not.
 5. Add a full iPhone client, BLE, or an internet relay only after the MVP behavior is measured.
 
 This ordering keeps the remote-control path local-first without promising that watchOS, system

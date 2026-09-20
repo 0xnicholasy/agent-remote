@@ -1,12 +1,13 @@
 # Architecture decision records
 
-Updated 2026-09-16.
+Updated 2026-09-20.
 
 Each record states the context that forced a decision, the decision itself, and the
-consequences we are accepting. The four written records remain Proposed while their evidence
-gates are open. Acceptance does not require waiting for a shipped release: it requires the
-relevant experiment or implementation evidence, the resulting decision to be recorded, and a
-reviewer to confirm that the record matches that evidence. Three further records are planned
+consequences we are accepting. The four earliest records remain Proposed while their evidence
+gates are open; ADR 008 is accepted for v0 because its evidence is the implementation and its
+tests rather than a device experiment. Acceptance does not require waiting for a shipped
+release: it requires the relevant experiment or implementation evidence, the resulting decision
+to be recorded, and a reviewer to confirm that the record matches that evidence. Three further records are planned
 and not yet written; their rows reserve the numbers and expose the open decisions.
 
 | ADR | Title | Status |
@@ -18,6 +19,7 @@ and not yet written; their rows reserve the numbers and expose the open decision
 | 005 | Bridge runtime: TypeScript and Bun versus Swift | Planned, not written |
 | 006 | MVP client: Watch-first versus iPhone-first | Planned, not written |
 | 007 | Approval delivery when the Watch is asleep; voice output while backgrounded | Planned, not written |
+| [008](008-pairing-and-wire-envelope.md) | Pairing and the authenticated wire envelope | Accepted for v0 |
 
 ## Acceptance evidence for proposed records
 
