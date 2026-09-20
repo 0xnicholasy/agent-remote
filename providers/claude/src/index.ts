@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { query as realQuery } from "@anthropic-ai/claude-agent-sdk";
 import type {
   CanUseTool,
@@ -330,7 +331,7 @@ export class ClaudeProvider implements AgentProvider {
     this.checkSessionLimit();
     const now = new Date().toISOString();
     const session: Session = {
-      id: `ses_${++this.counter}`,
+      id: `ses_${randomUUID()}`,
       projectId,
       provider: this.id,
       state: "idle",

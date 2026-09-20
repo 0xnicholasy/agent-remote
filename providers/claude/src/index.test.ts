@@ -1479,6 +1479,27 @@ describe("ClaudeProvider", () => {
     await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
   });
 
+  test("session ids do not collide across provider instances (simulated restarts)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    // A fresh instance mimics the bridge restarting; a per-instance counter would hand out the
+    // same first id (`ses_1`) again, colliding with a session recorded before the restart.
+    const { host: hostA } = createHost();
+    const providerA = new ClaudeProvider(hostA, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const sessionA = await providerA.createSession("p1");
+
+    const { host: hostB } = createHost();
+    const providerB = new ClaudeProvider(hostB, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const sessionB = await providerB.createSession("p1");
+
+    expect(sessionB.id).not.toBe(sessionA.id);
+  });
+
   test("seedSession refuses to exceed maxSessions (R2-001)", async () => {
     const queryFn: QueryFn = (() => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {

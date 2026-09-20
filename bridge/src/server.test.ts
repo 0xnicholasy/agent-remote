@@ -1695,7 +1695,7 @@ describe("single-writer state dir lock", () => {
   });
 });
 
-describe("retained events of a rebound session id", () => {
+describe("retained events of a reused session id", () => {
   let stateDir: string;
   let devicesFilePath: string;
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
@@ -1706,7 +1706,7 @@ describe("retained events of a rebound session id", () => {
   beforeEach(() => {
     stateDir = mkdtempSync(join(tmpdir(), "agentremote-rebind-test-"));
     devicesFilePath = join(stateDir, "devices.json");
-    // Two projects are needed to rebind a session id across projects, and the stub claude
+    // Two projects are needed to reuse a session id across projects, and the stub claude
     // provider is the only one wired to more than one.
     process.env.AGENTREMOTE_PROVIDER = "claude";
     process.env.AGENTREMOTE_PROJECT_DIRS = "/tmp/agentremote-project-a,/tmp/agentremote-project-b";
@@ -1775,30 +1775,38 @@ describe("retained events of a rebound session id", () => {
     return sessionId;
   }
 
-  test("an A-B-A rebinding does not re-authorize the retained events recorded under B", async () => {
+  test("a session id live under a different project than its recorded binding is served to no one", async () => {
     const first = await bootAndRecord(projectA, "1");
-    // The binding lapses while the event log survives: retention, the session index's size cap
-    // and a lost sessions.jsonl all end in exactly this state.
-    rmSync(join(stateDir, "sessions.jsonl"));
 
-    const second = await bootAndRecord(projectB, "2");
-    expect(second).toBe(first); // The same session id, now bound to a different project.
-    rmSync(join(stateDir, "sessions.jsonl"));
-
-    const third = await bootAndRecord(projectA, "3");
-    expect(third).toBe(first); // Bound back to the first project: the A-B-A cycle is closed.
-
+    // sessions.jsonl is left in place, so the durable binding for this id still reads project
+    // A. The stub provider hands out `ses_stub` again on the next boot, so creating a session
+    // under project B makes the live provider disagree with that recorded binding.
     const registry = DeviceRegistry.load(devicesFilePath);
-    registry.register(sampleDeviceRecord({ allowedProjects: [projectA] }));
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectA, projectB] }));
+
     const reader = boot(true);
+    const createBody: Command = {
+      commandId: "d1111111-1111-4111-8111-111111111111",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: projectB, provider: "claude" },
+    };
+    const created = await reader.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createBody }),
+    );
+    expect(created.status).toBe(200);
+    const createdBody = (await created.json()) as CommandResponse;
+    expect(createdBody.sessionId).toBe(first);
+
     const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
     expect(response.status).toBe(200);
     const page = (await response.json()) as EventsResponse;
     reader.close();
 
-    // The log still holds the events recorded while the id was bound to project B, and the
-    // binding readable now says project A. Those events must not be served, and since the id's
-    // history can no longer be attributed at all, none of its events are.
+    // The device is allowed both projects, so nothing here is a project-narrowing drop: the
+    // recorded binding (A) and the live provider (B) disagree about what this id is, so none of
+    // its events can be attributed to a project and all of them are withheld.
     expect(page.events.some((event) => event.sessionId === first)).toBe(false);
   });
 });

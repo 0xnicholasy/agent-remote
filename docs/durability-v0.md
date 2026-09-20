@@ -29,7 +29,6 @@ created 0700, files are 0600, and a full rewrite goes through a temp file and a 
 | `commands.jsonl` | Command identity and outcome | 24 hours, soft cap of 5000 commands |
 | `nonces.jsonl` | Seen request nonces | 300 seconds (the nonce TTL) |
 | `sessions.jsonl` | Session to project bindings | 24 hours |
-| `session-epochs.json` | Per-session binding history for event authorization | Bounded to `MAX_SESSIONS` entries |
 
 The four journals are JSON Lines: one record per line, appended as it happens, and rewritten in
 full only to compact. Every append is a single line written and fsynced, so a crash can leave at
@@ -126,32 +125,21 @@ its own retained events and reconnect to an empty history. Live sessions still t
 the index only fills gaps, and an event whose project cannot be resolved either way is still
 dropped for a narrowed device rather than shown.
 
-## Session binding epochs
+**Known limits.**
 
-`sessions.jsonl` answers "what project does this session id resolve to now," which is not the
-question a retained event needs answered. A binding can lapse — retention, the session index's own
-cap, a lost `sessions.jsonl` — and the same session id can then be bound to a second project and
-later back to the first. After that A-B-A cycle the current binding reads "A" again while events
-recorded under B are still in the log, so a device allowed only project A would be served project
-B's events under an "A" label. Event replay has to be authorized against the binding that was in
-effect when each event was recorded, not the binding current at read time.
-
-`session-epochs.json` closes that gap. For every session id it records the project the binding
-covers and `fromEventId`, the first event id that binding is allowed to authorize; anything below
-that id predates the binding and is not covered by it. A rebind to a different project does not
-re-authorize history under the new project — it marks the session's project unverifiable instead,
-which fails closed for every event of that session id from then on rather than re-opening the A-B-A
-hole.
-
-On event replay, an event is dropped if its session has no recorded epoch, if the epoch names a
-different project than the one being authorized, if the epoch is unverifiable, or if the event's id
-is below the epoch's `fromEventId`. The file is shape-validated entry by entry on load — an entry
-missing `sessionId`, `projectId`, or a finite `fromEventId` is discarded rather than trusted — and
-the map is capped at the same size the session index keeps, so it cannot grow with session volume;
-a dropped epoch fails closed rather than reopening the hole above. If the file cannot be read at
-startup, the bridge logs the failure and starts with no epochs rather than guessing at their
-contents, which means retained events stay unauthorized for a narrowed device until their sessions
-are bound again — the safe direction.
+- If a session id is live under a project that differs from its recorded binding, the disagreement
+  is not resolved in the live session's favor: none of that session id's events are served until
+  the recorded binding ages out of `sessions.jsonl` (24 hours). Provider session ids are unique per
+  process now, so this is reachable mainly through the fixed `ses_seed` session id, whose bound
+  project changes only when the first entry of `AGENTREMOTE_PROJECT_DIRS` changes across a restart.
+- A session id rebound from one project to another and back, across a loss of `sessions.jsonl`,
+  can re-authorize the intervening project's retained events to a device scoped only to the
+  original project: nothing in the event log itself records which project was current when an
+  event was written, so authorization only ever checks a session id against whichever project is
+  currently bound. Closing this requires recording the project on each persisted event so an event
+  is authorized against its own record rather than against the session's current binding; that is
+  a protocol change planned as follow-up work, and it must land before any device-narrowing
+  feature.
 
 ## What this does not cover
 

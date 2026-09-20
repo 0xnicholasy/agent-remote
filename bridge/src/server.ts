@@ -36,7 +36,7 @@ import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { CommandJournal } from "./state/commands";
 import { EventLog } from "./state/event-log";
 import { createNonceJournal } from "./state/nonces";
-import { MAX_SESSIONS, SessionIndex } from "./state/sessions";
+import { SessionIndex } from "./state/sessions";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv);
@@ -320,91 +320,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const sessionIndex = new SessionIndex(journalPath("sessions.jsonl"), { now: now() });
   const commands = new CommandJournal(journalPath("commands.jsonl"), { now: now() });
 
-  // Which project a session was bound to *when each of its events was recorded*. The session
-  // index answers "what project does this session id resolve to now", which is not the same
-  // question for a retained event: a binding can lapse (retention, the cap in SessionIndex,
-  // a lost sessions.jsonl) and the same session id can then be bound to a second project and
-  // later back to the first. After such an A-B-A cycle the current binding reads "A" while
-  // events recorded under B are still in the log, and a device allowed only A would be served
-  // them. So every binding also records the event id it took effect at, and a rebind to a
-  // different project marks the whole session id unverifiable rather than re-authorizing its
-  // history under the new project.
-  interface BindingEpoch {
-    sessionId: string;
-    /** The project bound from `fromEventId` on, or null once a conflicting rebind was seen. */
-    projectId: string | null;
-    /** First event id this binding covers. Anything below it predates the binding. */
-    fromEventId: number;
-  }
-  // `unknown` is genuinely right here: this reads back a file and must prove its shape before
-  // trusting any field; nothing is authorized off an entry that fails these checks.
-  const isBindingEpoch = (value: unknown): value is BindingEpoch => {
-    if (typeof value !== "object" || value === null) {
-      return false;
-    }
-    const candidate = value as Record<string, unknown>;
-    return (
-      typeof candidate.sessionId === "string" &&
-      (candidate.projectId === null || typeof candidate.projectId === "string") &&
-      typeof candidate.fromEventId === "number" &&
-      Number.isFinite(candidate.fromEventId)
-    );
-  };
-  const bindingEpochPath = journalPath("session-epochs.json");
-  const bindingEpochs = new Map<string, BindingEpoch>();
-  if (bindingEpochPath !== undefined && existsSync(bindingEpochPath)) {
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(bindingEpochPath, "utf8"));
-      if (Array.isArray(parsed)) {
-        for (const entry of parsed) {
-          if (isBindingEpoch(entry)) {
-            bindingEpochs.set(entry.sessionId, entry);
-          }
-        }
-      }
-    } catch (error) {
-      // Fail closed: with no epochs, retained events are simply not authorized for a narrowed
-      // device until their sessions are bound again, which is the safe direction.
-      console.error(`Failed to read session binding epochs from ${bindingEpochPath}:`, error);
-    }
-  }
-  const persistBindingEpochs = (): void => {
-    if (bindingEpochPath === undefined) {
-      return;
-    }
-    atomicWriteFileSync(bindingEpochPath, JSON.stringify([...bindingEpochs.values()]));
-  };
-  /**
-   * Binds a session to a project in the durable index and records the epoch that binding
-   * covers. `atEventId` is the first event id the binding is allowed to authorize.
-   */
-  const bindSession = (sessionId: string, projectId: string, atEventId: number): void => {
-    sessionIndex.record(sessionId, projectId, now());
-    const existing = bindingEpochs.get(sessionId);
-    if (existing !== undefined) {
-      if (existing.projectId === projectId || existing.projectId === null) {
-        return; // Same binding as before, or already marked unverifiable: nothing changes.
-      }
-      // A rebind to a different project. SessionIndex keeps the first binding it saw, so the
-      // binding readable at request time can no longer prove which project any of this session
-      // id's retained events were recorded under. Fail closed for the whole id.
-      bindingEpochs.set(sessionId, { sessionId, projectId: null, fromEventId: existing.fromEventId });
-    } else {
-      bindingEpochs.set(sessionId, { sessionId, projectId, fromEventId: atEventId });
-    }
-    // Same size bound the session index keeps, so this map cannot grow with session volume.
-    // A dropped epoch fails closed (its retained events, if any still exist, stop being
-    // authorized) rather than reopening the hole above.
-    while (bindingEpochs.size > MAX_SESSIONS) {
-      const oldest = bindingEpochs.keys().next();
-      if (oldest.done) {
-        break;
-      }
-      bindingEpochs.delete(oldest.value);
-    }
-    persistBindingEpochs();
-  };
-
   const waiters = new Set<() => void>();
   // Reserves a command id for the duration of its execution, so two retries that arrive at
   // the same time cannot both pass the journal check and run the command twice.
@@ -453,7 +368,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       }
       if (type === "session.started") {
         try {
-          bindSession(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, event.eventId);
+          sessionIndex.record(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, now());
         } catch (error) {
           // The event itself is already durably appended above; this binding only backs the
           // per-device project filter for retained events after a restart, so a failure here must
@@ -529,7 +444,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   };
   provider.seedSession(session);
   try {
-    bindSession(session.id, session.projectId, eventLog.nextEventId);
+    sessionIndex.record(session.id, session.projectId, now());
   } catch (error) {
     // Same rationale as the emit-path guard above: the seeded session itself already exists in
     // the provider, so a failure here must not crash startup, only be surfaced loudly.
@@ -749,7 +664,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     try {
       commands.complete(command.commandId, response, now());
       if (createdSessionId !== undefined && command.type === "session.create") {
-        bindSession(createdSessionId, command.payload.projectId, eventLog.nextEventId);
+        sessionIndex.record(createdSessionId, command.payload.projectId, now());
       }
     } catch (error) {
       console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
@@ -861,16 +776,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         // closed and drop them rather than trusting the live value for old events.
         const recordedProjectId = sessionIndex.projectOf(event.sessionId);
         if (recordedProjectId !== undefined && projectId !== recordedProjectId) {
-          return false;
-        }
-        // The binding readable now is not proof of what was in effect when this event was
-        // recorded: an A-B-A rebinding of the same session id would otherwise re-authorize
-        // events recorded under B. The epoch says which project the binding covered and from
-        // which event id, so an event below that floor, an event of a session whose epoch was
-        // never recorded, and every event of a session that was ever rebound to a different
-        // project (projectId null) are all dropped.
-        const epoch = bindingEpochs.get(event.sessionId);
-        if (epoch === undefined || epoch.projectId !== projectId || event.eventId < epoch.fromEventId) {
           return false;
         }
         // Fail closed: an event whose session cannot be resolved to a project is dropped for a
