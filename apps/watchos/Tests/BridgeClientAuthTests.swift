@@ -202,9 +202,12 @@ final class BridgeClientAuthTests: XCTestCase {
     func testPairFailureSurfacesErrorAndDoesNotEnroll() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
+        // The real bridge answers every rejected pairing code the same way -- "pairing_rejected"
+        // at 401 -- per bridge/src/server.ts's handlePair (malformed body, wrong/expired/exhausted
+        // code, and malformed proof all share this response so an attacker can't distinguish them).
         server.respondOnce(
             statusLine: "HTTP/1.1 401 Unauthorized",
-            body: #"{"error":"unauthenticated"}"#
+            body: #"{"error":"pairing_rejected"}"#
         )
 
         let credentialStore = InMemoryCredentialStore()
@@ -213,10 +216,13 @@ final class BridgeClientAuthTests: XCTestCase {
         do {
             try await client.pair(code: "000000000000", deviceName: "Test Watch")
             XCTFail("expected pair() to throw when the bridge rejects the pairing code")
-        } catch BridgeError.unauthenticated {
-            // expected -- the failure surfaced instead of being swallowed
+        } catch BridgeError.http(let status, let message) {
+            // "pairing_rejected" has no dedicated BridgeError case today, so BridgeError.from
+            // falls back to .http -- the failure still surfaces instead of being swallowed.
+            XCTAssertEqual(status, 401)
+            XCTAssertEqual(message, "pairing_rejected")
         } catch {
-            XCTFail("expected .unauthenticated, got \(error)")
+            XCTFail("expected .http(401, \"pairing_rejected\"), got \(error)")
         }
 
         let pairedAfterFailure = await client.isPaired()

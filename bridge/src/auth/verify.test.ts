@@ -104,6 +104,33 @@ describe("NonceCache", () => {
     expect(cache.has("dev_1", "n0", now)).toBe(false);
     expect(cache.has("dev_1", "n10000", now)).toBe(true);
   });
+
+  // NONCE_TTL_MS is 300_000 (5 minutes). The accepted timestamp-skew window used in production
+  // (SKEW_MS, 120_000 = 2 minutes) is narrower than the nonce TTL, so a nonce cannot become
+  // reusable within any pair of timestamps `verifyEnvelope` would both accept: the oldest and
+  // newest accepted timestamps are at most 2 * SKEW_MS = 240_000ms apart, which is still inside
+  // the 300_000ms TTL. If the TTL were ever shortened below 2 * SKEW_MS, this relationship — and
+  // this test's premise that expiry-then-reuse is safe rather than a replay hole — would break.
+  test("has() reports a nonce as reusable once its 300s TTL has elapsed, and record() prunes it", () => {
+    const cache = new NonceCache();
+    const recordedAt = new Date("2026-09-20T10:15:00.000Z");
+    cache.record("dev_1", "n1", recordedAt);
+
+    const atExpiry = new Date(recordedAt.getTime() + 300_000);
+    expect(cache.has("dev_1", "n1", atExpiry)).toBe(false);
+
+    // record() is the only place pruning happens (has() only reads); driving a second record()
+    // call at the TTL boundary exercises the actual eviction path, not just the boundary
+    // arithmetic in has(). "n1" must actually be gone from the underlying map afterward, not
+    // merely reported as expired.
+    cache.record("dev_1", "n2", atExpiry);
+
+    // Re-using "n1" at/after its TTL elapsed must succeed exactly like a first-time nonce: this
+    // is the by-design "expiry, not permanent memory" behavior documented on the class, safe
+    // only because SKEW_MS < NONCE_TTL_MS as explained above.
+    cache.record("dev_1", "n1", atExpiry);
+    expect(cache.has("dev_1", "n1", atExpiry)).toBe(true);
+  });
 });
 
 describe("verifyEnvelope", () => {

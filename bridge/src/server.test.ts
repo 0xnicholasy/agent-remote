@@ -1242,6 +1242,39 @@ describe("pairing", () => {
     expect(await response.json()).toEqual({ error: "pairing_rejected" });
   });
 
+  test("a malformed JSON body is rejected with 401 pairing_rejected and enrolls no device", async () => {
+    const registry = new DeviceRegistry(devicesFilePath);
+    const pairBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{not valid json",
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+    expect(registry.list()).toEqual([]);
+  });
+
+  test("valid JSON missing/ill-typed required fields is rejected with 401 pairing_rejected and enrolls no device", async () => {
+    const registry = new DeviceRegistry(devicesFilePath);
+    const pairBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    // Well-formed JSON, but `nonce` is missing and `proof` is a number rather than a string.
+    const response = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId: "dev_eeeeeeeeeeeeeeee", deviceName: "Watch", proof: 12345 }),
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+    expect(registry.list()).toEqual([]);
+  });
+
   test("pairing survives a new createBridge over the same devices file", async () => {
     const firstBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const deviceId = "dev_cccccccccccccccc";

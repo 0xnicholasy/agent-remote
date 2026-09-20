@@ -55,6 +55,14 @@ export class DeviceRegistry {
   // a separate `AGENTREMOTE_REVOKE` process writes devices.json directly, and a long-running
   // bridge must notice that write without a restart. undefined means "never checked yet".
   private knownStamp: FileStamp | null | undefined;
+  // `lastSeenAt` as last actually written to (or read from) disk, in epoch milliseconds, keyed by
+  // deviceId. touch() throttles against this rather than against the in-memory `lastSeenAt` it
+  // just overwrote: comparing against the in-memory value freezes the on-disk value forever once
+  // traffic is more frequent than LAST_SEEN_PERSIST_INTERVAL_MS. Rebuilt from `devices` on every
+  // persist and reload, so it holds no entry for a device that is no longer in the registry and
+  // cannot grow without bound. A device whose persisted `lastSeenAt` is null (or unparseable) has
+  // no entry, which makes the next touch persist.
+  private readonly persistedLastSeenAtMs = new Map<string, number>();
 
   constructor(filePath?: string) {
     this.filePath = filePath;
@@ -84,6 +92,7 @@ export class DeviceRegistry {
 
     if (stamp === null) {
       this.devices.clear();
+      this.persistedLastSeenAtMs.clear();
       this.knownStamp = stamp;
       return;
     }
@@ -112,11 +121,35 @@ export class DeviceRegistry {
       this.devices.set(entry.deviceId, entry);
     }
     this.knownStamp = stamp;
+    // What is on disk is by definition what was last persisted for these devices.
+    this.snapshotPersistedLastSeen();
   }
 
+  /**
+   * Adds or replaces a device. Reloads first, because `persist` rewrites the whole file from the
+   * in-memory map: without the reload, a registration made from a map that predates an
+   * out-of-band write (the revoke CLI writing devices.json directly) would rewrite that file from
+   * stale memory and resurrect a revoked device with `revokedAt` back to null.
+   *
+   * On a failed write the in-memory map is rolled back and the underlying error is rethrown, so a
+   * caller observes: the exception, and a registry in which this device is exactly as it was
+   * before the call (unknown to `get`/`list`, i.e. unauthorized, for a brand new device). The
+   * process never serves a device as registered whose record did not reach disk.
+   */
   register(record: DeviceRecord): void {
+    this.reloadIfChanged();
+    const previous = this.devices.get(record.deviceId);
     this.devices.set(record.deviceId, record);
-    this.persist();
+    try {
+      this.persist();
+    } catch (cause) {
+      if (previous === undefined) {
+        this.devices.delete(record.deviceId);
+      } else {
+        this.devices.set(record.deviceId, previous);
+      }
+      throw cause;
+    }
   }
 
   get(deviceId: string): DeviceRecord | undefined {
@@ -129,14 +162,30 @@ export class DeviceRegistry {
     return [...this.devices.values()];
   }
 
-  /** Sets `revokedAt`; keeps the record (a revoked device still reports `device_revoked`). */
+  /**
+   * Sets `revokedAt`; keeps the record (a revoked device still reports `device_revoked`). Reloads
+   * first for the same reason as `register`: the whole-map rewrite must land on top of whatever
+   * another process wrote to devices.json since this registry last looked.
+   *
+   * On a failed write `revokedAt` is restored and the error is rethrown, so a caller observes: the
+   * exception, and a device that is still not revoked here either. The alternative — keeping the
+   * revocation in memory only — hides a failed revoke from the operator while every other process
+   * (and this one after a restart) still treats the device as live.
+   */
   revoke(deviceId: string, now: Date): void {
+    this.reloadIfChanged();
     const record = this.devices.get(deviceId);
     if (record === undefined) {
       return;
     }
+    const previousRevokedAt = record.revokedAt;
     record.revokedAt = now.toISOString();
-    this.persist();
+    try {
+      this.persist();
+    } catch (cause) {
+      record.revokedAt = previousRevokedAt;
+      throw cause;
+    }
   }
 
   touch(deviceId: string, now: Date): void {
@@ -153,13 +202,12 @@ export class DeviceRegistry {
     // LAST_SEEN_PERSIST_INTERVAL_MS is purely cosmetic, and we skip the full atomic rewrite most
     // requests would otherwise pay for. Security-relevant state (registration, revocation) still
     // writes synchronously via register()/revoke() above.
-    const previousLastSeenAt = record.lastSeenAt;
     record.lastSeenAt = now.toISOString();
-    if (
-      previousLastSeenAt === null ||
-      previousLastSeenAt === undefined ||
-      now.getTime() - new Date(previousLastSeenAt).getTime() >= LAST_SEEN_PERSIST_INTERVAL_MS
-    ) {
+    // Throttle against the value last actually PERSISTED, not against the value the previous
+    // touch wrote into memory: the latter never ages past the interval under traffic more
+    // frequent than it, so the on-disk lastSeenAt would freeze at the first write forever.
+    const persistedAtMs = this.persistedLastSeenAtMs.get(deviceId);
+    if (persistedAtMs === undefined || now.getTime() - persistedAtMs >= LAST_SEEN_PERSIST_INTERVAL_MS) {
       this.persist();
     }
   }
@@ -176,6 +224,22 @@ export class DeviceRegistry {
     // Record the stamp of what we just wrote so the next read sees "unchanged" and skips a
     // redundant reparse of the file we are the ones who wrote.
     this.knownStamp = statFile(filePath);
+    this.snapshotPersistedLastSeen();
+  }
+
+  /** Rebuilds `persistedLastSeenAtMs` from the records now known to match the file. Rebuilding
+   * (rather than accumulating) is what keeps it bounded by the current device set. */
+  private snapshotPersistedLastSeen(): void {
+    this.persistedLastSeenAtMs.clear();
+    for (const [deviceId, record] of this.devices) {
+      if (record.lastSeenAt === null) {
+        continue;
+      }
+      const ms = Date.parse(record.lastSeenAt);
+      if (!Number.isNaN(ms)) {
+        this.persistedLastSeenAtMs.set(deviceId, ms);
+      }
+    }
   }
 }
 

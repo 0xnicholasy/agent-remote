@@ -235,6 +235,73 @@ describe("DeviceRegistry", () => {
     readSpy.mockRestore();
   });
 
+  test("registering a device does not resurrect one revoked out of band since this registry last read the file", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const deviceA = sampleRecord({ deviceId: "dev_a000000000000001" });
+
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(deviceA);
+
+    // The out-of-band revoke CLI writes devices.json directly; this registry has not looked since.
+    const revokedAt = "2026-09-20T12:00:00.000Z";
+    const onDisk = (JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[]).map((r) => ({
+      ...r,
+      revokedAt,
+    }));
+    writeFileSync(filePath, JSON.stringify(onDisk, null, 2), "utf8");
+
+    registry.register(sampleRecord({ deviceId: "dev_b000000000000002" }));
+
+    const after = JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[];
+    expect(after.find((r) => r.deviceId === deviceA.deviceId)?.revokedAt).toBe(revokedAt);
+    expect(after.map((r) => r.deviceId).sort()).toEqual(["dev_a000000000000001", "dev_b000000000000002"]);
+    expect(registry.get(deviceA.deviceId)?.revokedAt).toBe(revokedAt);
+  });
+
+  test("touches more frequent than the throttle still advance the on-disk lastSeenAt over time", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+
+    // Seven touches 30s apart: 180s of traffic, never a 60s gap between consecutive touches.
+    const startMs = Date.parse("2026-09-20T12:00:00.000Z");
+    registry.touch(record.deviceId, new Date(startMs));
+    const readPersistedLastSeenAt = (): string | null =>
+      (JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[]).find(
+        (r) => r.deviceId === record.deviceId,
+      )?.lastSeenAt ?? null;
+    const firstPersisted = readPersistedLastSeenAt();
+    for (let step = 1; step <= 6; step += 1) {
+      registry.touch(record.deviceId, new Date(startMs + step * 30_000));
+    }
+
+    const persisted = readPersistedLastSeenAt();
+    expect(firstPersisted).toBe(new Date(startMs).toISOString());
+    // Throttling against the in-memory lastSeenAt would leave the file frozen at firstPersisted.
+    expect(persisted).not.toBe(firstPersisted);
+    expect(Date.parse(persisted ?? "")).toBeGreaterThanOrEqual(startMs + 120_000);
+    expect(Date.parse(persisted ?? "")).toBeLessThanOrEqual(startMs + 180_000);
+  });
+
+  test("a device whose record could not be written is not left registered in memory", () => {
+    const dir = tempDir();
+    // The parent of the registry path is a regular file, so the atomic write's mkdir fails.
+    const blocker = join(dir, "blocked");
+    writeFileSync(blocker, "not a directory", "utf8");
+    const filePath = join(blocker, "devices.json");
+
+    const registry = DeviceRegistry.load(filePath);
+    const record = sampleRecord();
+
+    expect(() => registry.register(record)).toThrow();
+    expect(registry.get(record.deviceId)).toBeUndefined();
+    expect(registry.list()).toEqual([]);
+    expect(existsSync(filePath)).toBe(false);
+  });
+
   test("a deleted backing file does not throw on the next get, and reports an empty registry", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");

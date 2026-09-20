@@ -20,6 +20,7 @@ enum StatusKind: Equatable {
     case reconnecting
     case requestInvalid
     case error
+    case authFailed
 }
 
 enum TurnState: String {
@@ -183,11 +184,31 @@ final class SessionStore {
             } catch {
                 if Task.isCancelled || generation != pollGeneration { return }
                 connected = false
+                // A revoked/unpaired/rejected credential will never succeed on retry: hammering
+                // the bridge forever would just hide the real problem from the user, so stop the
+                // loop here instead of backing off and trying again.
+                if let bridgeError = error as? BridgeError, Self.isTerminalAuthFailure(bridgeError) {
+                    statusLine = "Not authorized: \(bridgeError)"
+                    statusKind = .authFailed
+                    return
+                }
                 statusLine = "Reconnecting: \(error)"
                 statusKind = .reconnecting
                 try? await Task.sleep(for: .seconds(backoff))
                 backoff = min(backoff * 2, 15)
             }
+        }
+    }
+
+    /// Distinguishes a terminal authentication failure -- no retry will ever fix a revoked,
+    /// unpaired, or rejected device credential -- from a transient network/timeout error that
+    /// the existing backoff-and-retry loop should keep handling unchanged.
+    private static func isTerminalAuthFailure(_ error: BridgeError) -> Bool {
+        switch error {
+        case .notPaired, .unauthenticated, .deviceRevoked:
+            true
+        default:
+            false
         }
     }
 
