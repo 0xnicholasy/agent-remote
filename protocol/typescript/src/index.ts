@@ -333,6 +333,15 @@ export interface EventsResponse {
   events: AgentEvent[];
   /** Highest event id held by the bridge at the time of the response. */
   lastEventId: number;
+  /** Oldest event id the bridge still retains, or 0 when its log is empty. Events below it were
+   * dropped by retention and can never be polled for again. */
+  firstEventId?: number;
+  /** True when the requested cursor sits below `firstEventId - 1`, so events between the two
+   * were dropped and this page is not a continuation of what the client last saw. */
+  truncated?: boolean;
+  /** The bridge's identity, so a client can tell "same bridge, restarted" from "different
+   * bridge" without a separate health call. */
+  bridgeId?: string;
 }
 
 export interface CommandResponse {

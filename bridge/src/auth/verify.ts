@@ -55,13 +55,69 @@ function readHeader(headers: HeaderSource, name: string): string | undefined {
   return undefined;
 }
 
+/** One persisted nonce. `expiresAt` is epoch milliseconds. */
+export interface NonceRecord {
+  deviceId: string;
+  nonce: string;
+  expiresAt: number;
+}
+
+/**
+ * Storage a `NonceCache` writes through to so replay protection survives a bridge restart.
+ * Deliberately an interface rather than a file path: this module stays free of `node:fs`, and
+ * the bridge supplies the JSON Lines implementation from `src/state/nonces.ts`.
+ */
+export interface NonceJournal {
+  load(): NonceRecord[];
+  append(record: NonceRecord): void;
+  rewrite(records: readonly NonceRecord[]): void;
+}
+
+/** Appends since the last compaction that trigger a rewrite of the journal file. */
+const COMPACT_AFTER_APPENDS = 1_000;
+
 /**
  * Per-device nonce set with a 300s TTL and a 10,000-entry cap per device, oldest dropped first.
  * A `Map`'s keys iterate in insertion order, and since every entry's TTL is the same fixed
  * duration, insertion order and expiry order coincide as long as `now` does not go backwards.
+ *
+ * With a `NonceJournal` the same set is written through to disk and rehydrated on construction,
+ * so a request replayed across a bridge restart is still refused. Entries already expired at
+ * load time are dropped and never rehydrated.
  */
 export class NonceCache {
   private readonly perDevice = new Map<string, Map<string, number>>();
+  private readonly journal: NonceJournal | undefined;
+  private appendsSinceCompaction = 0;
+
+  constructor(options: { journal?: NonceJournal; now?: Date } = {}) {
+    this.journal = options.journal;
+    if (this.journal === undefined) {
+      return;
+    }
+
+    const nowMs = (options.now ?? new Date()).getTime();
+    let dropped = false;
+    for (const record of this.journal.load()) {
+      if (typeof record?.deviceId !== "string" || typeof record.nonce !== "string" || typeof record.expiresAt !== "number") {
+        dropped = true;
+        continue;
+      }
+      if (record.expiresAt <= nowMs) {
+        dropped = true;
+        continue;
+      }
+      let nonces = this.perDevice.get(record.deviceId);
+      if (nonces === undefined) {
+        nonces = new Map<string, number>();
+        this.perDevice.set(record.deviceId, nonces);
+      }
+      nonces.set(record.nonce, record.expiresAt);
+    }
+    if (dropped) {
+      this.compact();
+    }
+  }
 
   has(deviceId: string, nonce: string, now: Date): boolean {
     const nonces = this.perDevice.get(deviceId);
@@ -86,7 +142,17 @@ export class NonceCache {
         nonces.delete(oldest.value);
       }
     }
-    nonces.set(nonce, now.getTime() + NONCE_TTL_MS);
+    const expiresAt = now.getTime() + NONCE_TTL_MS;
+    nonces.set(nonce, expiresAt);
+
+    if (this.journal === undefined) {
+      return;
+    }
+    this.journal.append({ deviceId, nonce, expiresAt });
+    this.appendsSinceCompaction += 1;
+    if (this.appendsSinceCompaction >= COMPACT_AFTER_APPENDS) {
+      this.compact();
+    }
   }
 
   private pruneExpired(nonces: Map<string, number>, now: Date): void {
@@ -96,6 +162,21 @@ export class NonceCache {
       }
       nonces.delete(key);
     }
+  }
+
+  /** Rewrites the journal to exactly the live set, dropping expired and evicted entries. */
+  private compact(): void {
+    if (this.journal === undefined) {
+      return;
+    }
+    const records: NonceRecord[] = [];
+    for (const [deviceId, nonces] of this.perDevice) {
+      for (const [nonce, expiresAt] of nonces) {
+        records.push({ deviceId, nonce, expiresAt });
+      }
+    }
+    this.journal.rewrite(records);
+    this.appendsSinceCompaction = 0;
   }
 }
 

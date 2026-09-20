@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -83,8 +83,26 @@ function pendingQuestion(events: AgentEvent[]) {
   return requested.payload;
 }
 
+// Every bridge built without an explicit devicesFilePath resolves its state dir from the
+// environment, and slice 2 made that dir hold durable journals (events, commands, nonces,
+// sessions). Pointing it at a fresh temp dir per test keeps one test's persisted command ids
+// from colliding with the next one's, and keeps the suite out of the real ~/.agentremote.
+let testStateDir: string;
+const originalStateDir = process.env.AGENTREMOTE_STATE_DIR;
+
 beforeEach(() => {
+  testStateDir = mkdtempSync(join(tmpdir(), "agentremote-bridge-test-"));
+  process.env.AGENTREMOTE_STATE_DIR = testStateDir;
   bridge = createBridge({ authEnabled: false });
+});
+
+afterEach(() => {
+  if (originalStateDir === undefined) {
+    delete process.env.AGENTREMOTE_STATE_DIR;
+  } else {
+    process.env.AGENTREMOTE_STATE_DIR = originalStateDir;
+  }
+  rmSync(testStateDir, { recursive: true, force: true });
 });
 
 describe("bridge HTTP surface", () => {
@@ -667,6 +685,55 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     } finally {
       restoreProviderEnv();
     }
+  });
+});
+
+describe("indeterminate commands", () => {
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+
+  afterEach(() => {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+  });
+
+  test("a command whose provider call threw an unmapped error is not replayed on retry", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    const stub = { current: undefined as StubClaudeProvider | undefined };
+    const claudeBridge = createBridge({
+      authEnabled: false,
+      createClaudeProvider: (host, providerOptions) => {
+        stub.current = new StubClaudeProvider(host, providerOptions);
+        return stub.current;
+      },
+    });
+    stub.current!.sendPromptError = new Error("boom: unexpected stub failure");
+
+    const command: Command = {
+      commandId: "b1111111-1111-4111-8111-111111111111",
+      sessionId: claudeBridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+    const request = (): Request =>
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      });
+
+    const first = await claudeBridge.fetch(request());
+    expect(first.status).toBe(500);
+
+    // The side effect may or may not have landed, so the retry must be refused rather than
+    // executed a second time - even without a restart in between.
+    stub.current!.sendPromptError = undefined;
+    const retry = await claudeBridge.fetch(request());
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
   });
 });
 
@@ -1335,5 +1402,176 @@ describe("pairing", () => {
     );
     expect(afterRevoke.status).toBe(403);
     expect(await afterRevoke.json()).toEqual({ error: "device_revoked" });
+  });
+});
+
+describe("restart recovery", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-restart-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  /** A second `createBridge` over the same state dir is exactly what a bridge restart is. */
+  function restart(): Bridge {
+    return createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+  }
+
+  function commandBody(commandId: string, sessionId: string): Command {
+    return {
+      commandId,
+      sessionId,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+  }
+
+  function postTo(target: Bridge, command: Command): Promise<Response> {
+    return target.fetch(
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      }),
+    );
+  }
+
+  async function eventsOf(target: Bridge, after: number): Promise<EventsResponse> {
+    const response = await target.fetch(new Request(`http://bridge.local/v1/events?after=${after}`));
+    return (await response.json()) as EventsResponse;
+  }
+
+  test("a command already applied before the restart is answered from the journal, not re-executed", async () => {
+    const first = restart();
+    const command = commandBody("a1111111-1111-4111-8111-111111111111", first.session.id);
+    const firstResponse = (await (await postTo(first, command)).json()) as CommandResponse;
+    expect(firstResponse.duplicate).toBe(false);
+    const eventsBefore = (await eventsOf(first, 0)).events.length;
+
+    const second = restart();
+    const retried = await postTo(second, command);
+    const retriedBody = (await retried.json()) as CommandResponse;
+
+    expect(retried.status).toBe(200);
+    expect(retriedBody.duplicate).toBe(true);
+    expect(retriedBody.accepted).toBe(firstResponse.accepted);
+    // Re-execution would have appended a second turn.started to the retained log.
+    expect((await eventsOf(second, 0)).events.length).toBe(eventsBefore);
+  });
+
+  test("retained events survive the restart and event ids keep increasing", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a2222222-2222-4222-8222-222222222222", first.session.id));
+    const before = await eventsOf(first, 0);
+    expect(before.events.length).toBeGreaterThan(0);
+
+    const second = restart();
+    const afterRestart = await eventsOf(second, 0);
+    expect(afterRestart.events.map((event) => event.eventId)).toEqual(before.events.map((event) => event.eventId));
+
+    await postTo(second, commandBody("a3333333-3333-4333-8333-333333333333", second.session.id));
+    const withNewEvents = await eventsOf(second, before.lastEventId);
+    expect(withNewEvents.events.length).toBeGreaterThan(0);
+    // Ids are never reused across a restart: a client cursor stays meaningful.
+    for (const event of withNewEvents.events) {
+      expect(event.eventId).toBeGreaterThan(before.lastEventId);
+    }
+  });
+
+  test("a cursor below the retained window is reported truncated instead of silently continued", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a4444444-4444-4444-8444-444444444444", first.session.id));
+    const page = await eventsOf(first, 0);
+
+    const stale = await eventsOf(first, 0);
+    expect(stale.truncated).toBe(false);
+    expect(stale.firstEventId).toBe(page.events[0]?.eventId);
+
+    // Rewrite the journal as if retention had dropped everything below id 500.
+    const retained = page.events.map((event, index) => ({ ...event, eventId: 500 + index }));
+    writeFileSync(join(stateDir, "events.jsonl"), retained.map((event) => `${JSON.stringify(event)}\n`).join(""));
+
+    const second = restart();
+    const gapped = await eventsOf(second, 10);
+    expect(gapped.firstEventId).toBe(500);
+    expect(gapped.truncated).toBe(true);
+
+    const continuous = await eventsOf(second, 500);
+    expect(continuous.truncated).toBe(false);
+  });
+
+  test("a command the previous process died in the middle of is refused as indeterminate", async () => {
+    const command = commandBody("a5555555-5555-4555-8555-555555555555", "ses_seed");
+    const rawBody = JSON.stringify(command);
+    const entry = {
+      commandId: command.commandId,
+      deviceId: null,
+      digest: createHash("sha256").update(rawBody).digest("hex"),
+      status: "in_flight",
+      at: FIXED_NOW.getTime(),
+    };
+    writeFileSync(join(stateDir, "commands.jsonl"), `${JSON.stringify(entry)}\n`);
+
+    const after = restart();
+    const response = await postTo(after, command);
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
+    // Nothing was applied on this side either: the log holds no turn for it.
+    expect((await eventsOf(after, 0)).events.length).toBe(0);
+  });
+
+  test("a nonce used before the restart is still rejected as a replay", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord());
+    const nonce = randomBytes(16).toString("hex");
+
+    const first = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const accepted = await first.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(accepted.status).toBe(200);
+
+    const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const replayed = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(replayed.status).toBe(401);
+    expect(await replayed.json()).toEqual({ error: "replayed_request" });
+  });
+
+  test("a narrowed device still sees retained events of a session the provider forgot", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: ["prj_demo"] }));
+
+    const first = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const created = await first.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "a6666666-6666-4666-8666-666666666666",
+          sessionId: "ses_placeholder",
+          type: "session.create",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { projectId: "prj_demo", provider: "mock" },
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+    const createdSessionId = ((await created.json()) as CommandResponse).sessionId;
+    expect(createdSessionId).toBeDefined();
+
+    const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const response = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as EventsResponse;
+
+    // The restarted provider has no such session, so only the persisted session index can
+    // authorize these events; without it the device would reconnect to an empty history.
+    expect(page.events.some((event) => event.sessionId === createdSessionId)).toBe(true);
   });
 });
