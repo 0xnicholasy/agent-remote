@@ -1,8 +1,9 @@
+import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { AgentEvent } from "@agentremote/protocol";
 
 import { NonceCache } from "../auth/verify";
@@ -45,6 +46,60 @@ describe("JsonlJournal", () => {
     writeFileSync(filePath, '{"a":1}\n{"a":2}\n{"a":3', "utf8");
 
     expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 2 }]);
+  });
+
+  test("append after loading a torn tail does not corrupt the new record", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    writeFileSync(filePath, '{"a":1}\n{"a":2}\n{"a":3', "utf8");
+
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    expect(journal.load()).toEqual([{ a: 1 }, { a: 2 }]);
+
+    // If the torn bytes were left on disk, this append would land right after them with no
+    // separating newline, merging into one corrupt line and losing this record on reload too.
+    journal.append({ a: 4 });
+
+    expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 2 }, { a: 4 }]);
+  });
+
+  test("a short write is not reported as a successful durable append", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    const realWriteSync = fs.writeSync.bind(fs);
+    let calls = 0;
+    // JsonlJournal only ever calls the buffer form of writeSync, never the string form, so the
+    // mock only needs to satisfy that one overload rather than the full overloaded type.
+    const bufferOverload: (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset?: number | null,
+      length?: number | null,
+      position?: number | null,
+    ) => number = (fd, buffer, offset, length, position) => {
+      calls += 1;
+      if (calls === 1 && typeof offset === "number" && typeof length === "number") {
+        // Simulate the OS accepting fewer bytes than asked for on the first call.
+        const shortLength = Math.min(3, length);
+        return realWriteSync(fd, buffer, offset, shortLength, position ?? undefined);
+      }
+      return realWriteSync(fd, buffer, offset as number, length as number, position ?? undefined);
+    };
+    const writeSpy = spyOn(fs, "writeSync").mockImplementation(
+      // Cast is safe: it narrows the mocked overloaded signature down to the single overload
+      // (buffer form) this test's production code path actually exercises.
+      bufferOverload as typeof fs.writeSync,
+    );
+
+    try {
+      journal.append({ a: 1 });
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    // The short first write must have been followed by at least one more to finish the record,
+    // and the record on disk must be exactly what was appended, not the first partial chunk.
+    expect(calls).toBeGreaterThan(1);
+    expect(journal.load()).toEqual([{ a: 1 }]);
   });
 });
 
@@ -120,32 +175,101 @@ describe("EventLog", () => {
     const reloaded = new EventLog(filePath, { now: NOW });
     expect(reloaded.all().map((entry) => entry.eventId)).toEqual(log.all().map((entry) => entry.eventId));
   });
+
+  test("an event whose journal append fails is not left readable in memory, and the caller sees the failure", () => {
+    const filePath = join(stateDir, "events.jsonl");
+    const log = new EventLog(filePath, { now: NOW });
+    const id = log.takeEventId();
+
+    mkdirSync(filePath); // the journal path is now a directory: every append fails
+
+    expect(() => log.append(event(id))).toThrow();
+
+    expect(log.all().length).toBe(0);
+    expect(log.after(0)).toEqual([]);
+    expect(log.lastEventId).toBe(0);
+  });
+
+  test("a corrupt watermark fails loudly instead of reissuing already-issued event ids", () => {
+    const filePath = join(stateDir, "events.jsonl");
+    const first = new EventLog(filePath, { now: NOW });
+    const issued = first.takeEventId();
+    first.append(event(issued));
+
+    writeFileSync(`${filePath}.watermark`, "{not json", "utf8");
+    expect(() => new EventLog(filePath, { now: NOW })).toThrow(/watermark/);
+
+    writeFileSync(`${filePath}.watermark`, JSON.stringify({ reservedThrough: "lots" }), "utf8");
+    expect(() => new EventLog(filePath, { now: NOW })).toThrow(/watermark/);
+
+    // An absent watermark is still a legitimately fresh bridge, not a failure.
+    rmSync(`${filePath}.watermark`);
+    rmSync(filePath);
+    expect(new EventLog(filePath, { now: NOW }).takeEventId()).toBe(1);
+  });
 });
 
 describe("CommandJournal", () => {
-  test("terminal entries are capped, oldest terminal evicted first", () => {
+  test("terminal entries past retention are capped, oldest evicted first", () => {
     const filePath = join(stateDir, "commands.jsonl");
     const journal = new CommandJournal(filePath, { now: NOW });
+    const stale = new Date(NOW.getTime() - 25 * 60 * 60 * 1000); // past the 24h retention window
 
-    for (let index = 0; index < MAX_COMMANDS + 50; index += 1) {
+    for (let index = 0; index < 50; index += 1) {
+      journal.begin(`stale-${index}`, "dev_a", `digest-stale-${index}`, stale);
+      journal.complete(`stale-${index}`, { accepted: true, commandId: `stale-${index}`, duplicate: false }, stale);
+    }
+    for (let index = 0; index < MAX_COMMANDS; index += 1) {
       journal.begin(`cmd-${index}`, "dev_a", `digest-${index}`, NOW);
       journal.complete(`cmd-${index}`, { accepted: true, commandId: `cmd-${index}`, duplicate: false }, NOW);
     }
 
+    // Cap pressure evicted exactly the records past retention, oldest first, so the store stays
+    // bounded; no retry can still be relying on those.
     expect(journal.size()).toBe(MAX_COMMANDS);
-    // The oldest terminal ids were evicted, the newest kept.
-    expect(journal.get("cmd-0")).toBeUndefined();
-    expect(journal.get(`cmd-${MAX_COMMANDS + 49}`)).toBeDefined();
+    expect(journal.get("stale-0")).toBeUndefined();
+    expect(journal.get("stale-49")).toBeUndefined();
+    expect(journal.get("cmd-0")).toBeDefined();
+    expect(journal.get(`cmd-${MAX_COMMANDS - 1}`)).toBeDefined();
 
     // The journal is append-only and only rewrites the file on eviction or every
     // COMPACT_AFTER_APPENDS appends, so a `complete()` right after an eviction-triggered
-    // compaction can legitimately leave one stale line on disk until the *next* write forces
-    // another rewrite. Asserting an exact on-disk line count at this arbitrary moment would pin
-    // that compaction timing rather than the cap. Instead, drive one more write (which pushes the
-    // map back over the cap and forces `enforceCap` + `compact` to run again) and assert the file
-    // converges back to the cap, proving the journal does not grow without bound.
-    journal.begin("cmd-cap-sentinel", "dev_a", "digest-sentinel", NOW);
-    expect(lineCount(filePath)).toBe(MAX_COMMANDS);
+    // compaction can legitimately leave a stale line on disk until the next rewrite. Asserting an
+    // exact on-disk line count at this arbitrary moment would pin that compaction timing rather
+    // than the cap, so assert only that the file tracks the live set instead of every append.
+    expect(lineCount(filePath)).toBeLessThanOrEqual(MAX_COMMANDS + 2);
+  });
+
+  test("a terminal entry still inside its retention window is not evicted by cap pressure", () => {
+    const filePath = join(stateDir, "commands.jsonl");
+    const journal = new CommandJournal(filePath, { now: NOW });
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    // Test double for a variadic console method, hence the unknown[] parameter.
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((arg) => String(arg)).join(" "));
+    };
+
+    try {
+      for (let index = 0; index < MAX_COMMANDS + 10; index += 1) {
+        journal.begin(`cmd-${index}`, "dev_a", `digest-${index}`, NOW);
+        journal.complete(`cmd-${index}`, { accepted: true, commandId: `cmd-${index}`, duplicate: false }, NOW);
+      }
+    } finally {
+      console.warn = realWarn;
+    }
+
+    // A retry of cmd-0 is still legitimate for another 24 hours, so its recorded response has to
+    // survive the cap; evicting it would make that retry re-execute the command.
+    expect(journal.size()).toBe(MAX_COMMANDS + 10);
+    expect(journal.get("cmd-0")?.response).toEqual({ accepted: true, commandId: "cmd-0", duplicate: false });
+    expect(journal.get(`cmd-${MAX_COMMANDS + 9}`)).toBeDefined();
+    expect(warnings.some((line) => line.includes("terminal but within retention"))).toBe(true);
+
+    // Growth past the cap is temporary: the same records are dropped once they age out.
+    journal.prune(new Date(NOW.getTime() + 25 * 60 * 60 * 1000));
+    expect(journal.size()).toBe(0);
+    expect(lineCount(filePath)).toBe(0);
   });
 
   test("in-flight entries are never evicted, even past the cap", () => {

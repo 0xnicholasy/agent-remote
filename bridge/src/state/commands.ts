@@ -89,7 +89,7 @@ export class CommandJournal {
         changed = true;
       }
     }
-    changed = this.enforceCap() || changed;
+    changed = this.enforceCap(now) || changed;
     if (changed) {
       this.compact();
     }
@@ -177,7 +177,7 @@ export class CommandJournal {
       }
       throw error;
     }
-    if (this.enforceCap()) {
+    if (this.enforceCap(entry.at)) {
       this.compact();
       return;
     }
@@ -187,30 +187,40 @@ export class CommandJournal {
     }
   }
 
-  /** Drops the oldest entries until the map is within `MAX_COMMANDS`, never evicting a
-   * non-terminal (`in_flight`) record: evicting one would destroy the idempotency record for a
-   * command that is still executing, so a retry of that command id would re-execute it instead
-   * of returning the recorded outcome. Evicts the oldest terminal record first. If every record
-   * is non-terminal, the cap is exceeded with a logged warning rather than silently dropping an
-   * in-flight command or rejecting new work. Returns whether anything was dropped, so the caller
-   * can decide to compact. */
-  private enforceCap(): boolean {
+  /** Drops the oldest evictable entries until the map is within `MAX_COMMANDS`. An entry is
+   * evictable only when it is terminal (not `in_flight`) *and* already past `retentionMs`, the
+   * same window `prune` uses. Both conditions protect the guarantee this journal exists for:
+   * evicting an `in_flight` record loses the identity of a command that is still executing, and
+   * evicting a `completed`/`indeterminate` record still inside its retention window means a
+   * legitimate retry no longer finds the recorded outcome and the command is re-executed. When
+   * nothing is evictable the cap is exceeded with a logged warning naming why, rather than
+   * dropping live idempotency state or rejecting new work — the same precedent the in-flight case
+   * already set. Returns whether anything was dropped, so the caller can decide to compact. */
+  private enforceCap(nowMs: number): boolean {
     let dropped = false;
     while (this.entries.size > MAX_COMMANDS) {
-      let oldestTerminalId: string | undefined;
+      let oldestEvictableId: string | undefined;
+      let inFlight = 0;
+      let withinRetention = 0;
       for (const [commandId, entry] of this.entries) {
-        if (entry.status !== "in_flight") {
-          oldestTerminalId = commandId;
-          break;
+        if (entry.status === "in_flight") {
+          inFlight += 1;
+          continue;
         }
+        if (nowMs - entry.at <= this.retentionMs) {
+          withinRetention += 1;
+          continue;
+        }
+        oldestEvictableId = commandId;
+        break;
       }
-      if (oldestTerminalId === undefined) {
+      if (oldestEvictableId === undefined) {
         console.warn(
-          `Agent Remote bridge: command journal has ${this.entries.size} entries, all in_flight, exceeding MAX_COMMANDS (${MAX_COMMANDS}); growing past cap rather than evicting an in-flight command`,
+          `Agent Remote bridge: command journal has ${this.entries.size} entries, exceeding MAX_COMMANDS (${MAX_COMMANDS}), and none are evictable (${inFlight} in flight, ${withinRetention} terminal but within retention); growing past cap rather than dropping live idempotency records`,
         );
         break;
       }
-      this.entries.delete(oldestTerminalId);
+      this.entries.delete(oldestEvictableId);
       dropped = true;
     }
     return dropped;

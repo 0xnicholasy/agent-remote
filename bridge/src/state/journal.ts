@@ -70,6 +70,15 @@ export class JsonlJournal<T> {
         // A torn or corrupt line costs that record only.
       }
     }
+
+    // Every complete record ends with "\n" (append always writes `${json}\n`), so raw content
+    // that does not end with a newline means the final write was torn by a crash mid-append.
+    // Left on disk, that fragment would merge with the very next append into one corrupt line
+    // and lose the new record too, so compact the file down to just the parsed records now,
+    // through the same atomic, fsynced path `rewrite` already uses for compaction.
+    if (raw.length > 0 && !raw.endsWith("\n")) {
+      this.rewrite(records);
+    }
     return records;
   }
 
@@ -90,7 +99,14 @@ export class JsonlJournal<T> {
     try {
       mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
       fd = openSync(this.filePath, "a", 0o600);
-      writeSync(fd, `${JSON.stringify(record)}\n`);
+      // writeSync can write fewer bytes than given (short write); loop until the whole record
+      // has landed rather than trusting the first call, otherwise a partial record on disk would
+      // still be fsynced and reported as a durable append.
+      const payload = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+      let written = 0;
+      while (written < payload.length) {
+        written += writeSync(fd, payload, written, payload.length - written);
+      }
       fsyncSync(fd);
       fsyncDirSync(dirname(this.filePath));
     } catch (error) {

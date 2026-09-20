@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1673,5 +1673,132 @@ describe("single-writer state dir lock", () => {
     writeFileSync(join(stateDir, "bridge.lock"), "999999999", "utf8");
 
     expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).not.toThrow();
+  });
+
+  test("a bridge boots against a state dir that does not exist yet", () => {
+    // A fresh install has no ~/.agentremote at all: the lock is the first file written into it,
+    // so the directory has to be created before the exclusive create rather than by whatever
+    // journal happens to write first.
+    const freshDir = join(stateDir, "not-created-yet");
+    let fresh: Bridge | undefined;
+
+    expect(() => {
+      fresh = createBridge({
+        devicesFilePath: join(freshDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+    }).not.toThrow();
+    expect(readFileSync(join(freshDir, "bridge.lock"), "utf8").trim()).toBe(String(process.pid));
+
+    fresh?.close();
+  });
+});
+
+describe("retained events of a rebound session id", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+  const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+  const projectA = projectIdFor("/tmp/agentremote-project-a");
+  const projectB = projectIdFor("/tmp/agentremote-project-b");
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-rebind-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+    // Two projects are needed to rebind a session id across projects, and the stub claude
+    // provider is the only one wired to more than one.
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    process.env.AGENTREMOTE_PROJECT_DIRS = "/tmp/agentremote-project-a,/tmp/agentremote-project-b";
+  });
+
+  afterEach(() => {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+    if (originalDirs === undefined) {
+      delete process.env.AGENTREMOTE_PROJECT_DIRS;
+    } else {
+      process.env.AGENTREMOTE_PROJECT_DIRS = originalDirs;
+    }
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function boot(authEnabled: boolean): Bridge {
+    return createBridge({
+      devicesFilePath,
+      authEnabled,
+      now: () => FIXED_NOW,
+      createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+    });
+  }
+
+  function send(target: Bridge, command: Command): Promise<Response> {
+    return target.fetch(
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      }),
+    );
+  }
+
+  /** One boot that creates a session in `projectId`, records an event under it, and shuts down.
+   * The stub provider hands out the same session id (`ses_stub`) on every boot, which is how a
+   * session id really can be reused after a restart. */
+  async function bootAndRecord(projectId: string, suffix: string): Promise<string> {
+    const booted = boot(false);
+    const created = await send(booted, {
+      commandId: `b${suffix}111111-1111-4111-8111-111111111111`,
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId, provider: "claude" },
+    });
+    const body = (await created.json()) as CommandResponse;
+    expect(created.status).toBe(200);
+    const sessionId = body.sessionId;
+    if (sessionId === undefined) {
+      throw new Error("session.create did not report a session id");
+    }
+    const prompted = await send(booted, {
+      commandId: `c${suffix}222222-2222-4222-8222-222222222222`,
+      sessionId,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: `prompt under ${projectId}` },
+    });
+    expect(prompted.status).toBe(200);
+    booted.close();
+    return sessionId;
+  }
+
+  test("an A-B-A rebinding does not re-authorize the retained events recorded under B", async () => {
+    const first = await bootAndRecord(projectA, "1");
+    // The binding lapses while the event log survives: retention, the session index's size cap
+    // and a lost sessions.jsonl all end in exactly this state.
+    rmSync(join(stateDir, "sessions.jsonl"));
+
+    const second = await bootAndRecord(projectB, "2");
+    expect(second).toBe(first); // The same session id, now bound to a different project.
+    rmSync(join(stateDir, "sessions.jsonl"));
+
+    const third = await bootAndRecord(projectA, "3");
+    expect(third).toBe(first); // Bound back to the first project: the A-B-A cycle is closed.
+
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectA] }));
+    const reader = boot(true);
+    const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as EventsResponse;
+    reader.close();
+
+    // The log still holds the events recorded while the id was bound to project B, and the
+    // binding readable now says project A. Those events must not be served, and since the id's
+    // history can no longer be attributed at all, none of its events are.
+    expect(page.events.some((event) => event.sessionId === first)).toBe(false);
   });
 });

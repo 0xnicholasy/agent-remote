@@ -88,9 +88,12 @@ export class EventLog {
     return this.nextId++;
   }
 
+  /** Persists first, then records in memory. A durable append that throws must leave no trace in
+   * memory: serving a client an event that will not exist after a restart puts a permanent,
+   * undetectable gap in its cursor sequence, which is worse than the caller seeing the failure. */
   append(event: AgentEvent): void {
-    this.events.push(event);
     this.journal.append(event);
+    this.events.push(event);
     this.appendsSinceCompaction += 1;
     if (this.events.length > MAX_RETAINED_EVENTS) {
       this.events = this.events.slice(-MAX_RETAINED_EVENTS);
@@ -115,24 +118,49 @@ export class EventLog {
     this.appendsSinceCompaction = 0;
   }
 
-  /** Highest id any previous process may have issued, from the persisted watermark. */
+  /**
+   * Highest id any previous process may have issued, from the persisted watermark.
+   *
+   * Absent means a legitimately fresh bridge and reads as 0. Present but unreadable is a real
+   * failure and throws: the watermark reserves ids ahead of the log, so it can legitimately sit
+   * above the log's highest id, and there is no floor recoverable from the log that is
+   * guaranteed safe. Failing to start beats silently reissuing ids clients already hold.
+   */
   private loadWatermark(): number {
     if (this.watermarkFilePath === undefined || !existsSync(this.watermarkFilePath)) {
       return 0;
     }
+
+    let raw: string;
     try {
-      // JSON.parse is untyped by construction; validated before it is trusted.
-      const parsed: unknown = JSON.parse(readFileSync(this.watermarkFilePath, "utf8"));
-      if (typeof parsed === "object" && parsed !== null) {
-        const value = (parsed as Record<string, unknown>).reservedThrough;
-        if (typeof value === "number" && Number.isFinite(value)) {
-          return value;
-        }
+      raw = readFileSync(this.watermarkFilePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return 0; // removed between the check and the read: still an absent watermark
       }
-    } catch {
-      // A corrupt watermark falls back to the log's own highest id.
+      console.error(`Agent Remote bridge: failed to read watermark ${this.watermarkFilePath}`, error);
+      throw error;
     }
-    return 0;
+
+    let parsed: unknown; // JSON.parse is untyped by construction; validated before it is trusted.
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(
+        `Agent Remote bridge: event id watermark ${this.watermarkFilePath} is corrupt and cannot be parsed; refusing to start rather than reuse event ids`,
+        { cause: error },
+      );
+    }
+
+    if (typeof parsed === "object" && parsed !== null) {
+      const value = (parsed as Record<string, unknown>).reservedThrough;
+      if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+        return value;
+      }
+    }
+    throw new Error(
+      `Agent Remote bridge: event id watermark ${this.watermarkFilePath} holds no usable reservation; refusing to start rather than reuse event ids`,
+    );
   }
 
   /** Persists the watermark before any id in the new block is handed out. Reservation must not

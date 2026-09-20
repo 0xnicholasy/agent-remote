@@ -96,7 +96,18 @@ export class SessionIndex {
     }
     const entry: SessionIndexEntry = { sessionId, projectId, at: now.getTime() };
     this.entries.set(sessionId, entry);
-    this.journal.append(entry);
+    try {
+      this.journal.append(entry);
+    } catch (error) {
+      // journal.ts propagates append failures instead of swallowing them. The in-memory binding
+      // must not claim durability the journal does not have, or the server would authorize
+      // cross-project events against a binding that vanishes on restart. Roll it back — deleting
+      // outright is correct here (unlike CommandJournal.write) because `record` never reaches
+      // this branch when `existing` is defined, so there is never a previous entry to restore.
+      console.error(`Agent Remote bridge: session index append failed for ${sessionId}`, error);
+      this.entries.delete(sessionId);
+      throw error;
+    }
     if (this.enforceCap()) {
       this.compact();
       return;
