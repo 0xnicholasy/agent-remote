@@ -146,17 +146,22 @@ export class NonceCache {
 
     this.pruneExpired(nonces, now);
     const expiresAt = now.getTime() + NONCE_TTL_MS;
-    nonces.set(nonce, expiresAt);
-    this.evictOverflow(nonces);
 
     if (this.journal === undefined) {
+      nonces.set(nonce, expiresAt);
+      this.evictOverflow(nonces);
       return;
     }
-    // `append` throws on a filesystem failure (see JsonlJournal). Let it propagate out of
-    // `record` and in turn out of `verifyEnvelope`: a nonce that is not durably recorded must
-    // not be treated as a successfully verified request, or the same envelope replays cleanly
-    // across a bridge restart.
+    // Persist before marking the nonce used in memory, so the two can never disagree. `append`
+    // throws on a filesystem failure (see JsonlJournal); letting it propagate out of `record`
+    // and in turn out of `verifyEnvelope` is what makes an unpersistable nonce fail closed, and
+    // appending first means the throw leaves the in-memory set untouched rather than holding a
+    // nonce the journal never recorded (which would look spent now and replay cleanly after a
+    // restart). The same ordering keeps eviction honest: nothing is evicted on behalf of an
+    // entry that was never durably written.
     this.journal.append({ deviceId, nonce, expiresAt });
+    nonces.set(nonce, expiresAt);
+    this.evictOverflow(nonces);
     this.appendsSinceCompaction += 1;
     if (this.appendsSinceCompaction >= COMPACT_AFTER_APPENDS) {
       this.compact();

@@ -401,6 +401,30 @@ describe("NonceCache persistence", () => {
     expect(reloaded.has("dev_a", "nonce-999", now)).toBe(true);
   });
 
+  test("a nonce whose journal append fails is not treated as used, and the failure propagates", () => {
+    const filePath = join(stateDir, "nonces.jsonl");
+    const cache = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+    cache.record("dev_a", "nonce-durable", NOW);
+
+    // Replace the journal file with a directory of the same name: the next append's openSync
+    // call fails with EISDIR, simulating a filesystem failure while recording a nonce.
+    const persisted = readFileSync(filePath, "utf8");
+    rmSync(filePath);
+    mkdirSync(filePath);
+
+    expect(() => cache.record("dev_a", "nonce-lost", NOW)).toThrow();
+
+    // A nonce the journal never recorded must not be spent in memory either: believing it spent
+    // now while the journal disagrees means the same envelope replays cleanly after a restart.
+    expect(cache.has("dev_a", "nonce-lost", NOW)).toBe(false);
+
+    rmSync(filePath, { recursive: true });
+    writeFileSync(filePath, persisted);
+    const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+    expect(reloaded.has("dev_a", "nonce-lost", NOW)).toBe(false);
+    expect(reloaded.has("dev_a", "nonce-durable", NOW)).toBe(true);
+  });
+
   test("the per-device nonce cap and journal persistence agree on who survives a restart", () => {
     const filePath = join(stateDir, "nonces.jsonl");
     const MAX_NONCES_PER_DEVICE = 10_000; // mirrors auth/verify.ts's cap, which is not exported

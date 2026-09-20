@@ -58,6 +58,27 @@ function createHost(): { host: ProviderHost; events: AgentEvent[] } {
   return { host, events };
 }
 
+/** A host whose `emit` throws for the given event types, standing in for the bridge's durable
+ * emit path after it was made to throw when an event cannot be appended to the event log. */
+function createFailingHost(failTypes: Array<AgentEvent["type"]>): { host: ProviderHost; events: AgentEvent[] } {
+  const inner = createHost();
+  const host: ProviderHost = {
+    emit(sessionId, type, payload) {
+      if (failTypes.includes(type)) {
+        throw new Error(`event log append failed for ${type}`);
+      }
+      return inner.host.emit(sessionId, type, payload);
+    },
+    eventsAfter(after: number) {
+      return inner.host.eventsAfter(after);
+    },
+    waitForChange(timeoutMs: number) {
+      return inner.host.waitForChange(timeoutMs);
+    },
+  };
+  return { host, events: inner.events };
+}
+
 // Minimal stand-ins for the real SDK message and tool-call shapes. `SDKAssistantMessage` and
 // `SDKResultMessage` each carry dozens of fields (BetaMessage ids, stop reasons, per-model
 // usage tables, ...) that the provider never reads, so these fakes carry only the fields it
@@ -1837,5 +1858,50 @@ describe("ClaudeProvider", () => {
 
     expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("running");
     releaseTurn?.();
+  });
+  test("an emit the bridge cannot persist does not reject unhandled: it is logged and the session fails (entry R-041)", async () => {
+    // `ProviderHost.emit` throws when the event log append fails. The message pump runs
+    // fire-and-forget, so before the fix that throw became an unhandled rejection that could
+    // take the whole bridge process down on a disk error.
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    const logged: string[] = [];
+    const realConsoleError = console.error;
+    console.error = (...args: unknown[]): void => {
+      logged.push(args.map((arg) => String(arg)).join(" "));
+    };
+    try {
+      // Both the event the pump tries to emit and the `error` event its own failure path would
+      // fall back to: before the fix that second throw escaped the unawaited pump as an
+      // unhandled rejection.
+      const { host, events } = createFailingHost(["agent.message", "error"]);
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        yield fakeAssistant("hello", "m1");
+        yield fakeResult("done");
+      }
+      const { query } = asQuery(gen());
+      const queryFn: QueryFn = (() => query) as QueryFn;
+      const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+      const session = await provider.createSession("p1");
+
+      await provider.sendPrompt(session.id, "go");
+      await delay();
+      await delay();
+
+      expect(rejections).toEqual([]);
+      // Not swallowed: the failure names the session and the event that was lost.
+      expect(logged.some((line) => line.includes(session.id) && line.includes("agent.message"))).toBe(true);
+      // Defined state: the session is torn down rather than left running with a hole in its
+      // event stream that the client's cursor cannot detect.
+      expect(await provider.listSessions()).toHaveLength(0);
+      expect(events.map((event) => event.type)).not.toContain("turn.completed");
+      await expect(provider.sendPrompt(session.id, "again")).rejects.toBeInstanceOf(UnknownSessionError);
+    } finally {
+      console.error = realConsoleError;
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 });

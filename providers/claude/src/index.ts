@@ -271,6 +271,9 @@ export class ClaudeProvider implements AgentProvider {
   private readonly maxSessions: number;
   private readonly sessions = new Map<string, Session>();
   private readonly conversations = new Map<string, Conversation>();
+  /** Session ids whose events stopped being persistable (see `safeEmit`). Read by the message
+   * pump, which stops iterating for these sessions instead of streaming events nobody records. */
+  private readonly abandoned = new Set<string>();
   private counter = 0;
 
   constructor(host: ProviderHost, options: ClaudeProviderOptions) {
@@ -567,7 +570,14 @@ export class ClaudeProvider implements AgentProvider {
       interactionLock: Promise.resolve(),
     };
     this.conversations.set(sessionId, conversation);
-    void this.pumpMessages(sessionId, queryHandle);
+    // Fire-and-forget by design (the pump runs for the life of the conversation), so its promise
+    // must never be able to reject: every emit inside it goes through `safeEmit`, and this catch
+    // is the backstop that keeps any other unexpected throw from becoming an unhandled rejection
+    // that crashes the bridge process.
+    void this.pumpMessages(sessionId, queryHandle).catch((error: unknown) => {
+      console.error(`[claude] message pump for session ${sessionId} failed unexpectedly:`, error);
+      this.abandonConversation(sessionId, "pumpMessages");
+    });
   }
 
   /**
@@ -625,17 +635,21 @@ export class ClaudeProvider implements AgentProvider {
       if (error instanceof TimeoutError) {
         terminalMessage = "interrupt_timeout";
       }
-      this.host.emit(sessionId, "error", {
-        code: "provider_error",
-        message: `queryHandle.return failed: ${errorMessage(error)}`,
-        fatal: false,
+      this.safeEmit(sessionId, "error", () => {
+        this.host.emit(sessionId, "error", {
+          code: "provider_error",
+          message: `queryHandle.return failed: ${errorMessage(error)}`,
+          fatal: false,
+        });
       });
     }
     this.conversations.delete(sessionId);
     this.sessions.delete(sessionId);
-    this.host.emit(sessionId, "session.completed", {
-      reason,
-      ...(terminalMessage === undefined ? {} : { message: terminalMessage }),
+    this.safeEmit(sessionId, "session.completed", () => {
+      this.host.emit(sessionId, "session.completed", {
+        reason,
+        ...(terminalMessage === undefined ? {} : { message: terminalMessage }),
+      });
     });
   }
 
@@ -645,7 +659,9 @@ export class ClaudeProvider implements AgentProvider {
    * "cancelled" member in the schema, so the forced outcome is reported as `expired` with the
    * real cause in `reason`, which is what lets the watch clear the card. */
   private resolvePendingApprovalEvent(sessionId: string, approvalId: string, reason: string): void {
-    this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "expired", reason });
+    this.safeEmit(sessionId, "approval.resolved", () => {
+      this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "expired", reason });
+    });
   }
 
   /** The question-side counterpart. The protocol has no separate question-cancelled event, and
@@ -653,7 +669,9 @@ export class ClaudeProvider implements AgentProvider {
    * reported through it with the cause in place of an answer — otherwise the watch keeps showing
    * a question card for an interaction the agent has already given up on. */
   private resolvePendingQuestionEvent(sessionId: string, questionId: string, reason: string): void {
-    this.host.emit(sessionId, "question.answered", { questionId, answer: `(${reason})` });
+    this.safeEmit(sessionId, "question.answered", () => {
+      this.host.emit(sessionId, "question.answered", { questionId, answer: `(${reason})` });
+    });
   }
 
   /** Chains `fn` onto the conversation's interaction lock so a second concurrent
@@ -671,6 +689,77 @@ export class ClaudeProvider implements AgentProvider {
     return run;
   }
 
+  /**
+   * Emits through the host without ever letting the failure escape into a fire-and-forget
+   * context. `ProviderHost.emit` now throws when the event cannot be durably persisted, and
+   * several emit sites here run detached from any caller (the `pumpMessages` loop, an
+   * `AbortSignal` listener, the approval expiry timer), where a throw would become an unhandled
+   * rejection or an uncaught exception and take the bridge process down.
+   *
+   * The failure is never swallowed: it is logged with the session id and event type, and the
+   * conversation is torn down (`abandonConversation`) instead of pumping on. Continuing would
+   * leave the client's event stream with a gap it cannot detect — the exact failure mode the
+   * watermark/cursor work exists to prevent — so a session whose events stopped being durable
+   * ends as `failed` rather than as a session that looks healthy but is silently lying.
+   *
+   * Returns false when the event was not emitted, so a caller holding an SDK promise (a pending
+   * approval/question) can settle it instead of waiting for a decision no client will ever make.
+   */
+  private safeEmit(sessionId: string, type: string, emit: () => void): boolean {
+    try {
+      emit();
+      return true;
+    } catch (error) {
+      console.error(
+        `[claude] failed to emit ${type} for session ${sessionId}; terminating the session rather than continuing with an undetectable gap in its event stream:`,
+        error,
+      );
+      this.abandonConversation(sessionId, type);
+      return false;
+    }
+  }
+
+  /** Terminal teardown for a conversation whose events can no longer be persisted. Mirrors
+   * `terminateConversation` minus every emit: the host has just proved it cannot take events, so
+   * emitting `session.completed`/`approval.resolved` here would only throw again. The session is
+   * left in a defined state (`failed`, removed from both maps, pendings denied, subprocess
+   * disposed) rather than continuing to run against a client that is no longer being told
+   * anything. Idempotent, and a no-op for a conversation already tearing down. */
+  private abandonConversation(sessionId: string, type: string): void {
+    this.abandoned.add(sessionId);
+    const conversation = this.conversations.get(sessionId);
+    if (conversation === undefined || conversation.terminal) {
+      return;
+    }
+    conversation.terminal = true;
+    conversation.turnInProgress = false;
+    conversation.pendingAssistantMessage = undefined;
+    this.setSessionState(sessionId, "failed");
+    const denied: PermissionResult = {
+      behavior: "deny",
+      message: `event ${type} could not be persisted`,
+      interrupt: true,
+    };
+    if (conversation.pendingApproval !== undefined) {
+      const pending = conversation.pendingApproval;
+      clearTimeout(pending.expiryTimer);
+      conversation.pendingApproval = undefined;
+      pending.resolve(denied);
+    }
+    if (conversation.pendingQuestion !== undefined) {
+      const pending = conversation.pendingQuestion;
+      conversation.pendingQuestion = undefined;
+      pending.resolve(denied);
+    }
+    this.conversations.delete(sessionId);
+    this.sessions.delete(sessionId);
+    // Detached on purpose: this runs from contexts with nobody to await it. Disposal failures are
+    // already non-fatal everywhere else in this file.
+    void Promise.resolve(conversation.queryHandle.return(undefined)).catch((error: unknown) => {
+      console.error(`[claude] queryHandle.return failed while abandoning session ${sessionId}:`, error);
+    });
+  }
+
   private async pumpMessages(sessionId: string, queryHandle: Query): Promise<void> {
     try {
       for await (const message of queryHandle) {
@@ -679,15 +768,25 @@ export class ClaudeProvider implements AgentProvider {
         } catch (error) {
           // Distinct from the SDK/transport failure below: this is a bug in our own mapping of
           // an otherwise healthy message, not the agent process failing.
-          this.host.emit(sessionId, "error", {
-            code: "message_handling_error",
-            message: errorMessage(error),
-            fatal: true,
+          this.safeEmit(sessionId, "error", () => {
+            this.host.emit(sessionId, "error", {
+              code: "message_handling_error",
+              message: errorMessage(error),
+              fatal: true,
+            });
           });
           const conversation = this.conversations.get(sessionId);
           if (conversation !== undefined) {
             await this.terminateConversation(sessionId, conversation, "error");
           }
+          return;
+        }
+        // A `safeEmit` failure inside `handleMessage` abandoned this session: its event stream
+        // already has a hole, so the pump stops here rather than emitting further events that
+        // would make the client's view look continuous when it is not. (A plain teardown by
+        // `cancel()` is deliberately not treated this way: that path owns its own disposal.)
+        if (this.abandoned.has(sessionId)) {
+          this.abandoned.delete(sessionId);
           return;
         }
       }
@@ -699,10 +798,12 @@ export class ClaudeProvider implements AgentProvider {
         if (conversation.turnInProgress) {
           // Ended mid-turn without ever yielding a `result`: an abnormal teardown, reported as a
           // fatal error and a failed session.
-          this.host.emit(sessionId, "error", {
-            code: "provider_error",
-            message: "conversation ended without a result",
-            fatal: true,
+          this.safeEmit(sessionId, "error", () => {
+            this.host.emit(sessionId, "error", {
+              code: "provider_error",
+              message: "conversation ended without a result",
+              fatal: true,
+            });
           });
           await this.terminateConversation(sessionId, conversation, "error");
         } else {
@@ -720,10 +821,12 @@ export class ClaudeProvider implements AgentProvider {
       if (conversation === undefined || conversation.terminal) {
         return;
       }
-      this.host.emit(sessionId, "error", {
-        code: "provider_error",
-        message: errorMessage(error),
-        fatal: true,
+      this.safeEmit(sessionId, "error", () => {
+        this.host.emit(sessionId, "error", {
+          code: "provider_error",
+          message: errorMessage(error),
+          fatal: true,
+        });
       });
       await this.terminateConversation(sessionId, conversation, "error");
     }
@@ -738,11 +841,13 @@ export class ClaudeProvider implements AgentProvider {
       return;
     }
     conversation.pendingAssistantMessage = undefined;
-    this.host.emit(sessionId, "agent.message", {
-      messageId: pending.messageId,
-      role: "assistant",
-      text: pending.text,
-      final: true,
+    this.safeEmit(sessionId, "agent.message", () => {
+      this.host.emit(sessionId, "agent.message", {
+        messageId: pending.messageId,
+        role: "assistant",
+        text: pending.text,
+        final: true,
+      });
     });
   }
 
@@ -759,22 +864,26 @@ export class ClaudeProvider implements AgentProvider {
           if (conversation !== undefined) {
             const previous = conversation.pendingAssistantMessage;
             if (previous !== undefined) {
-              this.host.emit(sessionId, "agent.message", {
-                messageId: previous.messageId,
-                role: "assistant",
-                text: previous.text,
-                final: false,
+              this.safeEmit(sessionId, "agent.message", () => {
+                this.host.emit(sessionId, "agent.message", {
+                  messageId: previous.messageId,
+                  role: "assistant",
+                  text: previous.text,
+                  final: false,
+                });
               });
             }
             conversation.pendingAssistantMessage = { messageId: message.uuid, text: block.text };
           } else {
             // No conversation to hold this back against (already torn down): emit immediately,
             // since there is nowhere to buffer it and nothing left that could still follow it.
-            this.host.emit(sessionId, "agent.message", {
-              messageId: message.uuid,
-              role: "assistant",
-              text: block.text,
-              final: true,
+            this.safeEmit(sessionId, "agent.message", () => {
+              this.host.emit(sessionId, "agent.message", {
+                messageId: message.uuid,
+                role: "assistant",
+                text: block.text,
+                final: true,
+              });
             });
           }
         }
@@ -793,18 +902,28 @@ export class ClaudeProvider implements AgentProvider {
       }
       const turnId = conversation.turnId ?? `trn_${++this.counter}`;
       this.flushPendingAssistantMessage(sessionId, conversation);
+      if (conversation.terminal) {
+        // The flush above could not be persisted and abandoned the conversation. Reporting
+        // `turn.completed` now would tell the client the turn finished cleanly while the
+        // assistant text it completed with never reached the log.
+        return;
+      }
       conversation.turnInProgress = false;
       this.setSessionState(sessionId, "idle");
       if (message.subtype === "success") {
-        this.host.emit(sessionId, "turn.completed", {
-          turnId,
-          durationMs: message.duration_ms,
-          summary: message.result,
+        this.safeEmit(sessionId, "turn.completed", () => {
+          this.host.emit(sessionId, "turn.completed", {
+            turnId,
+            durationMs: message.duration_ms,
+            summary: message.result,
+          });
         });
-        this.host.emit(sessionId, "usage.updated", {
-          inputTokens: message.usage.input_tokens,
-          outputTokens: message.usage.output_tokens,
-          ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
+        this.safeEmit(sessionId, "usage.updated", () => {
+          this.host.emit(sessionId, "usage.updated", {
+            inputTokens: message.usage.input_tokens,
+            outputTokens: message.usage.output_tokens,
+            ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
+          });
         });
         return;
       }
@@ -812,15 +931,19 @@ export class ClaudeProvider implements AgentProvider {
       // An SDKResultError (error_max_turns, error_during_execution, ...) is a normal, non-thrown
       // turn outcome, not a pump crash: surface it as an `error` event rather than a
       // turn.completed, but usage is still meaningful and must still be reported.
-      this.host.emit(sessionId, "error", {
-        code: message.subtype,
-        message: message.errors.length > 0 ? message.errors.join("; ") : message.subtype,
-        fatal: false,
+      this.safeEmit(sessionId, "error", () => {
+        this.host.emit(sessionId, "error", {
+          code: message.subtype,
+          message: message.errors.length > 0 ? message.errors.join("; ") : message.subtype,
+          fatal: false,
+        });
       });
-      this.host.emit(sessionId, "usage.updated", {
-        inputTokens: message.usage.input_tokens,
-        outputTokens: message.usage.output_tokens,
-        ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
+      this.safeEmit(sessionId, "usage.updated", () => {
+        this.host.emit(sessionId, "usage.updated", {
+          inputTokens: message.usage.input_tokens,
+          outputTokens: message.usage.output_tokens,
+          ...(message.total_cost_usd === undefined ? {} : { costUsd: message.total_cost_usd }),
+        });
       });
     }
   }
@@ -900,13 +1023,26 @@ export class ClaudeProvider implements AgentProvider {
           },
           (settle) => {
             conversation.pendingQuestion = { questionId, turnId, resolve: settle, question };
-            this.host.emit(sessionId, "question.requested", {
-              questionId,
-              turnId,
-              text: question.question,
-              options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
-              allowFreeText: true,
+            const emitted = this.safeEmit(sessionId, "question.requested", () => {
+              this.host.emit(sessionId, "question.requested", {
+                questionId,
+                turnId,
+                text: question.question,
+                options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
+                allowFreeText: true,
+              });
             });
+            if (!emitted) {
+              // The client never learned this question exists, so nobody will ever answer it:
+              // deny now instead of holding the SDK call (and the interaction lock) open forever.
+              // `safeEmit` has already abandoned the conversation and denied this pending, so the
+              // settle below is normally a no-op; it stays as the guard for the case where the
+              // conversation was already terminal.
+              if (conversation.pendingQuestion?.questionId === questionId) {
+                conversation.pendingQuestion = undefined;
+              }
+              settle({ behavior: "deny", message: "question.requested could not be persisted", interrupt: true });
+            }
           },
         );
         if (result.behavior === "deny") {
@@ -987,10 +1123,15 @@ export class ClaudeProvider implements AgentProvider {
             return;
           }
           conversation.pendingApproval = undefined;
-          this.host.emit(sessionId, "approval.resolved", {
-            approvalId,
-            decision: "expired",
-            reason: "expired",
+          // Runs on a timer with no caller to catch a throw, so the emit must not be able to
+          // throw out of this callback; the deny below still happens either way, so the SDK call
+          // is released whether or not the event reached the log.
+          this.safeEmit(sessionId, "approval.resolved", () => {
+            this.host.emit(sessionId, "approval.resolved", {
+              approvalId,
+              decision: "expired",
+              reason: "expired",
+            });
           });
           this.restoreRunningState(sessionId, conversation);
           settle({ behavior: "deny", message: "approval expired" });
@@ -1002,15 +1143,27 @@ export class ClaudeProvider implements AgentProvider {
         }
         conversation.pendingApproval = { binding, resolve: settle, expiryTimer };
         const detail = `${callOptions.description ?? ""}${truncationNote}`.trim();
-        this.host.emit(sessionId, "approval.requested", {
-          binding,
-          kind: deriveApprovalKind(toolName),
-          // Always the same text the digest was computed over, so the card the user sees is
-          // exactly what they are binding their decision to.
-          title: actionText,
-          ...(detail === "" ? {} : { detail }),
-          ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
+        const emitted = this.safeEmit(sessionId, "approval.requested", () => {
+          this.host.emit(sessionId, "approval.requested", {
+            binding,
+            kind: deriveApprovalKind(toolName),
+            // Always the same text the digest was computed over, so the card the user sees is
+            // exactly what they are binding their decision to.
+            title: actionText,
+            ...(detail === "" ? {} : { detail }),
+            ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
+          });
         });
+        if (!emitted) {
+          // No card ever reached the client, so no approve/reject can arrive: deny rather than
+          // let the tool call sit on the interaction lock until the TTL. Same no-op-settle
+          // reasoning as the question path above.
+          if (conversation.pendingApproval?.binding.approvalId === approvalId) {
+            clearTimeout(conversation.pendingApproval.expiryTimer);
+            conversation.pendingApproval = undefined;
+          }
+          settle({ behavior: "deny", message: "approval.requested could not be persisted", interrupt: true });
+        }
       },
     );
   }
