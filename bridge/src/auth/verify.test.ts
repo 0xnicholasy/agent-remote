@@ -191,6 +191,16 @@ describe("verifyEnvelope", () => {
     expect(result).toEqual({ ok: false, status: 401, code: "unauthenticated" });
   });
 
+  test("a signature captured for one (method, path) is rejected for a different method or path", () => {
+    const params = baseParams();
+
+    const differentMethod = verifyEnvelope({ ...params, method: "POST" });
+    expect(differentMethod).toEqual({ ok: false, status: 401, code: "unauthenticated" });
+
+    const differentPath = verifyEnvelope({ ...params, pathWithQuery: "/v1/sessions" });
+    expect(differentPath).toEqual({ ok: false, status: 401, code: "unauthenticated" });
+  });
+
   test("a nonce is NOT recorded when the signature is bad", () => {
     const params = baseParams();
     const headers = {

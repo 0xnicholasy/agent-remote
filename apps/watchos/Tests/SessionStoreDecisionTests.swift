@@ -15,6 +15,12 @@ actor FakeBridgeClient: BridgeClientProtocol {
     }
 
     private var sendResult: SendResult = .success(CommandResponse())
+    /// Controls what `pair(code:deviceName:)` does; defaults to succeeding silently like the
+    /// existing no-op did, so tests that never touch pairing are unaffected.
+    private var pairResult: Result<Void, any Error & Sendable> = .success(())
+    /// Backs `isPaired()`; defaults to `true` to preserve the previous hardcoded behavior for
+    /// every test that does not care about pairing state.
+    private var pairedFlag = true
     /// One page per call, returned in order; the last one repeats once the list is exhausted.
     private var eventsResults: [Result<EventsPage, any Error & Sendable>] = []
     private(set) var sentCalls: [RecordedSend] = []
@@ -34,6 +40,17 @@ actor FakeBridgeClient: BridgeClientProtocol {
 
     func setSendResult(_ result: SendResult) {
         sendResult = result
+    }
+
+    /// Arms the next `pair(code:deviceName:)` call to throw `error` instead of succeeding.
+    func setPairResult(_ result: Result<Void, any Error & Sendable>) {
+        pairResult = result
+    }
+
+    /// Sets what `isPaired()` reports, so a test can simulate "the credential store never
+    /// got a credential" after a failed pair attempt.
+    func setPaired(_ value: Bool) {
+        pairedFlag = value
     }
 
     /// Queues the pages/errors `events(after:wait:)` returns on successive calls.
@@ -64,8 +81,10 @@ actor FakeBridgeClient: BridgeClientProtocol {
     }
 
     func setBaseURL(_ url: URL) async {}
-    func pair(code: String, deviceName: String) async throws {}
-    func isPaired() async -> Bool { true }
+    func pair(code: String, deviceName: String) async throws {
+        try pairResult.get()
+    }
+    func isPaired() async -> Bool { pairedFlag }
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
         eventsCallCount += 1
@@ -701,5 +720,22 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertNil(created, "same-generation create must not overwrite a session bound by apply()")
         XCTAssertEqual(store.sessionId, "sess_other", "the concurrently bound session must survive")
+    }
+
+    /// Regression for R-010: `pairingError` was never asserted because the fake client never
+    /// threw. A failing pair() must surface the error on the store and must not flip `paired`
+    /// to true just because the call was attempted.
+    func testPairFailureSetsPairingErrorAndLeavesUnpaired() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
+        // The real client only reports paired == true once a credential is actually stored;
+        // simulate that a failed pair leaves the credential store empty.
+        await client.setPaired(false)
+
+        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
+
+        XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
+        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
     }
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -73,6 +73,31 @@ describe("DeviceRegistry", () => {
     expect(() => DeviceRegistry.load(filePath)).toThrow(filePath);
   });
 
+  test("valid JSON that is not a well-formed device record is rejected, not silently accepted", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    // Valid JSON array, but the entry is missing deviceKeyHex and has allowedProjects as a
+    // string instead of an array -- exactly the shape isDeviceRecord must reject.
+    writeFileSync(
+      filePath,
+      JSON.stringify([
+        {
+          deviceId: "dev_missing_fields",
+          deviceName: "Malformed Watch",
+          keyId: "key_deadbeef",
+          pairedAt: "2026-09-20T10:15:00.000Z",
+          allowedProjects: "prj_demo",
+          allowedActions: ["prompt.send"],
+          revokedAt: null,
+          lastSeenAt: null,
+        },
+      ]),
+      "utf8",
+    );
+
+    expect(() => DeviceRegistry.load(filePath)).toThrow(/malformed device record/);
+  });
+
   test("revoke persists revokedAt", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");
@@ -117,6 +142,42 @@ describe("DeviceRegistry", () => {
     registry.touch(record.deviceId, seenAt);
 
     expect(registry.get(record.deviceId)?.lastSeenAt).toBe(seenAt.toISOString());
+  });
+
+  test("a second touch within the throttle interval updates lastSeenAt in memory but does not rewrite the file", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+
+    const firstSeenAt = new Date("2026-09-20T12:00:00.000Z");
+    registry.touch(record.deviceId, firstSeenAt);
+    const statAfterFirstTouch = statSync(filePath);
+    const onDiskAfterFirstTouch = JSON.parse(readFileSync(filePath, "utf8"));
+
+    const secondSeenAt = new Date(firstSeenAt.getTime() + 1_000);
+    registry.touch(record.deviceId, secondSeenAt);
+
+    expect(registry.get(record.deviceId)?.lastSeenAt).toBe(secondSeenAt.toISOString());
+    expect(statSync(filePath).mtimeMs).toBe(statAfterFirstTouch.mtimeMs);
+    const onDiskAfterSecondTouch = JSON.parse(readFileSync(filePath, "utf8"));
+    expect(onDiskAfterSecondTouch[0].lastSeenAt).toBe(onDiskAfterFirstTouch[0].lastSeenAt);
+  });
+
+  test("a touch after the throttle interval has elapsed persists the new lastSeenAt", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const oldSeenAt = new Date("2026-09-20T12:00:00.000Z");
+    const record = sampleRecord({ lastSeenAt: oldSeenAt.toISOString() });
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+
+    const newSeenAt = new Date(oldSeenAt.getTime() + 60_000);
+    registry.touch(record.deviceId, newSeenAt);
+
+    const reader = DeviceRegistry.load(filePath);
+    expect(reader.get(record.deviceId)?.lastSeenAt).toBe(newSeenAt.toISOString());
   });
 
   // Regression test for the live bug: a bridge process's DeviceRegistry never re-reads

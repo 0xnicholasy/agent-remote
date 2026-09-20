@@ -212,7 +212,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   // Tracks, per commandId, which device sent it and the SHA-256 of the exact body it sent, per
   // the "Request identity" rule: a repeat with a different digest or device is a conflict, not
   // a replay, even before the command finishes executing.
-  const commandIdentities = new Map<string, { deviceId: string | undefined; digest: string }>();
+  // Bounded by COMMAND_IDENTITY_TTL_MS below (see that constant's comment for why the bound is
+  // safe): without a bound this map grows once per distinct commandId for the process lifetime.
+  const commandIdentities = new Map<string, { deviceId: string | undefined; digest: string; expiresAt: number }>();
+  // Matches NONCE_TTL_MS in auth/verify.ts: the nonce cache already only guards a replayed
+  // envelope for 300s, so evicting a commandId identity sooner would let a body that has already
+  // fallen out of scope of that guard collide with a reused commandId while still looking "new"
+  // here. Keeping this window the same length as the nonce TTL means an entry can only expire
+  // here once the signature layer has already stopped treating its nonce as fresh, so eviction
+  // never opens a replay window the auth layer wasn't already exposed to.
+  const COMMAND_IDENTITY_TTL_MS = 300_000;
   let nextEventId = 1;
   // Set once the provider instance exists (below); host.emit reads it lazily so an event's
   // `provider` tag always reflects what actually constructed/ran the session (provider.id),
@@ -446,13 +455,27 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     // different digest or from a different device is a conflict, not a replay, and must not
     // execute.
     const bodyDigest = createHash("sha256").update(rawBody).digest("hex");
+    const nowMs = now().getTime();
+    // Insertion order == expiry order here, same reasoning as NonceCache.pruneExpired in
+    // auth/verify.ts: every entry gets the same fixed TTL, so the oldest inserted entry is always
+    // the first to expire as long as the clock does not go backwards.
+    for (const [key, entry] of commandIdentities) {
+      if (entry.expiresAt > nowMs) {
+        break;
+      }
+      commandIdentities.delete(key);
+    }
     const identity = commandIdentities.get(command.commandId);
     if (identity !== undefined) {
       if (identity.digest !== bodyDigest || identity.deviceId !== device?.deviceId) {
         return json({ error: "command_id_conflict" }, 409);
       }
     } else {
-      commandIdentities.set(command.commandId, { deviceId: device?.deviceId, digest: bodyDigest });
+      commandIdentities.set(command.commandId, {
+        deviceId: device?.deviceId,
+        digest: bodyDigest,
+        expiresAt: nowMs + COMMAND_IDENTITY_TTL_MS,
+      });
     }
 
     const previous = processed.get(command.commandId);
@@ -653,7 +676,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
           return json({ sessions: visible } satisfies SessionsResponse);
         }
         if (request.method === "GET" && path === "/v1/projects") {
-          return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
+          const projects = await provider.listProjects();
+          // Same no-device/no-filter and newly-paired/no-narrowing notes as handleEvents above.
+          const visible =
+            device === undefined ? projects : projects.filter((project) => device.allowedProjects.includes(project.id));
+          return json({ projects: visible } satisfies ProjectsResponse);
         }
 
         const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);

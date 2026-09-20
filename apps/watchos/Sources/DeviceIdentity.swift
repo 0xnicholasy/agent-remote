@@ -18,8 +18,24 @@ struct DeviceCredential: Sendable, Equatable {
 /// the Keychain.
 protocol CredentialStore: Sendable {
     func load() -> DeviceCredential?
-    func save(_ credential: DeviceCredential)
-    func clear()
+    func save(_ credential: DeviceCredential) throws
+    func clear() throws
+}
+
+/// Surfaces a Keychain write/delete failure instead of letting it be swallowed, so a caller
+/// can't believe pairing succeeded when the credential was never persisted.
+enum CredentialStoreError: Error, CustomStringConvertible, Sendable, Equatable {
+    case keychainWrite(OSStatus)
+    case keychainDelete(OSStatus)
+    case encodingFailed
+
+    var description: String {
+        switch self {
+        case .keychainWrite(let status): "Keychain write failed (OSStatus \(status))."
+        case .keychainDelete(let status): "Keychain delete failed (OSStatus \(status))."
+        case .encodingFailed: "Failed to encode the device credential for storage."
+        }
+    }
 }
 
 /// Keychain-backed credential store. Never logs key material.
@@ -56,7 +72,7 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
         )
     }
 
-    func save(_ credential: DeviceCredential) {
+    func save(_ credential: DeviceCredential) throws {
         let wire = Wire(
             deviceId: credential.deviceId,
             keyId: credential.keyId,
@@ -64,17 +80,28 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
             bridgeId: credential.bridgeId,
             baseURL: credential.baseURL.absoluteString
         )
-        guard let data = try? JSONEncoder().encode(wire) else { return }
+        guard let data = try? JSONEncoder().encode(wire) else {
+            throw CredentialStoreError.encodingFailed
+        }
 
-        SecItemDelete(baseQuery() as CFDictionary)
+        let deleteStatus = SecItemDelete(baseQuery() as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw CredentialStoreError.keychainDelete(deleteStatus)
+        }
         var addQuery = baseQuery()
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(addQuery as CFDictionary, nil)
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw CredentialStoreError.keychainWrite(addStatus)
+        }
     }
 
-    func clear() {
-        SecItemDelete(baseQuery() as CFDictionary)
+    func clear() throws {
+        let status = SecItemDelete(baseQuery() as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw CredentialStoreError.keychainDelete(status)
+        }
     }
 
     private func baseQuery() -> [String: Any] {

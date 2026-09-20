@@ -198,7 +198,7 @@ actor BridgeClient: BridgeClientProtocol {
             bridgeId: decoded.bridgeId,
             baseURL: baseURL
         )
-        credentialStore.save(newCredential)
+        try credentialStore.save(newCredential)
         credential = newCredential
     }
 

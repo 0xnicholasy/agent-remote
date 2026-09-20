@@ -19,7 +19,14 @@ import type {
 } from "@agentremote/protocol";
 import { SessionLimitError, TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
 
-import { createBridge, projectIdFor, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
+import {
+  assertAuthBypassAllowed,
+  createBridge,
+  projectIdFor,
+  resolveBindHost,
+  type Bridge,
+  type CreateBridgeOptions,
+} from "./server";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { deriveDeviceKey, pairingProof } from "./auth/pairing";
 import { signRequest } from "./auth/verify";
@@ -764,6 +771,35 @@ describe("resolveBindHost", () => {
 
   test("an explicit loopback AGENTREMOTE_HOST never warns", () => {
     expect(resolveBindHost("claude", "127.0.0.1")).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
+  });
+});
+
+describe("assertAuthBypassAllowed", () => {
+  test("refuses AGENTREMOTE_AUTH=off with the claude provider bound to a non-loopback host", () => {
+    expect(() =>
+      assertAuthBypassAllowed({ authEnabled: false, providerId: "claude", hostname: "0.0.0.0" }),
+    ).toThrow(/AGENTREMOTE_AUTH=off refuses to start/);
+  });
+
+  test("permits AGENTREMOTE_AUTH=off with the claude provider bound to loopback", () => {
+    expect(() =>
+      assertAuthBypassAllowed({ authEnabled: false, providerId: "claude", hostname: "127.0.0.1" }),
+    ).not.toThrow();
+  });
+
+  test("permits AGENTREMOTE_AUTH=off with the mock provider bound to a non-loopback host: the gate is claude-only", () => {
+    // The mock provider is exempt by design: it serves fixed demo data (a constant fake cwd,
+    // prj_demo/ses_seed) and executes nothing on the host, so an unauthenticated non-loopback
+    // mock bridge exposes no real data.
+    expect(() =>
+      assertAuthBypassAllowed({ authEnabled: false, providerId: "mock", hostname: "0.0.0.0" }),
+    ).not.toThrow();
+  });
+
+  test("permits when auth is enabled regardless of provider or hostname", () => {
+    expect(() =>
+      assertAuthBypassAllowed({ authEnabled: true, providerId: "claude", hostname: "0.0.0.0" }),
+    ).not.toThrow();
   });
 });
 

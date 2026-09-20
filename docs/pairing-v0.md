@@ -247,7 +247,9 @@ startup and logged:
 mock-provider simulator loop and the loopback harness keep working without pairing. The bridge
 refuses to start with `AGENTREMOTE_AUTH=off` when the provider is `claude` and the bind host is not
 loopback, because that combination is an unauthenticated endpoint executing real tool calls on a
-reachable address. Every startup with auth off logs a warning.
+reachable address. The mock provider is exempt from this refusal because it serves fixed demo
+data and executes nothing on the host, and that exemption is the only reason `AGENTREMOTE_AUTH=off`
+may bind a non-loopback address. Every startup with auth off logs a warning.
 
 ## Limitations
 

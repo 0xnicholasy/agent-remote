@@ -4,6 +4,10 @@ import { join } from "node:path";
 
 import { atomicWriteFileSync } from "./persist";
 
+// touch() coalesces persists to at most once per this interval; see the comment on touch() for
+// why an on-disk lastSeenAt lagging by up to this much is safe.
+const LAST_SEEN_PERSIST_INTERVAL_MS = 60_000;
+
 /** `mtimeMs`+`size` of the backing file as last observed by this registry, or `null` when the
  * file did not exist at that observation. Cheap to compare against a fresh `statSync` without
  * re-reading or re-parsing the file. */
@@ -143,8 +147,21 @@ export class DeviceRegistry {
     if (record === undefined) {
       return;
     }
+    // lastSeenAt is operator-visible information only: it is read solely by the operator
+    // device-list command (server.ts:~817) and the record shape check above, and it feeds no
+    // authorization or replay decision. So an on-disk value lagging by up to
+    // LAST_SEEN_PERSIST_INTERVAL_MS is purely cosmetic, and we skip the full atomic rewrite most
+    // requests would otherwise pay for. Security-relevant state (registration, revocation) still
+    // writes synchronously via register()/revoke() above.
+    const previousLastSeenAt = record.lastSeenAt;
     record.lastSeenAt = now.toISOString();
-    this.persist();
+    if (
+      previousLastSeenAt === null ||
+      previousLastSeenAt === undefined ||
+      now.getTime() - new Date(previousLastSeenAt).getTime() >= LAST_SEEN_PERSIST_INTERVAL_MS
+    ) {
+      this.persist();
+    }
   }
 
   private persist(): void {

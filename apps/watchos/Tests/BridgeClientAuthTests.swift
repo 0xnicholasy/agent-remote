@@ -1,5 +1,74 @@
 import XCTest
 import AgentRemoteProtocol
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// A one-shot loopback HTTP/1.1 server bound to 127.0.0.1 on an OS-assigned port. `BridgeClient`
+/// builds its own `URLSession` internally with no injection point for a stub protocol, so this
+/// gives `pair()` tests a real socket to talk to instead of a fake in-process client.
+private final class LoopbackHTTPServer: @unchecked Sendable {
+    let port: UInt16
+    private let listenSocket: Int32
+    private let queue = DispatchQueue(label: "loopback-http-server")
+
+    init() {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        var reuse: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = 0 // ask the OS for an ephemeral port
+        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                bind(sock, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        precondition(bindResult == 0, "LoopbackHTTPServer failed to bind to 127.0.0.1")
+        precondition(listen(sock, 1) == 0, "LoopbackHTTPServer failed to listen")
+
+        var boundAddr = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &boundAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                _ = getsockname(sock, sockaddrPtr, &len)
+            }
+        }
+        listenSocket = sock
+        port = UInt16(bigEndian: boundAddr.sin_port)
+    }
+
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
+
+    /// Accepts exactly one connection, reads until the header terminator, then replies with
+    /// `statusLine` (e.g. "HTTP/1.1 200 OK") and a JSON `body`. Runs on a background queue so
+    /// the test's `await client.pair(...)` call can be issued concurrently.
+    func respondOnce(statusLine: String, body: String) {
+        queue.async { [listenSocket] in
+            let clientSocket = accept(listenSocket, nil, nil)
+            guard clientSocket >= 0 else { return }
+            defer { close(clientSocket) }
+
+            var requestData = Data()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let terminator = Data("\r\n\r\n".utf8)
+            while requestData.range(of: terminator) == nil {
+                let n = read(clientSocket, &buffer, buffer.count)
+                if n <= 0 { break }
+                requestData.append(contentsOf: buffer[0..<n])
+            }
+
+            let response = "\(statusLine)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+            _ = response.withCString { write(clientSocket, $0, strlen($0)) }
+        }
+    }
+
+    func stop() {
+        close(listenSocket)
+    }
+}
 
 /// Covers the client-side pieces of M3 slice 1 that do not need a live bridge: signed-request
 /// header construction, the unpaired failure mode, and the bridge error-code mapping. See
@@ -93,5 +162,65 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 409, code: "command_id_conflict", message: ""), .commandIdConflict)
         // Unknown/pre-existing codes fall back to the generic case so old 409 handling still works.
         XCTAssertEqual(BridgeError.from(status: 409, code: nil, message: "stale binding"), .http(status: 409, message: "stale binding"))
+    }
+
+    /// Covers R-004: a well-formed `POST /v1/pair` response must enroll the device and leave
+    /// behind a credential that subsequent requests can actually sign with -- specifically the
+    /// server's own `deviceId`, not whatever id the client generated locally before it knew
+    /// what the bridge would assign.
+    func testPairSuccessEnrollsAndYieldsAUsableCredential() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        server.respondOnce(
+            statusLine: "HTTP/1.1 200 OK",
+            body: #"{"deviceId":"dev_serverassigned01","keyId":"key_aaaa1111","bridgeId":"brg_87654321"}"#
+        )
+
+        let credentialStore = InMemoryCredentialStore()
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
+
+        let pairedBefore = await client.isPaired()
+        XCTAssertFalse(pairedBefore, "must not be paired before pair() runs")
+        try await client.pair(code: "ABCDEFGHJKMN", deviceName: "Test Watch")
+
+        let pairedAfter = await client.isPaired()
+        XCTAssertTrue(pairedAfter)
+        let stored = try XCTUnwrap(credentialStore.load(), "pair() must persist a credential")
+        XCTAssertEqual(stored.deviceId, "dev_serverassigned01", "the stored credential must use the bridge's assigned deviceId")
+        XCTAssertEqual(stored.keyId, "key_aaaa1111")
+        XCTAssertEqual(stored.bridgeId, "brg_87654321")
+
+        // The credential must actually be usable: a subsequent signed request carries the
+        // server-assigned deviceId, not the locally generated one from before pairing.
+        let url = server.baseURL.appending(path: "/v1/sessions")
+        let request = try await client.signedRequest(method: "GET", url: url, body: nil)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-AgentRemote-Device"), "dev_serverassigned01")
+    }
+
+    /// Covers R-004: when the bridge rejects the pairing code, `pair()` must throw rather than
+    /// silently leaving the caller thinking it enrolled, and no credential may be persisted.
+    func testPairFailureSurfacesErrorAndDoesNotEnroll() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        server.respondOnce(
+            statusLine: "HTTP/1.1 401 Unauthorized",
+            body: #"{"error":"unauthenticated"}"#
+        )
+
+        let credentialStore = InMemoryCredentialStore()
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
+
+        do {
+            try await client.pair(code: "000000000000", deviceName: "Test Watch")
+            XCTFail("expected pair() to throw when the bridge rejects the pairing code")
+        } catch BridgeError.unauthenticated {
+            // expected -- the failure surfaced instead of being swallowed
+        } catch {
+            XCTFail("expected .unauthenticated, got \(error)")
+        }
+
+        let pairedAfterFailure = await client.isPaired()
+        XCTAssertFalse(pairedAfterFailure, "a rejected pairing code must not enroll the device")
+        XCTAssertNil(credentialStore.load(), "no credential may be persisted on a failed pair()")
     }
 }
