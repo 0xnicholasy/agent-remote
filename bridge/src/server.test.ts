@@ -1,4 +1,9 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type {
   AgentCapabilities,
   AgentEvent,
@@ -15,6 +20,9 @@ import type {
 import { SessionLimitError, TurnInProgressError, UnknownSessionError } from "@agentremote/protocol";
 
 import { createBridge, projectIdFor, resolveBindHost, type Bridge, type CreateBridgeOptions } from "./server";
+import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
+import { deriveDeviceKey, pairingProof } from "./auth/pairing";
+import { signRequest } from "./auth/verify";
 
 let bridge: Bridge;
 
@@ -69,7 +77,7 @@ function pendingQuestion(events: AgentEvent[]) {
 }
 
 beforeEach(() => {
-  bridge = createBridge();
+  bridge = createBridge({ authEnabled: false });
 });
 
 describe("bridge HTTP surface", () => {
@@ -431,6 +439,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     process.env.AGENTREMOTE_PROVIDER = "claude";
     try {
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
       const claudeBridge = createBridge(options);
@@ -470,6 +479,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     try {
       const stub = { current: undefined as StubClaudeProvider | undefined };
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => {
           stub.current = new StubClaudeProvider(host, providerOptions);
           return stub.current;
@@ -504,6 +514,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     try {
       const stub = { current: undefined as StubClaudeProvider | undefined };
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => {
           stub.current = new StubClaudeProvider(host, providerOptions);
           return stub.current;
@@ -538,6 +549,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     try {
       const stub = { current: undefined as StubClaudeProvider | undefined };
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => {
           stub.current = new StubClaudeProvider(host, providerOptions);
           return stub.current;
@@ -561,6 +573,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     process.env.AGENTREMOTE_PROVIDER = "claude";
     try {
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
       const claudeBridge = createBridge(options);
@@ -591,6 +604,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     try {
       const stub = { current: undefined as StubClaudeProvider | undefined };
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => {
           stub.current = new StubClaudeProvider(host, providerOptions);
           return stub.current;
@@ -627,6 +641,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     try {
       const stub = { current: undefined as StubClaudeProvider | undefined };
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => {
           stub.current = new StubClaudeProvider(host, providerOptions);
           return stub.current;
@@ -685,6 +700,7 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
     process.env.AGENTREMOTE_PROJECT_DIRS = " /repos/one , , /repos/two ,";
     try {
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
       const claudeBridge = createBridge(options);
@@ -702,6 +718,7 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
     process.env.AGENTREMOTE_PROJECT_DIRS = "   ";
     try {
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
       expect(() => createBridge(options)).not.toThrow();
@@ -717,6 +734,7 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
     process.env.AGENTREMOTE_PROJECT_DIRS = ",, ,";
     try {
       const options: CreateBridgeOptions = {
+        authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
       expect(() => createBridge(options)).not.toThrow();
@@ -746,5 +764,507 @@ describe("resolveBindHost", () => {
 
   test("an explicit loopback AGENTREMOTE_HOST never warns", () => {
     expect(resolveBindHost("claude", "127.0.0.1")).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
+  });
+});
+
+const FIXED_NOW = new Date("2026-09-20T10:15:00.000Z");
+const DEVICE_ID = "dev_9f2c4a1b7d3e5061";
+const DEVICE_KEY = Buffer.from("cc".repeat(32), "hex");
+const ALL_ACTIONS = [
+  "prompt.send",
+  "approval.accept",
+  "approval.reject",
+  "session.cancel",
+  "question.answer",
+  "session.create",
+];
+
+function sampleDeviceRecord(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
+  return {
+    deviceId: DEVICE_ID,
+    deviceName: "Test Watch",
+    keyId: "key_deadbeef",
+    deviceKeyHex: DEVICE_KEY.toString("hex"),
+    pairedAt: FIXED_NOW.toISOString(),
+    allowedProjects: ["prj_demo"],
+    allowedActions: ALL_ACTIONS,
+    revokedAt: null,
+    lastSeenAt: null,
+    ...overrides,
+  };
+}
+
+/** Builds a fully signed request against the six-line envelope from docs/pairing-v0.md. */
+function signedRequest(params: {
+  method: string;
+  pathWithQuery: string;
+  body?: unknown;
+  deviceId?: string;
+  deviceKey?: Buffer;
+  timestamp?: string;
+  nonce?: string;
+}): Request {
+  const rawBody = params.body === undefined ? "" : JSON.stringify(params.body);
+  const timestamp = params.timestamp ?? FIXED_NOW.toISOString();
+  const nonce = params.nonce ?? randomBytes(16).toString("hex");
+  const deviceId = params.deviceId ?? DEVICE_ID;
+  const deviceKey = params.deviceKey ?? DEVICE_KEY;
+  const bodySha256 = createHash("sha256").update(rawBody).digest("hex");
+  const signature = signRequest(deviceKey, {
+    method: params.method,
+    pathWithQuery: params.pathWithQuery,
+    timestamp,
+    nonce,
+    bodySha256,
+  });
+  return new Request(`http://bridge.local${params.pathWithQuery}`, {
+    method: params.method,
+    headers: {
+      "content-type": "application/json",
+      "X-AgentRemote-Device": deviceId,
+      "X-AgentRemote-Timestamp": timestamp,
+      "X-AgentRemote-Nonce": nonce,
+      "X-AgentRemote-Signature": signature,
+    },
+    ...(rawBody.length > 0 ? { body: rawBody } : {}),
+  });
+}
+
+describe("signed request envelope and command authorization", () => {
+  test("an unsigned request is rejected with 401 unauthenticated", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(new Request("http://bridge.local/v1/sessions"));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "unauthenticated" });
+  });
+
+  test("a revoked device is rejected with 403 device_revoked", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    registry.revoke(DEVICE_ID, FIXED_NOW);
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions" }));
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "device_revoked" });
+  });
+
+  test("a timestamp outside the skew window is rejected with 401 stale_request", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const staleTimestamp = new Date(FIXED_NOW.getTime() - 200_000).toISOString();
+    const response = await authedBridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", timestamp: staleTimestamp }),
+    );
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "stale_request" });
+  });
+
+  test("a replayed nonce is rejected with 401 replayed_request", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+    const nonce = randomBytes(16).toString("hex");
+
+    const first = await authedBridge.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(first.status).toBe(200);
+
+    const second = await authedBridge.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(second.status).toBe(401);
+    expect(await second.json()).toEqual({ error: "replayed_request" });
+  });
+
+  test("a tampered body fails the signature with 401 unauthenticated", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const commandId = "f0000000-0000-4000-8000-000000000001";
+    const originalBody = {
+      commandId,
+      sessionId: authedBridge.session.id,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "original" },
+    } satisfies Command;
+    const timestamp = FIXED_NOW.toISOString();
+    const nonce = randomBytes(16).toString("hex");
+    const bodySha256 = createHash("sha256").update(JSON.stringify(originalBody)).digest("hex");
+    const signature = signRequest(DEVICE_KEY, {
+      method: "POST",
+      pathWithQuery: "/v1/commands",
+      timestamp,
+      nonce,
+      bodySha256,
+    });
+    const tamperedBody = { ...originalBody, payload: { text: "tampered" } };
+
+    const response = await authedBridge.fetch(
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-AgentRemote-Device": DEVICE_ID,
+          "X-AgentRemote-Timestamp": timestamp,
+          "X-AgentRemote-Nonce": nonce,
+          "X-AgentRemote-Signature": signature,
+        },
+        body: JSON.stringify(tamperedBody),
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "unauthenticated" });
+  });
+
+  test("GET /v1/health needs no signature", async () => {
+    const registry = new DeviceRegistry();
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(new Request("http://bridge.local/v1/health"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, bridgeId: authedBridge.bridgeId });
+  });
+
+  test("an action outside allowedActions is rejected with 403 action_not_allowed", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedActions: ["session.cancel"] }));
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "f0000000-0000-4000-8000-000000000002",
+          sessionId: authedBridge.session.id,
+          type: "prompt.send",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { text: "hi" },
+        } satisfies Command,
+      }),
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "action_not_allowed" });
+  });
+
+  test("a project outside allowedProjects is rejected with 403 project_not_allowed", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedProjects: ["prj_other"] }));
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "f0000000-0000-4000-8000-000000000003",
+          sessionId: authedBridge.session.id,
+          type: "prompt.send",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { text: "hi" },
+        } satisfies Command,
+      }),
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "project_not_allowed" });
+  });
+
+  test("an approval binding whose expiresAt has passed is rejected with 410 and never reaches the provider", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const binding: ApprovalBinding = {
+      approvalId: "apr_1",
+      sessionId: authedBridge.session.id,
+      turnId: "turn_1",
+      toolCallId: "tool_1",
+      actionDigest: "sha256:whatever",
+      expiresAt: new Date(FIXED_NOW.getTime() - 1000).toISOString(),
+    };
+    const response = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "f0000000-0000-4000-8000-000000000004",
+          sessionId: authedBridge.session.id,
+          type: "approval.accept",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { binding },
+        } satisfies Command,
+      }),
+    );
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+
+  test("a repeat commandId with a different body is rejected with 409 command_id_conflict", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+    const commandId = "f0000000-0000-4000-8000-000000000005";
+
+    const first = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId,
+          sessionId: authedBridge.session.id,
+          type: "prompt.send",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { text: "first" },
+        } satisfies Command,
+      }),
+    );
+    expect(first.status).toBe(200);
+
+    const second = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId,
+          sessionId: authedBridge.session.id,
+          type: "prompt.send",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { text: "second" },
+        } satisfies Command,
+      }),
+    );
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: "command_id_conflict" });
+  });
+
+  test("a repeat commandId with the same body still replays", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+    const commandId = "f0000000-0000-4000-8000-000000000006";
+    const body = {
+      commandId,
+      sessionId: authedBridge.session.id,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "same" },
+    } satisfies Command;
+
+    const first = await authedBridge.fetch(signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body }));
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as CommandResponse;
+    expect(firstBody.duplicate).toBe(false);
+
+    const second = await authedBridge.fetch(signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body }));
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as CommandResponse;
+    expect(secondBody.duplicate).toBe(true);
+  });
+});
+
+describe("cancel route authorization", () => {
+  test("a device without session.cancel in allowedActions is rejected with 403 action_not_allowed", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedActions: ["prompt.send"] }));
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: `/v1/sessions/${authedBridge.session.id}/cancel` }),
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "action_not_allowed" });
+  });
+
+  test("a device not allowed the session's project is rejected with 403 project_not_allowed", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedProjects: ["prj_other"] }));
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: `/v1/sessions/${authedBridge.session.id}/cancel` }),
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "project_not_allowed" });
+  });
+
+  test("a fully allowed device can still cancel", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: `/v1/sessions/${authedBridge.session.id}/cancel` }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ cancelled: true, sessionId: authedBridge.session.id });
+  });
+});
+
+describe("allowedProjects filtering on GET /v1/sessions and /v1/events", () => {
+  test("GET /v1/sessions hides a session in a project the device is not allowed", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord()); // allowedProjects: ["prj_demo"], per the default above.
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+    // Bypasses the /v1/commands schema check (which would reject an unknown projectId) to seed
+    // a session in a project the device is not allowed, exercising the registry's existing
+    // per-device narrowing directly against the provider.
+    const otherSession = await authedBridge.provider.createSession("prj_other");
+
+    const response = await authedBridge.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions" }));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as SessionsResponse;
+    const ids = body.sessions.map((session) => session.id);
+    expect(ids).toContain(authedBridge.session.id);
+    expect(ids).not.toContain(otherSession.id);
+  });
+
+  test("GET /v1/events hides events from a disallowed project while lastEventId stays the global maximum", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord()); // allowedProjects: ["prj_demo"].
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+    const otherSession = await authedBridge.provider.createSession("prj_other");
+
+    const response = await authedBridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as EventsResponse;
+    expect(body.events.some((event) => event.sessionId === otherSession.id)).toBe(false);
+    // createSession emitted one session.started event for otherSession, so the true global
+    // maximum is 1 even though every visible event for this device was filtered out.
+    expect(body.lastEventId).toBe(1);
+  });
+});
+
+describe("pairing", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-pair-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  test("a successful pairing followed by a signed command succeeds", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_aaaaaaaaaaaaaaaa";
+    const deviceName = "Ting's Apple Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(pairBridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const pairBody = (await pairResponse.json()) as {
+      deviceId: string;
+      keyId: string;
+      pairedAt: string;
+      bridgeId: string;
+      allowedProjects: string[];
+      allowedActions: string[];
+    };
+    expect(pairBody.deviceId).toBe(deviceId);
+    expect(pairBody.bridgeId).toBe(pairBridge.bridgeId);
+    expect(pairBody.allowedProjects).toEqual(["prj_demo"]);
+    expect(pairBody.allowedActions).toContain("prompt.send");
+
+    const deviceKey = deriveDeviceKey(pairBridge.pairingCode, deviceId, nonce);
+    const response = await pairBridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
+    );
+    expect(response.status).toBe(200);
+  });
+
+  test("a wrong pairing code is rejected with 401 pairing_rejected", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_bbbbbbbbbbbbbbbb";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof("WRONGWRONGWR", deviceId, "Watch", nonce);
+
+    const response = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName: "Watch", nonce, proof }),
+      }),
+    );
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+  });
+
+  test("pairing survives a new createBridge over the same devices file", async () => {
+    const firstBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_cccccccccccccccc";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(firstBridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await firstBridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(firstBridge.pairingCode, deviceId, nonce);
+
+    const secondBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const response = await secondBridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
+    );
+    expect(response.status).toBe(200);
+    expect(secondBridge.bridgeId).toBe(firstBridge.bridgeId);
+  });
+
+  // Regression test for the live bug: AGENTREMOTE_REVOKE runs as a separate one-shot process
+  // that writes devices.json directly. A running bridge must notice that write on its next
+  // request rather than needing a restart, since restarting kills every live session.
+  test("a device revoked by a separate DeviceRegistry over the same file is rejected without a bridge restart", async () => {
+    const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_dddddddddddddddd";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await bridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+
+    const beforeRevoke = await bridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
+    );
+    expect(beforeRevoke.status).toBe(200);
+
+    // Stands in for the `AGENTREMOTE_REVOKE=<deviceId>` operator command: a separate registry
+    // instance over the same file, with no reference to `bridge` at all.
+    const operatorRegistry = DeviceRegistry.load(devicesFilePath);
+    operatorRegistry.revoke(deviceId, FIXED_NOW);
+
+    const afterRevoke = await bridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
+    );
+    expect(afterRevoke.status).toBe(403);
+    expect(await afterRevoke.json()).toEqual({ error: "device_revoked" });
   });
 });
