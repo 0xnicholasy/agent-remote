@@ -45,6 +45,7 @@ targets:
     sources:
       - path: Tests
       - path: Sources/BridgeClient.swift
+      - path: Sources/DeviceIdentity.swift
       - path: Sources/SessionStore.swift
       - path: Sources/Speech.swift
     dependencies:

@@ -1,3 +1,5 @@
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import Ajv2020 from "ajv/dist/2020";
@@ -27,6 +29,10 @@ import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider } f
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
+import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "./auth/pairing";
+import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
+import { atomicWriteFileSync } from "./auth/persist";
+import { NonceCache, verifyEnvelope } from "./auth/verify";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv);
@@ -55,14 +61,75 @@ export interface Bridge {
   /** The seeded session, exposed so callers do not have to guess its identifier. */
   readonly session: Session;
   readonly provider: AgentProvider;
+  /** `brg_` + 8 hex, stable for this process and persisted alongside the device registry so a
+   * client can notice it is talking to a different bridge after a restart. */
+  readonly bridgeId: string;
+  /** The pairing code minted at startup, per docs/pairing-v0.md. Production only prints it (see
+   * `import.meta.main` below); exposed here so tests can pair without scraping stdout. */
+  readonly pairingCode: string;
+  /** ISO timestamp the minted `pairingCode` expires at. */
+  readonly pairingCodeExpiresAt: string;
 }
 
 /** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
  * test wire `AGENTREMOTE_PROVIDER=claude` without constructing a real `ClaudeProvider`, which
  * would spawn the Claude Agent SDK's subprocess. Production code never passes it, so the
- * default keeps building the real `ClaudeProvider` exactly as before. */
+ * default keeps building the real `ClaudeProvider` exactly as before. The auth-related options
+ * below exist for the same reason: tests need to inject a registry/clock/auth-off flag without
+ * ever touching the real `~/.agentremote`; production always uses the defaults. */
 export interface CreateBridgeOptions {
   createClaudeProvider?: (host: ProviderHost, options: { projects: Project[] }) => SeedableProvider;
+  /** Injects a `DeviceRegistry` instance directly, e.g. so a test can inspect registered
+   * devices in memory. Production always builds its own from `devicesFilePath`. */
+  registry?: DeviceRegistry;
+  /** Explicit path for the persisted device registry (and the co-located bridge id file);
+   * defaults to `resolveStateDir()/devices.json`. Tests point this at a temp dir. Ignored when
+   * `registry` is supplied. */
+  devicesFilePath?: string;
+  /** Explicit path for the persisted live pairing code; defaults to alongside `devicesFilePath`
+   * as `pairing.json`. Persisting it (rather than keeping it in the bridge process's memory
+   * only) is what lets `AGENTREMOTE_PAIR=1` mint a code the already-running bridge can see. */
+  pairingCodeFilePath?: string;
+  /** Clock used for pairing TTL, signature skew, nonce TTL and device timestamps. Production
+   * uses the real clock; tests pass a fixed one for determinism. */
+  now?: () => Date;
+  /** Overrides `AGENTREMOTE_AUTH` for tests. Production reads the environment variable. */
+  authEnabled?: boolean;
+}
+
+/** Every command type a newly paired device is granted, per the "Device registry" section of
+ * docs/pairing-v0.md: a new device is granted every action. Kept in sync with `CommandType`. */
+const ALL_COMMAND_ACTIONS = [
+  "prompt.send",
+  "approval.accept",
+  "approval.reject",
+  "session.cancel",
+  "question.answer",
+  "session.create",
+] as const;
+
+/** Loads a bridge id from `filePath`, minting and persisting a fresh one if the file is absent
+ * or corrupt. `filePath === undefined` means "do not persist" (an in-memory-only registry in
+ * tests), in which case a fresh id is minted every call. */
+function loadOrCreateBridgeId(filePath: string | undefined): string {
+  if (filePath !== undefined && existsSync(filePath)) {
+    try {
+      const raw = readFileSync(filePath, "utf8");
+      // JSON.parse is untyped by construction; validated below before anything is trusted.
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && typeof (parsed as Record<string, unknown>).bridgeId === "string") {
+        return (parsed as { bridgeId: string }).bridgeId;
+      }
+    } catch {
+      // Falls through to minting a fresh id: a corrupt bridge-id file must not crash startup.
+    }
+  }
+
+  const bridgeId = `brg_${randomBytes(4).toString("hex")}`;
+  if (filePath !== undefined) {
+    atomicWriteFileSync(filePath, JSON.stringify({ bridgeId }));
+  }
+  return bridgeId;
 }
 
 const VALID_PROVIDER_IDS = ["mock", "claude"] as const;
@@ -105,12 +172,56 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   }
   console.log(`Agent Remote bridge selected provider: ${providerId}`);
 
+  const now = options.now ?? ((): Date => new Date());
+  const authEnabled = options.authEnabled ?? process.env.AGENTREMOTE_AUTH !== "off";
+
+  const devicesFilePath = options.devicesFilePath ?? path.join(resolveStateDir(), "devices.json");
+  const registry = options.registry ?? DeviceRegistry.load(devicesFilePath);
+  const nonces = new NonceCache();
+  const SKEW_MS = 120_000; // 120 seconds in either direction, per docs/pairing-v0.md.
+
+  // An injected in-memory registry with no explicit devices path has nowhere durable to keep a
+  // bridge id either, so it mints a fresh one every call; a real path (explicit or default)
+  // persists it next to the registry.
+  const bridgeIdFilePath =
+    options.registry !== undefined && options.devicesFilePath === undefined
+      ? undefined
+      : path.join(path.dirname(devicesFilePath), "bridge-id.json");
+  const bridgeId = loadOrCreateBridgeId(bridgeIdFilePath);
+
+  // Mirrors the bridgeIdFilePath guard just above: an injected in-memory registry with no
+  // explicit devices path has no durable state dir to persist into either, so the pairing code
+  // stays in-memory only (as it always has) rather than writing into the real ~/.agentremote.
+  const pairingCodeFilePath =
+    options.pairingCodeFilePath ??
+    (options.registry !== undefined && options.devicesFilePath === undefined
+      ? undefined
+      : path.join(path.dirname(devicesFilePath), "pairing.json"));
+  const pairingCodeStore = new PairingCodeStore(pairingCodeFilePath);
+  const pairingMintedAt = now();
+  const pairingCode = pairingCodeStore.mint(pairingMintedAt);
+  const PAIRING_TTL_MS = 5 * 60 * 1000; // 5 minutes, per docs/pairing-v0.md.
+  const pairingCodeExpiresAt = new Date(pairingMintedAt.getTime() + PAIRING_TTL_MS).toISOString();
+
   const log: AgentEvent[] = [];
   const waiters = new Set<() => void>();
   const processed = new Map<string, CommandResponse>();
   // Reserves a command id for the duration of its execution, so two retries that arrive at
   // the same time cannot both pass the `processed` check and run the command twice.
   const inFlight = new Set<string>();
+  // Tracks, per commandId, which device sent it and the SHA-256 of the exact body it sent, per
+  // the "Request identity" rule: a repeat with a different digest or device is a conflict, not
+  // a replay, even before the command finishes executing.
+  // Bounded by COMMAND_IDENTITY_TTL_MS below (see that constant's comment for why the bound is
+  // safe): without a bound this map grows once per distinct commandId for the process lifetime.
+  const commandIdentities = new Map<string, { deviceId: string | undefined; digest: string; expiresAt: number }>();
+  // Matches NONCE_TTL_MS in auth/verify.ts: the nonce cache already only guards a replayed
+  // envelope for 300s, so evicting a commandId identity sooner would let a body that has already
+  // fallen out of scope of that guard collide with a reused commandId while still looking "new"
+  // here. Keeping this window the same length as the nonce TTL means an entry can only expire
+  // here once the signature layer has already stopped treating its nonce as fresh, so eviction
+  // never opens a replay window the auth layer wasn't already exposed to.
+  const COMMAND_IDENTITY_TTL_MS = 300_000;
   let nextEventId = 1;
   // Set once the provider instance exists (below); host.emit reads it lazily so an event's
   // `provider` tag always reflects what actually constructed/ran the session (provider.id),
@@ -195,14 +306,14 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   }
   emittedProviderId = provider.id;
 
-  const now = new Date().toISOString();
+  const seedTimestamp = now().toISOString();
   const session: Session = {
     id: "ses_seed",
     projectId: seedProjectId,
     provider: provider.id,
     state: "idle",
-    createdAt: now,
-    updatedAt: now,
+    createdAt: seedTimestamp,
+    updatedAt: seedTimestamp,
     title: "demo",
   };
   provider.seedSession(session);
@@ -261,12 +372,12 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     return undefined;
   }
 
-  async function handleCommand(request: Request): Promise<Response> {
+  async function handleCommand(rawBody: string, device: DeviceRecord | undefined): Promise<Response> {
     // The body is untrusted network input: parse it as unknown JSON first (never asserted as
     // Command) and let the ajv schema validator, not a type cast, decide whether it is one.
     let body: unknown;
     try {
-      body = await request.json();
+      body = JSON.parse(rawBody);
     } catch {
       return json({ error: "invalid_command", details: [{ instancePath: "", message: "malformed JSON" }] }, 400);
     }
@@ -279,6 +390,28 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ error: "invalid_command", details }, 400);
     }
     const command = body;
+
+    // Command authorization, per the "Command authorization" section of docs/pairing-v0.md.
+    // Runs only when the envelope was actually verified (`device` set); the AGENTREMOTE_AUTH=off
+    // bypass skips it entirely, exactly as it skipped envelope verification.
+    if (device !== undefined) {
+      // 1. Allowed action.
+      if (!device.allowedActions.includes(command.type)) {
+        return json({ error: "action_not_allowed" }, 403);
+      }
+
+      // 2. Project. session.create checks payload.projectId directly; every other command type
+      // resolves the session's project from the provider, so revoking a project also cuts off
+      // sessions already running in it. An unresolvable session falls through to the "Session"
+      // check below, which already reports it as invalid_command.
+      const commandProjectId =
+        command.type === "session.create"
+          ? command.payload.projectId
+          : (await provider.listSessions()).find((session) => session.id === command.sessionId)?.projectId;
+      if (commandProjectId !== undefined && !device.allowedProjects.includes(commandProjectId)) {
+        return json({ error: "project_not_allowed" }, 403);
+      }
+    }
 
     // session.create's envelope sessionId is a client generated placeholder the bridge does
     // not route on (see the comment on SessionCreatePayload in protocol/typescript/src/index.ts);
@@ -304,6 +437,45 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
           400,
         );
       }
+    }
+
+    // 4. Expiry. approval.accept/reject carry payload.binding.expiresAt; a binding whose
+    // deadline already passed is rejected here, before the provider's own (live-binding) check
+    // ever runs.
+    if (
+      device !== undefined &&
+      (command.type === "approval.accept" || command.type === "approval.reject") &&
+      Date.parse(command.payload.binding.expiresAt) < now().getTime()
+    ) {
+      return json({ error: "decision_expired" }, 410);
+    }
+
+    // 5. Request identity. commandId stays the idempotency key; the bridge also stores the
+    // SHA-256 of the exact command body and the issuing device with it. A repeat with a
+    // different digest or from a different device is a conflict, not a replay, and must not
+    // execute.
+    const bodyDigest = createHash("sha256").update(rawBody).digest("hex");
+    const nowMs = now().getTime();
+    // Insertion order == expiry order here, same reasoning as NonceCache.pruneExpired in
+    // auth/verify.ts: every entry gets the same fixed TTL, so the oldest inserted entry is always
+    // the first to expire as long as the clock does not go backwards.
+    for (const [key, entry] of commandIdentities) {
+      if (entry.expiresAt > nowMs) {
+        break;
+      }
+      commandIdentities.delete(key);
+    }
+    const identity = commandIdentities.get(command.commandId);
+    if (identity !== undefined) {
+      if (identity.digest !== bodyDigest || identity.deviceId !== device?.deviceId) {
+        return json({ error: "command_id_conflict" }, 409);
+      }
+    } else {
+      commandIdentities.set(command.commandId, {
+        deviceId: device?.deviceId,
+        digest: bodyDigest,
+        expiresAt: nowMs + COMMAND_IDENTITY_TTL_MS,
+      });
     }
 
     const previous = processed.get(command.commandId);
@@ -340,7 +512,74 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     return json(response);
   }
 
-  async function handleEvents(url: URL): Promise<Response> {
+  interface PairRequestBody {
+    deviceId: string;
+    deviceName: string;
+    nonce: string;
+    proof: string;
+  }
+
+  function isPairRequestBody(value: unknown): value is PairRequestBody {
+    if (typeof value !== "object" || value === null) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    return (
+      typeof record.deviceId === "string" &&
+      typeof record.deviceName === "string" &&
+      typeof record.nonce === "string" &&
+      typeof record.proof === "string"
+    );
+  }
+
+  /** `POST /v1/pair`, per the "Enrollment" section of docs/pairing-v0.md. Every failure reason
+   * — malformed body, wrong code, expired code, exhausted code, malformed proof — answers the
+   * same 401, so the response never tells an attacker which one it was. */
+  async function handlePair(rawBody: string): Promise<Response> {
+    let body: unknown;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+    if (!isPairRequestBody(body)) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
+    const result = pairingCodeStore.verify(body.proof, body.deviceId, body.deviceName, body.nonce, now());
+    if (!result.ok) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
+    const deviceKey = deriveDeviceKey(result.code, body.deviceId, body.nonce);
+    const keyId = keyIdFor(deviceKey);
+    const pairedAt = now().toISOString();
+    const projects = await provider.listProjects();
+
+    const record: DeviceRecord = {
+      deviceId: body.deviceId,
+      deviceName: body.deviceName,
+      keyId,
+      deviceKeyHex: deviceKey.toString("hex"),
+      pairedAt,
+      allowedProjects: projects.map((project) => project.id),
+      allowedActions: [...ALL_COMMAND_ACTIONS],
+      revokedAt: null,
+      lastSeenAt: null,
+    };
+    registry.register(record);
+
+    return json({
+      deviceId: record.deviceId,
+      keyId: record.keyId,
+      pairedAt: record.pairedAt,
+      bridgeId,
+      allowedProjects: record.allowedProjects,
+      allowedActions: record.allowedActions,
+    });
+  }
+
+  async function handleEvents(url: URL, device: DeviceRecord | undefined): Promise<Response> {
     const after = Number.parseInt(url.searchParams.get("after") ?? "0", 10);
     const cursor = Number.isFinite(after) && after > 0 ? after : 0;
     const requested = Number.parseInt(url.searchParams.get("wait") ?? "0", 10);
@@ -352,13 +591,33 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       events = host.eventsAfter(cursor);
     }
 
+    // `lastEventId` is always the bridge's global maximum (from `log`, never from the
+    // project-filtered `events` below), even for a device narrowed to one project. If it
+    // reported the highest id the device could *see* instead, a device whose only newer events
+    // all belong to a filtered-out project would see an empty page with a cursor that never
+    // moves, and would re-poll the same "after" value forever. Reporting the true global max
+    // lets its next request's `after` skip straight past those filtered events instead.
     const last = log.at(-1);
+    if (device !== undefined) {
+      // AGENTREMOTE_AUTH=off has no device, so nothing is filtered (today's behavior). A newly
+      // paired device is granted every project, so this is a no-op until a project is narrowed.
+      const projectOf = new Map((await provider.listSessions()).map((session) => [session.id, session.projectId]));
+      events = events.filter((event) => {
+        const projectId = projectOf.get(event.sessionId);
+        // Fail closed: an event whose session cannot be resolved to a project is dropped for a
+        // narrowed device rather than shown, since there is no allowedProjects check to pass.
+        return projectId !== undefined && device.allowedProjects.includes(projectId);
+      });
+    }
     return json({ events, lastEventId: last?.eventId ?? 0 } satisfies EventsResponse);
   }
 
   return {
     session,
     provider,
+    bridgeId,
+    pairingCode,
+    pairingCodeExpiresAt,
     async fetch(request: Request): Promise<Response> {
       // Catch-all around the whole route table: mapProviderError only translates the protocol's
       // known error classes, so anything else thrown by a provider or by route logic itself
@@ -370,30 +629,94 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         const url = new URL(request.url);
         const path = url.pathname;
 
+        // The only two unauthenticated routes, per docs/pairing-v0.md.
+        if (request.method === "GET" && path === "/v1/health") {
+          return json({ ok: true, bridgeId });
+        }
+
+        // Read the body once as text and reuse it everywhere below: the envelope signature
+        // covers the raw bytes, and handleCommand/handlePair parse this same string, so the
+        // Request is never consumed twice.
+        const rawBody = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
+
+        if (request.method === "POST" && path === "/v1/pair") {
+          return await handlePair(rawBody);
+        }
+
+        let device: DeviceRecord | undefined;
+        if (authEnabled) {
+          const result = verifyEnvelope({
+            headers: request.headers,
+            method: request.method,
+            pathWithQuery: url.pathname + url.search,
+            rawBody,
+            registry,
+            nonces,
+            now: now(),
+            skewMs: SKEW_MS,
+          });
+          if (!result.ok) {
+            return json({ error: result.code }, result.status);
+          }
+          device = result.device;
+          registry.touch(device.deviceId, now());
+        }
+
         if (request.method === "POST" && path === "/v1/commands") {
-          return await handleCommand(request);
+          return await handleCommand(rawBody, device);
         }
         if (request.method === "GET" && path === "/v1/events") {
-          return await handleEvents(url);
+          return await handleEvents(url, device);
         }
         if (request.method === "GET" && path === "/v1/sessions") {
-          return json({ sessions: await provider.listSessions() } satisfies SessionsResponse);
+          const sessions = await provider.listSessions();
+          // Same no-device/no-filter and newly-paired/no-narrowing notes as handleEvents above.
+          const visible =
+            device === undefined ? sessions : sessions.filter((session) => device.allowedProjects.includes(session.projectId));
+          return json({ sessions: visible } satisfies SessionsResponse);
         }
         if (request.method === "GET" && path === "/v1/projects") {
-          return json({ projects: await provider.listProjects() } satisfies ProjectsResponse);
+          const projects = await provider.listProjects();
+          // Same no-device/no-filter and newly-paired/no-narrowing notes as handleEvents above.
+          const visible =
+            device === undefined ? projects : projects.filter((project) => device.allowedProjects.includes(project.id));
+          return json({ projects: visible } satisfies ProjectsResponse);
         }
 
         const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
         if (request.method === "POST" && cancelMatch !== null) {
           const sessionId = decodeURIComponent(cancelMatch[1] ?? "");
-          if (!(await sessionExists(sessionId))) {
+
+          // This route is authenticated (the envelope check already ran above) but was not
+          // authorized: it must apply the same two checks POST /v1/commands applies to the
+          // equivalent session.cancel command, per "Command authorization" in
+          // docs/pairing-v0.md. Ordering choice: the action check runs first because it never
+          // depends on sessionId, so a device lacking session.cancel learns nothing about
+          // whether sessionId exists (403 either way). The project check needs the target
+          // session's own projectId, so it can only run once the session is found; when the
+          // session can't be found, that check is skipped and control falls through to the same
+          // 404 unknown_session an authorized device would get for the same id. So an
+          // unauthorized device probing session ids sees exactly what an authorized one would
+          // see for a nonexistent id — the 404 never distinguishes "unauthorized" from
+          // "doesn't exist".
+          if (device !== undefined && !device.allowedActions.includes("session.cancel")) {
+            return json({ error: "action_not_allowed" }, 403);
+          }
+
+          const targetSession = (await provider.listSessions()).find((session) => session.id === sessionId);
+          if (device !== undefined && targetSession !== undefined && !device.allowedProjects.includes(targetSession.projectId)) {
+            return json({ error: "project_not_allowed" }, 403);
+          }
+
+          if (targetSession === undefined) {
             return json({ error: "unknown_session" }, 404);
           }
           try {
             await provider.cancel(sessionId);
           } catch (error) {
-            // sessionExists and cancel are two separate provider calls, so a session that existed
-            // a moment ago can still disappear (or otherwise fail to cancel) before this runs.
+            // The listSessions lookup above and cancel are two separate provider calls, so a
+            // session that existed a moment ago can still disappear (or otherwise fail to
+            // cancel) before this runs.
             const mapped = mapProviderError(error);
             if (mapped !== undefined) {
               return mapped;
@@ -425,8 +748,7 @@ export function resolveBindHost(
 ): { hostname: string | undefined; warnNoAuth: boolean } {
   const explicit = envHost?.trim();
   if (explicit !== undefined && explicit.length > 0) {
-    const isLoopback = explicit === "127.0.0.1" || explicit === "localhost" || explicit === "::1";
-    return { hostname: explicit, warnNoAuth: providerId === "claude" && !isLoopback };
+    return { hostname: explicit, warnNoAuth: providerId === "claude" && !isLoopbackHost(explicit) };
   }
   if (providerId === "claude") {
     return { hostname: "127.0.0.1", warnNoAuth: false };
@@ -434,21 +756,110 @@ export function resolveBindHost(
   return { hostname: undefined, warnNoAuth: false };
 }
 
-if (import.meta.main) {
-  const bridge = createBridge();
-  const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);
-  if (warnNoAuth) {
-    console.warn(
-      `Agent Remote bridge is binding to ${hostname} with the claude provider: this endpoint ` +
-        "has no authentication and can execute real tool calls on this host. Set " +
-        "AGENTREMOTE_HOST=127.0.0.1 (or run it behind a trusted network/proxy) unless this is intentional.",
-    );
+/** `undefined` (Bun's own default, which binds every interface) is never loopback. */
+export function isLoopbackHost(host: string | undefined): boolean {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+/** The "Development bypass" refusal from docs/pairing-v0.md: `AGENTREMOTE_AUTH=off` must not
+ * start with the claude provider (which executes real host tool calls) on a bind host other
+ * than loopback, since that combination is an unauthenticated endpoint reachable off the box.
+ * Throws to refuse startup; does nothing when auth is enabled or the combination is safe. */
+export function assertAuthBypassAllowed(params: {
+  authEnabled: boolean;
+  providerId: string;
+  hostname: string | undefined;
+}): void {
+  if (params.authEnabled || params.providerId !== "claude" || isLoopbackHost(params.hostname)) {
+    return;
   }
-  const server = Bun.serve({
-    port: Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10),
-    ...(hostname === undefined ? {} : { hostname }),
-    idleTimeout: 0,
-    fetch: bridge.fetch,
-  });
-  console.log(`Agent Remote bridge listening on http://localhost:${server.port}`);
+  throw new Error(
+    `AGENTREMOTE_AUTH=off refuses to start with the claude provider bound to ${params.hostname ?? "all interfaces"}: ` +
+      "that combination is an unauthenticated endpoint that can execute real tool calls on a reachable address. " +
+      "Set AGENTREMOTE_HOST=127.0.0.1 or leave AGENTREMOTE_AUTH enabled.",
+  );
+}
+
+/** Prints a fresh pairing code and its expiry, per the "Operator commands" section of
+ * docs/pairing-v0.md. The code is persisted to `<stateDir>/pairing.json` (the same path
+ * `createBridge` uses), so this one-shot process's mint reaches an already-running bridge —
+ * re-pairing a device no longer requires restarting the bridge and killing live sessions. */
+export function runPairOperatorCommand(stateDir: string = resolveStateDir(), now: Date = new Date()): void {
+  const store = new PairingCodeStore(path.join(stateDir, "pairing.json"));
+  const code = store.mint(now);
+  const PAIRING_TTL_MS = 5 * 60 * 1000;
+  const expiresAt = new Date(now.getTime() + PAIRING_TTL_MS).toISOString();
+  console.log(`Pairing code: ${formatPairingCode(code)} (expires ${expiresAt})`);
+}
+
+/** `AGENTREMOTE_REVOKE=<deviceId>`: marks a device revoked in the persisted registry and exits. */
+export function runRevokeOperatorCommand(deviceId: string, stateDir: string = resolveStateDir(), now: Date = new Date()): void {
+  const registry = DeviceRegistry.load(path.join(stateDir, "devices.json"));
+  if (registry.get(deviceId) === undefined) {
+    console.log(`No such device: ${deviceId}`);
+    return;
+  }
+  registry.revoke(deviceId, now);
+  console.log(`Revoked device: ${deviceId}`);
+}
+
+/** `AGENTREMOTE_LIST_DEVICES=1`: prints the registry, deliberately never printing key material. */
+export function runListDevicesOperatorCommand(stateDir: string = resolveStateDir()): void {
+  const registry = DeviceRegistry.load(path.join(stateDir, "devices.json"));
+  const devices = registry.list().map((record) => ({
+    deviceId: record.deviceId,
+    deviceName: record.deviceName,
+    keyId: record.keyId,
+    pairedAt: record.pairedAt,
+    allowedProjects: record.allowedProjects,
+    allowedActions: record.allowedActions,
+    revokedAt: record.revokedAt,
+    lastSeenAt: record.lastSeenAt,
+  }));
+  console.log(JSON.stringify(devices, null, 2));
+}
+
+if (import.meta.main) {
+  // Operator commands are one-shot: read the env var, act, exit. They never start the server.
+  if (process.env.AGENTREMOTE_PAIR === "1") {
+    runPairOperatorCommand();
+  } else if (process.env.AGENTREMOTE_REVOKE !== undefined && process.env.AGENTREMOTE_REVOKE.length > 0) {
+    runRevokeOperatorCommand(process.env.AGENTREMOTE_REVOKE);
+  } else if (process.env.AGENTREMOTE_LIST_DEVICES === "1") {
+    runListDevicesOperatorCommand();
+  } else {
+    const authEnabled = process.env.AGENTREMOTE_AUTH !== "off";
+    const bridge = createBridge();
+    const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);
+
+    try {
+      assertAuthBypassAllowed({ authEnabled, providerId: bridge.provider.id, hostname });
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+
+    if (!authEnabled) {
+      console.warn(
+        "Agent Remote bridge is starting with AGENTREMOTE_AUTH=off: every request is accepted " +
+          "without pairing or a signed envelope. Only use this for local development.",
+      );
+    } else if (warnNoAuth) {
+      console.warn(
+        `Agent Remote bridge is binding to ${hostname} with the claude provider: this endpoint ` +
+          "can execute real tool calls on this host. Set AGENTREMOTE_HOST=127.0.0.1 (or run it " +
+          "behind a trusted network/proxy) unless this is intentional.",
+      );
+    }
+
+    console.log(`Pairing code: ${formatPairingCode(bridge.pairingCode)} (expires ${bridge.pairingCodeExpiresAt})`);
+
+    const server = Bun.serve({
+      port: Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10),
+      ...(hostname === undefined ? {} : { hostname }),
+      idleTimeout: 0,
+      fetch: bridge.fetch,
+    });
+    console.log(`Agent Remote bridge listening on http://localhost:${server.port}`);
+  }
 }

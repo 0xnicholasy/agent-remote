@@ -1,6 +1,6 @@
 # Agent Remote task board
 
-Last updated: 2026-09-19
+Last updated: 2026-09-20
 
 Agent Remote lets a user steer short coding-agent interruptions from an Apple Watch while the Mac remains the authority. The first release targets one real provider and one paired Mac on the local network: tap answers, approve or deny, send reviewed dictation, hear short foreground replies, see current/syncing/disconnected state, and cancel. It controls only sessions created through its bridge, not arbitrary terminal sessions that were already running.
 
@@ -19,7 +19,7 @@ Agent Remote lets a user steer short coding-agent interruptions from an Apple Wa
   3. Done 2026-09-17 (PR #2): `approve()` / `reject()` / `answer()` keep the card until the bridge acknowledges; 409 (stale binding) clears it with a status line, any other failure keeps it for retry; buttons disabled while sending.
   4. Done 2026-09-17 (PR #3): mock refuses a new prompt while an approval or question is pending (409); cancel clears only that session's pending state.
   5. Speech on simulator unconfirmed; nav title overlaps card; approval title repeats the verb; mock reject path has no follow-up question; SessionStore has no client protocol seam so the 409-vs-retry path is untested; SessionStore not scoped to a session.
-- [ ] Security review of the first commits (2026-09-17), the cancel route session check landed in PR #1 on 2026-09-17; the rest is deferred to Phase 1 with the pairing work: bridge has no authentication on any route; the mock provider lets an approval or answer for one session touch state of another because bindings are not checked against the session id.
+- [ ] Security review of the first commits (2026-09-17). Cancel route session check landed in PR #1 on 2026-09-17. Bridge authentication landed 2026-09-20 in the M3 slice 1 work, which also closed two gaps found reviewing it: the cancel route was authenticated but not authorized, and the session/event reads ignored per-device project narrowing. Still open: the mock provider lets an approval or answer for one session touch state of another because bindings are not checked against the session id.
 - [ ] Add explicit root lint and typecheck entry points so documentation and CI can invoke the available package checks consistently.
 - [ ] Keep related-project research (claude-watch, agent-watcher, codex-apple-watch, iOS-vibebuddy, and mimi-remote) bounded to concrete reuse or contribution questions. It does not block the release path.
 
@@ -52,14 +52,16 @@ Exit gate: one real provider demonstrates the required interactive semantics thr
 
 Dependencies: M2 protocol behavior and M1 connectivity findings.
 
-- [ ] Define the authenticated and encrypted wire envelope, pairing enrollment, device revocation, and project authorization policy.
-- [ ] Enforce normative schema validation at every trust boundary and run shared TypeScript/Swift conformance fixtures.
-- [ ] Validate every command against device, session, request, project, expiry, and allowed action.
-- [ ] Add replay protection and durable idempotency reconciliation so retries cannot apply a decision twice or blindly replay an indeterminate provider side effect.
+- [x] 2026-09-20 (slice 1): authenticated wire envelope, pairing enrollment, device revocation, and project authorization policy. Contract in `docs/pairing-v0.md`, reasoning in ADR 008. Encryption is deliberately NOT part of this: the wire is authenticated and replay protected, not confidential, and ADR 008 records why.
+- [x] 2026-09-20 (slice 1): shared TypeScript/Swift conformance is a fixed signing vector asserted as literals on both sides (`bridge/src/auth/vector.test.ts`, `RequestSigningTests.swift`). Command schema validation at the bridge boundary landed 2026-09-17; the Swift side still has no runtime schema check of its own.
+- [x] 2026-09-20 (slice 1): every command is validated against device, session, request identity, project, expiry, and allowed action. `commandId` is now bound to one device and one body digest; an approval past `expiresAt` is refused with 410 before it reaches a provider.
+- [ ] Add replay protection and durable idempotency reconciliation so retries cannot apply a decision twice or blindly replay an indeterminate provider side effect. Slice 1 landed in-memory replay protection (per-device nonce cache, 120s skew window) and command identity; both the nonce cache and the command identity map are process memory only and unbounded across a long run, so the durable half is still open.
 - [ ] Define interaction lifecycle, expiry, and cancel isolation across concurrent sessions.
 - [ ] Recover safely after client and bridge restarts using a defined snapshot, replay, or materialized-state design; specify storage, rehydration, retention, and history policy.
 
 Exit gate: dropped responses, duplicate commands, expired decisions, reconnects, client relaunches, bridge restarts, conflicting device decisions, and multiple simultaneous sessions cannot apply an invalid or stale action. Recovery produces an explicit current, syncing, or disconnected state.
+
+Slice 1 status (2026-09-20): duplicate commands, expired decisions and unauthorized or unauthenticated commands are refused, and pairing survives a bridge restart. The gate itself is NOT met: bridge restart loses the event log, the nonce cache and the command identity map, so reconnect and relaunch recovery is still unproven. That is slice 2.
 
 ### M4 - Real Watch experience
 

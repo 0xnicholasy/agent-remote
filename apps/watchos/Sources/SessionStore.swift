@@ -20,6 +20,7 @@ enum StatusKind: Equatable {
     case reconnecting
     case requestInvalid
     case error
+    case authFailed
 }
 
 enum TurnState: String {
@@ -57,6 +58,8 @@ final class SessionStore {
     private(set) var statusLine = "Not connected"
     private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
+    private(set) var paired = false
+    private(set) var pairingError: String?
 
     var hostText: String {
         didSet { UserDefaults.standard.set(hostText, forKey: SessionStore.hostKey) }
@@ -85,10 +88,29 @@ final class SessionStore {
     // MARK: - Polling
 
     func start() {
+        Task { [weak self] in await self?.refreshPairedState() }
         guard pollTask == nil else { return }
         pollGeneration += 1
         let generation = pollGeneration
         pollTask = Task { [weak self] in await self?.pollLoop(generation: generation) }
+    }
+
+    func refreshPairedState() async {
+        paired = await client.isPaired()
+    }
+
+    /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
+    /// stores the device credential and subsequent requests are signed.
+    func pair(code: String, deviceName: String) async {
+        pairingError = nil
+        do {
+            try await client.pair(code: code, deviceName: deviceName)
+            paired = true
+            start()
+        } catch {
+            paired = await client.isPaired()
+            pairingError = "\(error)"
+        }
     }
 
     /// Applies a new host from Settings and restarts the poll loop against it.
@@ -163,11 +185,32 @@ final class SessionStore {
             } catch {
                 if Task.isCancelled || generation != pollGeneration { return }
                 connected = false
+                // A revoked/unpaired/rejected credential will never succeed on retry: hammering
+                // the bridge forever would just hide the real problem from the user, so stop the
+                // loop here instead of backing off and trying again.
+                if let bridgeError = error as? BridgeError, Self.isTerminalAuthFailure(bridgeError) {
+                    statusLine = "Not authorized: \(bridgeError)"
+                    statusKind = .authFailed
+                    pollTask = nil
+                    return
+                }
                 statusLine = "Reconnecting: \(error)"
                 statusKind = .reconnecting
                 try? await Task.sleep(for: .seconds(backoff))
                 backoff = min(backoff * 2, 15)
             }
+        }
+    }
+
+    /// Distinguishes a terminal authentication failure -- no retry will ever fix a revoked,
+    /// unpaired, or rejected device credential -- from a transient network/timeout error that
+    /// the existing backoff-and-retry loop should keep handling unchanged.
+    private static func isTerminalAuthFailure(_ error: BridgeError) -> Bool {
+        switch error {
+        case .notPaired, .unauthenticated, .deviceRevoked:
+            true
+        default:
+            false
         }
     }
 

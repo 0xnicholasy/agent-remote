@@ -13,6 +13,10 @@ struct SettingsView: View {
                     Button("Connect") { Task { await store.reconnect() } }
                     Button("Create session") { Task { await store.createSession() } }
                 }
+                Section("Pairing") {
+                    LabeledContent("Device", value: store.paired ? "Paired" : "Not paired")
+                    NavigationLink("Pair Watch") { PairingView() }
+                }
                 Section("Speech") {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
                 }
