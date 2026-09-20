@@ -26,7 +26,7 @@ created 0700, files are 0600, and a full rewrite goes through a temp file and a 
 | `bridge-id.json` | This bridge's identity (slice 1) | Forever |
 | `events.jsonl` | The event log | 24 hours, at most 2000 events |
 | `events.jsonl.watermark` | Highest reserved event id | Forever |
-| `commands.jsonl` | Command identity and outcome | 24 hours, at most 5000 commands |
+| `commands.jsonl` | Command identity and outcome | 24 hours, soft cap of 5000 commands |
 | `nonces.jsonl` | Seen request nonces | 300 seconds (the nonce TTL) |
 | `sessions.jsonl` | Session to project bindings | 24 hours |
 | `session-epochs.json` | Per-session binding history for event authorization | Bounded to `MAX_SESSIONS` entries |

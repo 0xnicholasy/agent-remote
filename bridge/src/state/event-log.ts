@@ -154,7 +154,7 @@ export class EventLog {
 
     if (typeof parsed === "object" && parsed !== null) {
       const value = (parsed as Record<string, unknown>).reservedThrough;
-      if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
         return value;
       }
     }
