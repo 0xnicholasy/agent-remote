@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -300,6 +310,52 @@ describe("DeviceRegistry", () => {
     expect(registry.get(record.deviceId)).toBeUndefined();
     expect(registry.list()).toEqual([]);
     expect(existsSync(filePath)).toBe(false);
+  });
+
+  test("a touch that persists does not resurrect a device revoked out of band since the last load", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ lastSeenAt: "2026-09-20T12:00:00.000Z" });
+
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+
+    // The out-of-band revoke CLI writes devices.json directly; this registry has not looked since.
+    const revokedAt = "2026-09-20T12:05:00.000Z";
+    const onDisk = (JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[]).map((r) => ({
+      ...r,
+      revokedAt,
+    }));
+    writeFileSync(filePath, JSON.stringify(onDisk, null, 2), "utf8");
+
+    // Past the throttle interval, so this touch actually persists (and must reload first).
+    const touchedAt = new Date(Date.parse(record.lastSeenAt as string) + 60_000);
+    registry.touch(record.deviceId, touchedAt);
+
+    const after = JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[];
+    expect(after.find((r) => r.deviceId === record.deviceId)?.revokedAt).toBe(revokedAt);
+  });
+
+  test("a touch whose persist fails does not throw, and still updates lastSeenAt in memory", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ lastSeenAt: "2026-09-20T12:00:00.000Z" });
+
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+
+    // Make the parent directory read-only so mkdirSync (already exists) still succeeds but the
+    // atomic write's temp-file writeFileSync fails with EACCES. The existing file and its stat
+    // stay unchanged, so touch's reload sees "nothing new" and does not clear the in-memory map.
+    chmodSync(dir, 0o500);
+    try {
+      // Past the throttle interval, so this touch attempts to persist.
+      const touchedAt = new Date(Date.parse(record.lastSeenAt as string) + 60_000);
+      expect(() => registry.touch(record.deviceId, touchedAt)).not.toThrow();
+      expect(registry.get(record.deviceId)?.lastSeenAt).toBe(touchedAt.toISOString());
+    } finally {
+      chmodSync(dir, 0o700);
+    }
   });
 
   test("a deleted backing file does not throw on the next get, and reports an empty registry", () => {

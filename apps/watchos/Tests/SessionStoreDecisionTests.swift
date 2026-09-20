@@ -738,4 +738,28 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
         XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
     }
+
+    /// Regression for R-029: a terminal auth failure stops the poll loop, but a subsequent
+    /// successful pair() must resume polling on its own -- without this, the loop stays dead
+    /// until the app relaunches or the user changes host in Settings.
+    func testSuccessfulRePairResumesPollingAfterTerminalAuthFailure() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client)
+        // Call 1 is a terminal auth failure that stops the loop; every call after (once
+        // re-paired) sees a clean, empty page.
+        await client.setEventsResults([
+            .failure(BridgeError.deviceRevoked),
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+        ])
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(store.statusKind, .authFailed, "setup should leave the loop stopped on a terminal auth failure")
+
+        await store.pair(code: "AAAAAAAAAAAA", deviceName: "Test Watch")
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(store.statusKind, .connected, "a successful re-pair must resume polling without a relaunch or host change")
+    }
 }

@@ -106,6 +106,7 @@ final class SessionStore {
         do {
             try await client.pair(code: code, deviceName: deviceName)
             paired = true
+            start()
         } catch {
             paired = await client.isPaired()
             pairingError = "\(error)"
@@ -190,6 +191,7 @@ final class SessionStore {
                 if let bridgeError = error as? BridgeError, Self.isTerminalAuthFailure(bridgeError) {
                     statusLine = "Not authorized: \(bridgeError)"
                     statusKind = .authFailed
+                    pollTask = nil
                     return
                 }
                 statusLine = "Reconnecting: \(error)"

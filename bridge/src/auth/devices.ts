@@ -188,10 +188,19 @@ export class DeviceRegistry {
     }
   }
 
+  /**
+   * Two-tier write policy for this class: security-relevant state (register/revoke, above) writes
+   * synchronously and rethrows on failure, so a caller never observes a device as registered or
+   * un-revoked whose record did not reach disk. `lastSeenAt` below is cosmetic only — it feeds no
+   * authorization or replay decision — so it writes best-effort and swallows a persist failure.
+   */
   touch(deviceId: string, now: Date): void {
-    // Deliberately no reloadIfChanged() here beyond the statSync `get`/callers already paid for
-    // on this request: touch runs once per authenticated request right after verifyEnvelope's
-    // own registry.get, so the stamp is already current and a second stat would be pure waste.
+    // No reloadIfChanged() on the non-persisting path beyond the statSync `get`/callers already
+    // paid for on this request: touch runs once per authenticated request right after
+    // verifyEnvelope's own registry.get, so the stamp is already current and a second stat would
+    // be pure waste when we are not about to write. On the persisting path below, though, an
+    // out-of-band write (the revoke CLI) could have landed on devices.json since that get, and the
+    // whole-map rewrite in persist() must not clobber it — so that path reloads first.
     const record = this.devices.get(deviceId);
     if (record === undefined) {
       return;
@@ -208,7 +217,17 @@ export class DeviceRegistry {
     // frequent than it, so the on-disk lastSeenAt would freeze at the first write forever.
     const persistedAtMs = this.persistedLastSeenAtMs.get(deviceId);
     if (persistedAtMs === undefined || now.getTime() - persistedAtMs >= LAST_SEEN_PERSIST_INTERVAL_MS) {
-      this.persist();
+      this.reloadIfChanged();
+      const fresh = this.devices.get(deviceId);
+      if (fresh === undefined) {
+        return;
+      }
+      fresh.lastSeenAt = now.toISOString();
+      try {
+        this.persist();
+      } catch (cause) {
+        console.warn(`Agent Remote bridge: failed to persist lastSeenAt for device ${deviceId}`, cause);
+      }
     }
   }
 
