@@ -71,6 +71,22 @@ private let approvalAcceptJSON = """
     #expect(again == event)
 }
 
+@Test func decodesTheProjectStampAndLeavesItNilWhenAbsent() throws {
+    // The bridge stamps the project an event was emitted under; a log written before the field
+    // existed has no stamp at all, and both shapes have to decode.
+    let stamped = approvalRequestedJSON.replacingOccurrences(
+        of: "\"sessionId\": \"ses_01\",\n  \"provider\"",
+        with: "\"sessionId\": \"ses_01\",\n  \"projectId\": \"prj_01\",\n  \"provider\"")
+    let withStamp = try JSONDecoder().decode(AgentEvent.self, from: Data(stamped.utf8))
+    #expect(withStamp.projectId == "prj_01")
+
+    let withoutStamp = try JSONDecoder().decode(AgentEvent.self, from: Data(approvalRequestedJSON.utf8))
+    #expect(withoutStamp.projectId == nil)
+
+    let encoded = try JSONEncoder().encode(withStamp)
+    #expect(try JSONDecoder().decode(AgentEvent.self, from: encoded) == withStamp)
+}
+
 @Test func decodesApprovalAcceptCommand() throws {
     let command = try JSONDecoder().decode(Command.self, from: Data(approvalAcceptJSON.utf8))
 

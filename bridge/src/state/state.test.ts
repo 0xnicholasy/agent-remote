@@ -101,6 +101,41 @@ describe("JsonlJournal", () => {
     expect(calls).toBeGreaterThan(1);
     expect(journal.load()).toEqual([{ a: 1 }]);
   });
+
+  test("a write that fails partway through leaves no torn prefix behind", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    journal.append({ a: 1 });
+
+    const realWriteSync = fs.writeSync.bind(fs);
+    // Writes the first few bytes of the record and then fails the way a full disk does, which
+    // is the only way to reach the rollback: a healthy filesystem never leaves a fragment.
+    const partialThenFail: (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset?: number | null,
+      length?: number | null,
+      position?: number | null,
+    ) => number = (fd, buffer, offset, length, position) => {
+      realWriteSync(fd, buffer, offset as number, Math.min(4, length as number), position ?? undefined);
+      const error = new Error("ENOSPC: no space left on device, write") as NodeJS.ErrnoException;
+      error.code = "ENOSPC";
+      throw error;
+    };
+    const writeSpy = spyOn(fs, "writeSync").mockImplementation(partialThenFail as typeof fs.writeSync);
+
+    try {
+      expect(() => journal.append({ a: 2 })).toThrow("ENOSPC");
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    // Without the rollback the file would end in a fragment of record 2, and the next append
+    // would land on the same line: both records would then be lost, not just the failed one.
+    expect(readFileSync(filePath, "utf8")).toBe('{"a":1}\n');
+    journal.append({ a: 3 });
+    expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 3 }]);
+  });
 });
 
 describe("EventLog", () => {

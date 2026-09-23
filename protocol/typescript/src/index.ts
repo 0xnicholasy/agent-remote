@@ -225,6 +225,16 @@ export interface AgentEventEnvelope<T extends AgentEventType> {
   /** Monotonically increasing integer assigned by the bridge, unique across sessions. */
   eventId: number;
   sessionId: string;
+  /**
+   * The project this event belongs to, stamped when the event is emitted.
+   *
+   * Authorization reads this field rather than resolving the event's session to a project at
+   * read time: a session that the provider has forgotten, or whose id is later reused, must not
+   * change who may read events already emitted under it. Optional only because events persisted
+   * before this field existed carry no value; a reader that finds it missing falls back to the
+   * session index and fails closed when that has nothing either.
+   */
+  projectId?: string;
   provider: string;
   type: T;
   timestamp: IsoTimestamp;

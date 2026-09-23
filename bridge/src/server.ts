@@ -320,6 +320,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const sessionIndex = new SessionIndex(journalPath("sessions.jsonl"), { now: now() });
   const commands = new CommandJournal(journalPath("commands.jsonl"), { now: now() });
 
+  // Project of every session this process has started or seeded, which is what each emitted
+  // event is stamped with. Separate from `sessionIndex`: that one survives restarts to authorize
+  // events from a previous boot, this one is the current boot's truth about a live session.
+  const liveProjectOf = new Map<string, string>();
+
   const waiters = new Set<() => void>();
   // Reserves a command id for the duration of its execution, so two retries that arrive at
   // the same time cannot both pass the journal check and run the command twice.
@@ -342,12 +347,28 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       type: T,
       payload: AgentEventPayloadMap[T],
     ): AgentEvent {
+      // The project an event belongs to is decided here, once, and travels with the event. A
+      // reader must not have to re-resolve it: by then the session may be gone from the
+      // provider, or its id handed out again for another project, and either would silently
+      // change who may read events that were emitted long before. `session.started` carries the
+      // binding in its own payload; every later event reads `liveProjectOf`, which this process
+      // populated from that same payload. The durable `sessionIndex` is deliberately not
+      // consulted here: it is first-bind-wins across restarts, so for a reused session id it
+      // holds the *previous* boot's project and would stamp new events with a stale one. An
+      // event whose session has no binding in this process leaves the field unset, which the
+      // read path fails closed on for a project-narrowed device.
+      if (type === "session.started") {
+        liveProjectOf.set(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId);
+      }
+      const projectId = liveProjectOf.get(sessionId);
+
       // An AgentEventEnvelope<T> is structurally one member of the AgentEvent union, but
       // TypeScript cannot verify that while T is still an unresolved type parameter, so the
       // envelope is asserted once here instead of weakening the public types.
       const event = {
         eventId: eventLog.takeEventId(),
         sessionId,
+        ...(projectId === undefined ? {} : { projectId }),
         provider: emittedProviderId,
         type,
         timestamp: new Date().toISOString(),
@@ -443,6 +464,10 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     title: "demo",
   };
   provider.seedSession(session);
+  // The seeded session never emits `session.started`, so its binding is registered directly;
+  // without it every event the seeded session emits would be unstamped and invisible to a
+  // project-narrowed device.
+  liveProjectOf.set(session.id, session.projectId);
   try {
     sessionIndex.record(session.id, session.projectId, now());
   } catch (error) {
@@ -472,6 +497,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       case "session.create": {
         // createSession emits session.started itself, so the bridge must not emit it again.
         const created = await provider.createSession(command.payload.projectId);
+        // A provider that emits session.started has already bound this id (emit binds it from
+        // that payload). One that does not still needs the binding recorded, or every event it
+        // emits under this session is unstamped and therefore invisible to a project-narrowed
+        // device. Overwriting is intentional: a provider that hands out a session id it used
+        // before, under a different project, has genuinely rebound it for this process, and the
+        // events already emitted under the old project keep the stamp they were given.
+        liveProjectOf.set(created.id, created.projectId);
         return created.id;
       }
     }
@@ -765,20 +797,25 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       // paired device is granted every project, so this is a no-op until a project is narrowed.
       const projectOf = new Map((await provider.listSessions()).map((session) => [session.id, session.projectId]));
       events = events.filter((event) => {
-        // Live sessions first; the persisted index answers for a session the provider forgot
-        // across a restart, which is the only way a retained event stays authorizable.
-        const projectId = projectOf.get(event.sessionId) ?? sessionIndex.projectOf(event.sessionId);
-        // The index's binding is first-bind-wins and immutable (SessionIndex.record), so it is
-        // the authoritative project for every event ever emitted under this sessionId. If the
-        // live provider now reports a different project for the same id (the id was reused, or
-        // reassigned), that disagreement means these retained events belong to a project the
-        // requesting device may not be authorized for even though the live session is: fail
-        // closed and drop them rather than trusting the live value for old events.
-        const recordedProjectId = sessionIndex.projectOf(event.sessionId);
-        if (recordedProjectId !== undefined && projectId !== recordedProjectId) {
-          return false;
+        // The event's own stamp is the authorization record: it was decided when the event was
+        // emitted, so nothing that happens to the session afterwards (the provider forgetting
+        // it across a restart, the id being reused for another project) can move an old event
+        // into a project this device is allowed to read. Only an event persisted before the
+        // field existed has no stamp; for those the session's binding is still the best record
+        // available, live value first and the persisted index for a session the provider forgot.
+        const projectId =
+          event.projectId ?? projectOf.get(event.sessionId) ?? sessionIndex.projectOf(event.sessionId);
+        if (event.projectId === undefined) {
+          // Legacy events only. The index's binding is first-bind-wins and immutable
+          // (SessionIndex.record), so a live provider reporting a different project for the same
+          // id means the id was reused or reassigned and these retained events belong to some
+          // other project: fail closed rather than trust the live value for old events.
+          const recordedProjectId = sessionIndex.projectOf(event.sessionId);
+          if (recordedProjectId !== undefined && projectId !== recordedProjectId) {
+            return false;
+          }
         }
-        // Fail closed: an event whose session cannot be resolved to a project is dropped for a
+        // Fail closed: an event that cannot be resolved to a project at all is dropped for a
         // narrowed device rather than shown, since there is no allowedProjects check to pass.
         return projectId !== undefined && device.allowedProjects.includes(projectId);
       });

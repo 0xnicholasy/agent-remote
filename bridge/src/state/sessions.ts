@@ -162,7 +162,15 @@ export class SessionIndex {
   }
 
   private compact(): void {
-    this.journal.rewrite([...this.entries.values()]);
+    try {
+      this.journal.rewrite([...this.entries.values()]);
+    } catch (error) {
+      // A rewrite failure is a durability concern, not a correctness one: the in-memory
+      // state is unaffected and every surviving record is still in the file it was appended
+      // to. Matching `CommandJournal.compact`, it is reported rather than thrown, so a
+      // compaction cannot fail the caller whose record already landed.
+      console.error(`Agent Remote bridge: session index rewrite failed`, error);
+    }
     this.appendsSinceCompaction = 0;
   }
 }

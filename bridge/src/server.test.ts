@@ -1775,18 +1775,15 @@ describe("retained events of a reused session id", () => {
     return sessionId;
   }
 
-  test("a session id live under a different project than its recorded binding is served to no one", async () => {
-    const first = await bootAndRecord(projectA, "1");
-
-    // sessions.jsonl is left in place, so the durable binding for this id still reads project
-    // A. The stub provider hands out `ses_stub` again on the next boot, so creating a session
-    // under project B makes the live provider disagree with that recorded binding.
+  /** Boots with `allowed` granted to the paired device, reuses `ses_stub` for a session under
+   * project B, and returns the page that device reads. */
+  async function reuseUnderProjectB(allowed: string[], commandId: string): Promise<EventsResponse> {
     const registry = DeviceRegistry.load(devicesFilePath);
-    registry.register(sampleDeviceRecord({ allowedProjects: [projectA, projectB] }));
+    registry.register(sampleDeviceRecord({ allowedProjects: allowed }));
 
     const reader = boot(true);
     const createBody: Command = {
-      commandId: "d1111111-1111-4111-8111-111111111111",
+      commandId,
       sessionId: "ses_placeholder",
       type: "session.create",
       timestamp: FIXED_NOW.toISOString(),
@@ -1796,17 +1793,77 @@ describe("retained events of a reused session id", () => {
       signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createBody }),
     );
     expect(created.status).toBe(200);
-    const createdBody = (await created.json()) as CommandResponse;
-    expect(createdBody.sessionId).toBe(first);
+    expect(((await created.json()) as CommandResponse).sessionId).toBe("ses_stub");
 
     const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
     expect(response.status).toBe(200);
     const page = (await response.json()) as EventsResponse;
     reader.close();
+    return page;
+  }
 
-    // The device is allowed both projects, so nothing here is a project-narrowing drop: the
-    // recorded binding (A) and the live provider (B) disagree about what this id is, so none of
-    // its events can be attributed to a project and all of them are withheld.
+  test("a retained event keeps the project it was emitted under when the session id is reused", async () => {
+    const first = await bootAndRecord(projectA, "1");
+    const page = await reuseUnderProjectB([projectA, projectB], "d1111111-1111-4111-8111-111111111111");
+
+    // The event was stamped with project A when it was emitted, and reusing `ses_stub` for a
+    // project B session afterwards does not restate what that older event was about.
+    const retained = page.events.filter((event) => event.sessionId === first);
+    expect(retained.length).toBe(1);
+    expect(retained[0]?.projectId).toBe(projectA);
+  });
+
+  /** Strips the stamp from every persisted event, which is what a log written before the field
+   * existed looks like after an upgrade. */
+  function unstampPersistedEvents(): void {
+    const eventsPath = join(stateDir, "events.jsonl");
+    const lines = readFileSync(eventsPath, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const { projectId: _dropped, ...rest } = JSON.parse(line) as AgentEvent & { projectId?: string };
+        return JSON.stringify(rest);
+      });
+    writeFileSync(eventsPath, `${lines.join("\n")}\n`);
+  }
+
+  test("an event persisted before the stamp existed is still authorized through the session index", async () => {
+    const first = await bootAndRecord(projectA, "1");
+    unstampPersistedEvents();
+
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectA] }));
+    const reader = boot(true);
+    const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    const page = (await response.json()) as EventsResponse;
+    reader.close();
+
+    // No stamp to read, so the durable session binding answers instead: an upgrade must not
+    // blank out the history a paired device already had.
+    expect(page.events.some((event) => event.sessionId === first)).toBe(true);
+  });
+
+  test("an unstamped event is withheld from a device not allowed its session's recorded project", async () => {
+    const first = await bootAndRecord(projectA, "1");
+    unstampPersistedEvents();
+
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectB] }));
+    const reader = boot(true);
+    const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    const page = (await response.json()) as EventsResponse;
+    reader.close();
+
+    expect(page.events.some((event) => event.sessionId === first)).toBe(false);
+  });
+
+  test("reusing a session id does not expose its earlier project's events to a device narrowed to the new project", async () => {
+    const first = await bootAndRecord(projectA, "1");
+    const page = await reuseUnderProjectB([projectB], "e1111111-1111-4111-8111-111111111111");
+
+    // The device may read project B, and `ses_stub` is now a project B session, but the
+    // retained event belongs to project A and stays withheld. Authorizing it against the live
+    // session instead of its own stamp is exactly the hole this closes.
     expect(page.events.some((event) => event.sessionId === first)).toBe(false);
   });
 });
