@@ -39,6 +39,7 @@ function fsyncDirSync(path: string): void {
  */
 export class JsonlJournal<T> {
   private readonly filePath: string | undefined;
+  private tornAtSize: number | undefined;
 
   constructor(filePath?: string) {
     this.filePath = filePath;
@@ -101,11 +102,13 @@ export class JsonlJournal<T> {
    * A failed write is reported, then rethrown: a caller believing an unpersisted record made it
    * to durable storage is worse than a caller that has to decide what to do about the failure.
    *
-   * A write that fails partway through the loop below (a full disk is the realistic cause)
-   * leaves a fragment of this record in the file. `load` repairs a fragment only at the end of
-   * the file and only on restart, so a process that keeps running would append the next record
-   * straight onto the fragment and corrupt both lines. The file is therefore truncated back to
-   * the size it had before this append, which is a record boundary by construction.
+   * A write that fails anywhere after the record boundary is known — the write itself, its
+   * fsync, or the directory fsync — leaves a fragment of this record in the file. `load` repairs
+   * a fragment only at the end of the file and only on restart, so a process that keeps running
+   * would append the next record straight onto the fragment and corrupt both lines. The file is
+   * therefore truncated back to the size it had before this append, which is a record boundary
+   * by construction. If that rollback truncate itself fails, the torn fragment is recorded and
+   * repaired before the next append is allowed to proceed.
    */
   append(record: T): void {
     if (this.filePath === undefined) {
@@ -116,7 +119,12 @@ export class JsonlJournal<T> {
     try {
       mkdirSync(dirname(this.filePath), { recursive: true, mode: 0o700 });
       fd = openSync(this.filePath, "a", 0o600);
-      sizeBeforeAppend = fstatSync(fd).size;
+      sizeBeforeAppend = this.tornAtSize ?? fstatSync(fd).size;
+      if (this.tornAtSize !== undefined) {
+        ftruncateSync(fd, sizeBeforeAppend);
+        fsyncSync(fd);
+        this.tornAtSize = undefined;
+      }
       // writeSync can write fewer bytes than given (short write); loop until the whole record
       // has landed rather than trusting the first call, otherwise a partial record on disk would
       // still be fsynced and reported as a durable append.
@@ -136,6 +144,8 @@ export class JsonlJournal<T> {
         } catch (truncateError) {
           // Nothing further can be done in-process, so say so loudly: the next append would
           // otherwise land on a torn prefix and the corruption would read like a parse bug.
+          // Record the torn size so the next append repairs it before writing anything new.
+          this.tornAtSize = sizeBeforeAppend;
           console.error(
             `Agent Remote bridge: failed to roll back a partial append to ${this.filePath}; the file may hold a torn record`,
             truncateError,
@@ -164,6 +174,8 @@ export class JsonlJournal<T> {
     const body = records.map((record) => `${JSON.stringify(record)}\n`).join("");
     try {
       atomicWriteFileSync(this.filePath, body);
+      // The rename replaced any torn tail, so clear it before the directory fsync can throw.
+      this.tornAtSize = undefined;
       fsyncDirSync(dirname(this.filePath));
     } catch (error) {
       console.error(`Agent Remote bridge: failed to rewrite ${this.filePath}`, error);

@@ -65,4 +65,19 @@ describe("protocol samples validate against the JSON Schemas", () => {
     const broken = { ...approvalAccept, payload: { text: "hello" } };
     expect(validateCommand(broken)).toBe(false);
   });
+
+  test("a sample event carrying the envelope-level projectId is valid", () => {
+    const withProjectId: AgentEventEnvelope<"approval.requested"> = {
+      ...approvalRequested,
+      projectId: "prj_01",
+    };
+    const valid = validateEvent(withProjectId);
+    expect(validateEvent.errors ?? []).toEqual([]);
+    expect(valid).toBe(true);
+  });
+
+  test("an event whose projectId is not a non-empty string is rejected", () => {
+    const broken = { ...approvalRequested, projectId: "" };
+    expect(validateEvent(broken)).toBe(false);
+  });
 });

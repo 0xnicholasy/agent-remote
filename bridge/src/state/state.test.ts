@@ -136,6 +136,139 @@ describe("JsonlJournal", () => {
     journal.append({ a: 3 });
     expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 3 }]);
   });
+
+  test("a failed rollback truncate leaves a torn fragment that the next append repairs instead of merging onto", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    journal.append({ a: 1 });
+
+    const realWriteSync = fs.writeSync.bind(fs);
+    const partialThenFail: (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset?: number | null,
+      length?: number | null,
+      position?: number | null,
+    ) => number = (fd, buffer, offset, length, position) => {
+      realWriteSync(fd, buffer, offset as number, Math.min(4, length as number), position ?? undefined);
+      const error = new Error("ENOSPC: no space left on device, write") as NodeJS.ErrnoException;
+      error.code = "ENOSPC";
+      throw error;
+    };
+    const writeSpy = spyOn(fs, "writeSync").mockImplementation(partialThenFail as typeof fs.writeSync);
+    const truncateSpy = spyOn(fs, "ftruncateSync").mockImplementation(() => {
+      const error = new Error("EIO: i/o error, ftruncate") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    });
+
+    try {
+      // The write fails AND the rollback truncate that would normally undo it also fails, so the
+      // torn fragment of record 2 stays on disk.
+      expect(() => journal.append({ a: 2 })).toThrow("ENOSPC");
+    } finally {
+      writeSpy.mockRestore();
+      truncateSpy.mockRestore();
+    }
+
+    const tornContent = readFileSync(filePath, "utf8");
+    expect(tornContent).toBe('{"a":1}\n{"a"');
+
+    // Without the repair, this append would land right after the torn fragment with no
+    // separating newline, merging into one corrupt line and losing both records on reload.
+    journal.append({ a: 3 });
+    expect(readFileSync(filePath, "utf8")).toBe('{"a":1}\n{"a":3}\n');
+    expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 3 }]);
+  });
+
+  test("while the rollback truncate keeps failing, a further append fails without merging onto the torn fragment", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    journal.append({ a: 1 });
+
+    const realWriteSync = fs.writeSync.bind(fs);
+    const partialThenFail: (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset?: number | null,
+      length?: number | null,
+      position?: number | null,
+    ) => number = (fd, buffer, offset, length, position) => {
+      realWriteSync(fd, buffer, offset as number, Math.min(4, length as number), position ?? undefined);
+      const error = new Error("ENOSPC: no space left on device, write") as NodeJS.ErrnoException;
+      error.code = "ENOSPC";
+      throw error;
+    };
+    const eioTruncate = () => {
+      const error = new Error("EIO: i/o error, ftruncate") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    };
+    const writeSpy = spyOn(fs, "writeSync").mockImplementation(partialThenFail as typeof fs.writeSync);
+    const truncateSpy = spyOn(fs, "ftruncateSync").mockImplementation(eioTruncate);
+
+    try {
+      expect(() => journal.append({ a: 2 })).toThrow("ENOSPC");
+      const tornContent = readFileSync(filePath, "utf8");
+
+      // The rollback truncate is still broken, so the repair attempt on this next append also
+      // fails; the file must stay byte-identical to the torn state, not gain a merged line.
+      expect(() => journal.append({ a: 3 })).toThrow();
+      expect(readFileSync(filePath, "utf8")).toBe(tornContent);
+    } finally {
+      writeSpy.mockRestore();
+      truncateSpy.mockRestore();
+    }
+  });
+
+  test("a rewrite whose rename lands but whose directory fsync fails still clears a pending torn-tail repair", () => {
+    const filePath = join(stateDir, "journal.jsonl");
+    const journal = new JsonlJournal<{ a: number }>(filePath);
+    journal.append({ a: 1 });
+
+    const realWriteSync = fs.writeSync.bind(fs);
+    const partialThenFail: (fd: number, buffer: NodeJS.ArrayBufferView) => number = (fd, buffer) => {
+      realWriteSync(fd, buffer, 0, 4);
+      const error = new Error("ENOSPC: no space left on device, write") as NodeJS.ErrnoException;
+      error.code = "ENOSPC";
+      throw error;
+    };
+    const writeSpy = spyOn(fs, "writeSync").mockImplementation(partialThenFail as typeof fs.writeSync);
+    const truncateSpy = spyOn(fs, "ftruncateSync").mockImplementation(() => {
+      const error = new Error("EIO: i/o error, ftruncate") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    });
+    try {
+      expect(() => journal.append({ a: 2 })).toThrow("ENOSPC");
+    } finally {
+      writeSpy.mockRestore();
+      truncateSpy.mockRestore();
+    }
+
+    // The rewrite's own directory fsync (inside the atomic write) succeeds; the journal's
+    // trailing one fails after the rename has already replaced the torn file.
+    const realOpenSync = fs.openSync.bind(fs);
+    let dirOpens = 0;
+    const openSpy = spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, flags?: fs.OpenMode) => {
+      if (path === stateDir && ++dirOpens === 2) {
+        const error = new Error("EIO: i/o error, open") as NodeJS.ErrnoException;
+        error.code = "EIO";
+        throw error;
+      }
+      return realOpenSync(path, flags ?? "r");
+    }) as typeof fs.openSync);
+    try {
+      expect(() => journal.rewrite([{ a: 1 }, { a: 5 }, { a: 6 }])).toThrow("EIO");
+    } finally {
+      openSpy.mockRestore();
+    }
+    expect(readFileSync(filePath, "utf8")).toBe('{"a":1}\n{"a":5}\n{"a":6}\n');
+
+    // A stale repair offset would truncate the rewritten file back to the torn boundary here.
+    journal.append({ a: 7 });
+    expect(new JsonlJournal<{ a: number }>(filePath).load()).toEqual([{ a: 1 }, { a: 5 }, { a: 6 }, { a: 7 }]);
+  });
 });
 
 describe("EventLog", () => {
