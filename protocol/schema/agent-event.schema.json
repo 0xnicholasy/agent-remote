@@ -14,6 +14,11 @@
       "type": "string",
       "minLength": 1
     },
+    "projectId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project the event belongs to, stamped at emit time and used to authorize the event itself. Absent on events persisted before the field existed."
+    },
     "provider": {
       "type": "string",
       "minLength": 1,

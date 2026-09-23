@@ -38,8 +38,13 @@ across a crash rather than only across a graceful shutdown; a nonce accepted imm
 power loss must not become replayable afterwards.
 
 A journal write that fails (full disk, read-only state dir) is reported to the console and
-swallowed. Appends happen inside event emission, outside any route's error handling, so throwing
-would turn a durability failure into an availability failure.
+rethrown, so no caller believes an unpersisted record reached durable storage; each caller decides
+what that means for it, and an event that could not be persisted is not reported as delivered. If
+the write failed partway through the record, the file is truncated back to the size it had before
+the append, which is a record boundary: a fragment left behind would otherwise merge with the next
+append and cost both records rather than one. Compaction is the exception — a failed rewrite is
+reported and swallowed, because the in-memory state is unaffected and every record is still in the
+file it was appended to.
 
 Two bounds keep the files finite. Retention drops records past their window, and a size cap drops
 the oldest beyond it: 2000 events, 5000 command ids, 10,000 nonces per device. Each journal
@@ -114,32 +119,43 @@ Events are appended to `events.jsonl` as they are emitted and reloaded on startu
 All three fields are optional in the protocol types, so an older client that ignores them keeps
 working exactly as before.
 
-## Session bindings
+## Event project stamps and session bindings
 
-Providers hold sessions in memory, so after a restart `listSessions()` no longer knows the project
-of a session that retained events still refer to. `sessions.jsonl` records the session-to-project
-binding when a session is seeded or created, and `GET /v1/events` consults it when the provider
-cannot answer. The first binding wins: a later attempt to rebind a session to a different project
-is reported and ignored, because it would silently re-scope every retained event of that session. Without it, a device narrowed to a project would fail the authorization check on
-its own retained events and reconnect to an empty history. Live sessions still take precedence;
-the index only fills gaps, and an event whose project cannot be resolved either way is still
-dropped for a narrowed device rather than shown.
+Every event carries the project it was emitted under, in the optional `projectId` field of
+`AgentEvent`. `GET /v1/events` authorizes an event against that stamp, not against whatever
+project its session is bound to at read time. The stamp is decided once, when the event is
+emitted, from the binding the running bridge holds for that session: `session.started` supplies it
+from its own payload, `session.create` records it from the session the provider returned, and the
+seeded session is bound at startup.
+
+This is what makes retained events safe when a session id is handed out again. A provider that
+reuses a session id for a different project rebinds it for new events only; events already emitted
+keep the project they were emitted under, so reusing an id can neither expose an earlier project's
+events to a device narrowed to the new one, nor hide them from a device that may read the old one.
+
+`sessions.jsonl` records the session-to-project binding when a session is seeded or created and
+survives restarts. It has two jobs now:
+
+- It authorizes events persisted before the stamp existed. Such an event has no `projectId`, so
+  the read path falls back to the live provider, then to this index. That keeps an upgrade from
+  blanking out the history a paired device already had.
+- The first binding wins: a later attempt to rebind a session to a different project is reported
+  and ignored, because for an unstamped event it would silently re-scope everything retained under
+  that session id.
+
+An event that cannot be resolved to a project either way is dropped for a project-narrowed device
+rather than shown.
 
 **Known limits.**
 
-- If a session id is live under a project that differs from its recorded binding, the disagreement
-  is not resolved in the live session's favor: none of that session id's events are served until
-  the recorded binding ages out of `sessions.jsonl` (24 hours). Provider session ids are unique per
-  process now, so this is reachable mainly through the fixed `ses_seed` session id, whose bound
-  project changes only when the first entry of `AGENTREMOTE_PROJECT_DIRS` changes across a restart.
-- A session id rebound from one project to another and back, across a loss of `sessions.jsonl`,
-  can re-authorize the intervening project's retained events to a device scoped only to the
-  original project: nothing in the event log itself records which project was current when an
-  event was written, so authorization only ever checks a session id against whichever project is
-  currently bound. Closing this requires recording the project on each persisted event so an event
-  is authorized against its own record rather than against the session's current binding; that is
-  a protocol change planned as follow-up work, and it must land before any device-narrowing
-  feature.
+- Unstamped (pre-upgrade) events keep the old behavior in full: a session id live under a project
+  that differs from its recorded binding has all of its unstamped events withheld until the
+  recorded binding ages out of `sessions.jsonl` (24 hours), and a rebind across a loss of
+  `sessions.jsonl` can re-authorize them to the wrong narrowed device. Both limits disappear as
+  the unstamped events age out of the 24 hour retention window.
+- The stamp is only as good as the binding the emitting process holds. A provider that emits
+  events for a session it never announced through `session.started` or `session.create` produces
+  unstamped events, which a project-narrowed device does not see.
 
 ## What this does not cover
 

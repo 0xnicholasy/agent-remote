@@ -290,6 +290,9 @@ public enum AgentEventPayload: Hashable, Sendable {
 public struct AgentEvent: Codable, Hashable, Sendable {
     public var eventId: Int
     public var sessionId: String
+    /// Project the event belongs to, stamped by the bridge at emit time. Nil on events the
+    /// bridge persisted before it carried the field.
+    public var projectId: String?
     public var provider: String
     public var timestamp: String
     public var payload: AgentEventPayload
@@ -297,24 +300,26 @@ public struct AgentEvent: Codable, Hashable, Sendable {
     public var type: AgentEventType { payload.type }
 
     public init(
-        eventId: Int, sessionId: String, provider: String, timestamp: String,
-        payload: AgentEventPayload
+        eventId: Int, sessionId: String, projectId: String? = nil, provider: String,
+        timestamp: String, payload: AgentEventPayload
     ) {
         self.eventId = eventId
         self.sessionId = sessionId
+        self.projectId = projectId
         self.provider = provider
         self.timestamp = timestamp
         self.payload = payload
     }
 
     private enum CodingKeys: String, CodingKey {
-        case eventId, sessionId, provider, type, timestamp, payload
+        case eventId, sessionId, projectId, provider, type, timestamp, payload
     }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         eventId = try container.decode(Int.self, forKey: .eventId)
         sessionId = try container.decode(String.self, forKey: .sessionId)
+        projectId = try container.decodeIfPresent(String.self, forKey: .projectId)
         provider = try container.decode(String.self, forKey: .provider)
         timestamp = try container.decode(String.self, forKey: .timestamp)
 
@@ -361,6 +366,7 @@ public struct AgentEvent: Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(eventId, forKey: .eventId)
         try container.encode(sessionId, forKey: .sessionId)
+        try container.encodeIfPresent(projectId, forKey: .projectId)
         try container.encode(provider, forKey: .provider)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(type, forKey: .type)
