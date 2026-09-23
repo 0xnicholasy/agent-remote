@@ -577,6 +577,9 @@ export class ClaudeProvider implements AgentProvider {
     void this.pumpMessages(sessionId, queryHandle).catch((error: unknown) => {
       console.error(`[claude] message pump for session ${sessionId} failed unexpectedly:`, error);
       this.abandonConversation(sessionId, "pumpMessages");
+      // The pump's own `finally` has already run by the time this handler does, so clear the
+      // marker here too rather than leaving the entry behind with no reader.
+      this.abandoned.delete(sessionId);
     });
   }
 
@@ -726,11 +729,14 @@ export class ClaudeProvider implements AgentProvider {
    * disposed) rather than continuing to run against a client that is no longer being told
    * anything. Idempotent, and a no-op for a conversation already tearing down. */
   private abandonConversation(sessionId: string, type: string): void {
-    this.abandoned.add(sessionId);
     const conversation = this.conversations.get(sessionId);
     if (conversation === undefined || conversation.terminal) {
       return;
     }
+    // Marked only once the call has decided to tear this conversation down. Marking before the
+    // guard above left an entry behind on every no-op call (a second emit failure, an abandon
+    // from a conversation already terminating), and only `pumpMessages` ever clears it.
+    this.abandoned.add(sessionId);
     conversation.terminal = true;
     conversation.turnInProgress = false;
     conversation.pendingAssistantMessage = undefined;
@@ -754,10 +760,16 @@ export class ClaudeProvider implements AgentProvider {
     this.conversations.delete(sessionId);
     this.sessions.delete(sessionId);
     // Detached on purpose: this runs from contexts with nobody to await it. Disposal failures are
-    // already non-fatal everywhere else in this file.
-    void Promise.resolve(conversation.queryHandle.return(undefined)).catch((error: unknown) => {
-      console.error(`[claude] queryHandle.return failed while abandoning session ${sessionId}:`, error);
-    });
+    // already non-fatal everywhere else in this file. The `try` covers a *synchronous* throw from
+    // `.return()`, which `.catch` would not: this function runs from the expiry timer and the
+    // abort listener, where an escaping throw is an uncaught exception, not a rejection.
+    try {
+      void Promise.resolve(conversation.queryHandle.return(undefined)).catch((error: unknown) => {
+        console.error(`[claude] queryHandle.return failed while abandoning session ${sessionId}:`, error);
+      });
+    } catch (error) {
+      console.error(`[claude] queryHandle.return threw while abandoning session ${sessionId}:`, error);
+    }
   }
 
   private async pumpMessages(sessionId: string, queryHandle: Query): Promise<void> {
@@ -829,6 +841,12 @@ export class ClaudeProvider implements AgentProvider {
         });
       });
       await this.terminateConversation(sessionId, conversation, "error");
+    } finally {
+      // The pump is the only reader of this marker, so once it is gone the entry has no purpose.
+      // Without this, an abandon that happens after the loop has exited (the pump's own catch
+      // backstop, the expiry timer, the abort listener) leaves one entry per failed session for
+      // the life of the process.
+      this.abandoned.delete(sessionId);
     }
   }
 
@@ -1192,7 +1210,12 @@ export class ClaudeProvider implements AgentProvider {
       // the timer firing and this call can never double-resolve `pending`.
       clearTimeout(pending.expiryTimer);
       conversation.pendingApproval = undefined;
-      this.host.emit(sessionId, "approval.resolved", { approvalId: binding.approvalId, decision: "expired" });
+      // Through `safeEmit`, and resolved either way: the timer is already cleared and the pending
+      // detached, so an emit that throws here would otherwise leave the SDK's `canUseTool`
+      // promise unsettled forever, hanging the subprocess behind the interaction lock.
+      this.safeEmit(sessionId, "approval.resolved", () => {
+        this.host.emit(sessionId, "approval.resolved", { approvalId: binding.approvalId, decision: "expired" });
+      });
       pending.resolve({ behavior: "deny", message: "approval expired" });
       throw new ApprovalBindingMismatchError(`approval ${binding.approvalId} expired`);
     }

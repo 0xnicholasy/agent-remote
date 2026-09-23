@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import {
   ApprovalBindingMismatchError,
   digest,
@@ -450,6 +450,43 @@ describe("ClaudeProvider", () => {
     // fail rather than double-resolving the same interaction.
     await expectApproveRefused(provider.approve(session.id, binding));
     expect(events.filter((event) => event.type === "approval.resolved")).toHaveLength(1);
+  });
+
+  test("a decision on an already-expired approval settles the SDK call even if its event cannot be persisted", async () => {
+    let toolResult: PermissionResult | null = null;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        toolResult = await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    // `approval.resolved` cannot be persisted, and the clock is moved past `expiresAt` while the
+    // auto-expiry timer (armed for a full minute) has not fired, so `approve()` takes the expired
+    // branch itself. The emit failure there must not strand `canUseTool`: the timer is already
+    // cleared and the pending already detached, so nothing else would ever settle it.
+    const { host, events } = createFailingHost(["approval.resolved"]);
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      approvalTtlMs: 60_000,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    const binding = bindingOf(events);
+
+    setSystemTime(new Date(Date.now() + 120_000));
+    try {
+      await expectApproveRefused(provider.approve(session.id, binding));
+      await delay();
+      expect(toolResult).toMatchObject({ behavior: "deny" });
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("C1-003: a Bash approval is emitted with kind \"command\"", async () => {
