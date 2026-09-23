@@ -4,10 +4,10 @@ Updated 2026-09-20.
 
 Each record states the context that forced a decision, the decision itself, and the
 consequences we are accepting. The four earliest records remain Proposed while their evidence
-gates are open; ADR 008 is accepted for v0 because its evidence is the implementation and its
-tests rather than a device experiment. Acceptance does not require waiting for a shipped
+gates are open; ADR 008 and ADR 009 are accepted for v0 because their evidence is the
+implementation and its tests rather than a device experiment. Acceptance does not require waiting for a shipped
 release: it requires the relevant experiment or implementation evidence, the resulting decision
-to be recorded, and a reviewer to confirm that the record matches that evidence. Three further records are planned
+to be recorded, and a reviewer to confirm that the record matches that evidence. ADR 005, 006 and 007 are planned
 and not yet written; their rows reserve the numbers and expose the open decisions.
 
 | ADR | Title | Status |
@@ -20,6 +20,7 @@ and not yet written; their rows reserve the numbers and expose the open decision
 | 006 | MVP client: Watch-first versus iPhone-first | Planned, not written |
 | 007 | Approval delivery when the Watch is asleep; voice output while backgrounded | Planned, not written |
 | [008](008-pairing-and-wire-envelope.md) | Pairing and the authenticated wire envelope | Accepted for v0 |
+| [009](009-durable-bridge-state.md) | Durable bridge state as append-only JSON Lines journals | Accepted for v0 |
 
 ## Acceptance evidence for proposed records
 

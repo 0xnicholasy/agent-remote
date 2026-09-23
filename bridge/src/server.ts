@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import Ajv2020 from "ajv/dist/2020";
@@ -33,6 +33,10 @@ import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "
 import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { atomicWriteFileSync } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
+import { CommandJournal } from "./state/commands";
+import { EventLog } from "./state/event-log";
+import { createNonceJournal } from "./state/nonces";
+import { SessionIndex } from "./state/sessions";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv);
@@ -69,6 +73,10 @@ export interface Bridge {
   readonly pairingCode: string;
   /** ISO timestamp the minted `pairingCode` expires at. */
   readonly pairingCodeExpiresAt: string;
+  /** Releases the single-writer lock (see the "Single-writer lock" comment in `createBridge`)
+   * so the same state dir can be reopened, e.g. by a test's `restart()` helper or a graceful
+   * shutdown. Idempotent; safe to call when there was no state dir to lock. */
+  close(): void;
 }
 
 /** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
@@ -177,52 +185,145 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
   const devicesFilePath = options.devicesFilePath ?? path.join(resolveStateDir(), "devices.json");
   const registry = options.registry ?? DeviceRegistry.load(devicesFilePath);
-  const nonces = new NonceCache();
   const SKEW_MS = 120_000; // 120 seconds in either direction, per docs/pairing-v0.md.
+
+  // Durable bridge state lives next to the device registry, per docs/durability-v0.md. The same
+  // guard the bridge id and pairing code use applies: an injected in-memory registry with no
+  // explicit devices path has no state dir to write into, so every journal stays in memory.
+  const stateDirPath =
+    options.registry !== undefined && options.devicesFilePath === undefined
+      ? undefined
+      : path.dirname(devicesFilePath);
+  const journalPath = (name: string): string | undefined =>
+    stateDirPath === undefined ? undefined : path.join(stateDirPath, name);
+
+  // Single-writer lock: two bridges pointed at the same state dir would otherwise race on the
+  // nonce/command/event journals and hand out duplicate event ids before EADDRINUSE ever fires
+  // (docs/durability-v0.md). Only enforced when there is a real state dir to protect; an
+  // injected in-memory registry (tests) has nothing to lock.
+  let releaseLock: (() => void) | undefined;
+  if (stateDirPath !== undefined) {
+    const lockPath = path.join(stateDirPath, "bridge.lock");
+    // The lock is the first thing written into the state dir, so on a fresh install the dir does
+    // not exist yet and an exclusive create would fail ENOENT and refuse startup. Created with
+    // the same 0700 mode atomicWriteFileSync uses for every other file under this dir.
+    mkdirSync(stateDirPath, { recursive: true, mode: 0o700 });
+    try {
+      writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      const holderPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+      let holderAlive = false;
+      if (Number.isFinite(holderPid)) {
+        try {
+          process.kill(holderPid, 0);
+          holderAlive = true;
+        } catch {
+          holderAlive = false;
+        }
+      }
+      if (holderAlive) {
+        throw new Error(
+          `Another Agent Remote bridge (pid ${holderPid}) already holds the lock at ${lockPath}. ` +
+            "Stop that process before starting a new one against the same state directory.",
+        );
+      }
+      // Lock left behind by a process that died without cleaning up: take it over. Two
+      // processes can observe the same stale lock at the same instant, so the takeover must
+      // decide a single winner instead of both overwriting the file:
+      //   1. rename() the stale lock out of the way. rename is atomic and consumes the name, so
+      //      exactly one of the two renames can see the stale file; the loser gets ENOENT and
+      //      refuses to boot rather than becoming a second writer.
+      //   2. The winner may still have renamed away a lock the other process had *already*
+      //      re-created (it got through step 1 and step 3 first), so the claimed file's content
+      //      is checked against the stale pid we probed. A different pid means we took someone
+      //      else's live lock: it is put back and this process refuses to boot.
+      //   3. Re-create the lock with the exclusive `wx` flag, never a plain overwrite, so a
+      //      third process that slipped in between wins and this one refuses (EEXIST).
+      const claimPath = `${lockPath}.claim.${process.pid}.${randomBytes(4).toString("hex")}`;
+      try {
+        renameSync(lockPath, claimPath);
+      } catch {
+        throw new Error(
+          `Another Agent Remote bridge took over the stale lock at ${lockPath} first. ` +
+            "Retry once that process has settled.",
+        );
+      }
+      const claimedPid = readFileSync(claimPath, "utf8").trim();
+      if (claimedPid !== String(holderPid)) {
+        // Not the stale lock we probed: restore it and leave the winner holding it.
+        try {
+          renameSync(claimPath, lockPath);
+        } catch {
+          // ignore: the winner has already re-created its own lock under that name.
+        }
+        throw new Error(
+          `Another Agent Remote bridge (pid ${claimedPid}) claimed the lock at ${lockPath} ` +
+            "while this one was taking it over. Stop that process before starting a new one " +
+            "against the same state directory.",
+        );
+      }
+      unlinkSync(claimPath);
+      try {
+        writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      } catch (takeoverError) {
+        if ((takeoverError as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw takeoverError;
+        }
+        throw new Error(
+          `Another Agent Remote bridge acquired the lock at ${lockPath} during takeover. ` +
+            "Stop that process before starting a new one against the same state directory.",
+        );
+      }
+    }
+    let lockReleased = false;
+    releaseLock = (): void => {
+      if (lockReleased) {
+        return;
+      }
+      lockReleased = true;
+      // Best effort: on process exit a failed unlink cannot be reported anywhere useful, and on
+      // an explicit close() a stale lock is still recovered by the liveness probe above.
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // ignore
+      }
+    };
+    process.on("exit", releaseLock);
+  }
+
+  const nonces = new NonceCache({ journal: createNonceJournal(journalPath("nonces.jsonl")), now: now() });
 
   // An injected in-memory registry with no explicit devices path has nowhere durable to keep a
   // bridge id either, so it mints a fresh one every call; a real path (explicit or default)
   // persists it next to the registry.
-  const bridgeIdFilePath =
-    options.registry !== undefined && options.devicesFilePath === undefined
-      ? undefined
-      : path.join(path.dirname(devicesFilePath), "bridge-id.json");
+  const bridgeIdFilePath = journalPath("bridge-id.json");
   const bridgeId = loadOrCreateBridgeId(bridgeIdFilePath);
 
   // Mirrors the bridgeIdFilePath guard just above: an injected in-memory registry with no
   // explicit devices path has no durable state dir to persist into either, so the pairing code
   // stays in-memory only (as it always has) rather than writing into the real ~/.agentremote.
-  const pairingCodeFilePath =
-    options.pairingCodeFilePath ??
-    (options.registry !== undefined && options.devicesFilePath === undefined
-      ? undefined
-      : path.join(path.dirname(devicesFilePath), "pairing.json"));
+  const pairingCodeFilePath = options.pairingCodeFilePath ?? journalPath("pairing.json");
   const pairingCodeStore = new PairingCodeStore(pairingCodeFilePath);
   const pairingMintedAt = now();
   const pairingCode = pairingCodeStore.mint(pairingMintedAt);
   const PAIRING_TTL_MS = 5 * 60 * 1000; // 5 minutes, per docs/pairing-v0.md.
   const pairingCodeExpiresAt = new Date(pairingMintedAt.getTime() + PAIRING_TTL_MS).toISOString();
 
-  const log: AgentEvent[] = [];
+  // The event log and the command journal are both durable (docs/durability-v0.md): a client
+  // reconnecting after a bridge restart resolves its cursor against retained events, and a retry
+  // of a command the previous process already applied still gets that command's recorded answer.
+  const eventLog = new EventLog(journalPath("events.jsonl"), { now: now() });
+  const sessionIndex = new SessionIndex(journalPath("sessions.jsonl"), { now: now() });
+  const commands = new CommandJournal(journalPath("commands.jsonl"), { now: now() });
+
   const waiters = new Set<() => void>();
-  const processed = new Map<string, CommandResponse>();
   // Reserves a command id for the duration of its execution, so two retries that arrive at
-  // the same time cannot both pass the `processed` check and run the command twice.
+  // the same time cannot both pass the journal check and run the command twice.
   const inFlight = new Set<string>();
-  // Tracks, per commandId, which device sent it and the SHA-256 of the exact body it sent, per
-  // the "Request identity" rule: a repeat with a different digest or device is a conflict, not
-  // a replay, even before the command finishes executing.
-  // Bounded by COMMAND_IDENTITY_TTL_MS below (see that constant's comment for why the bound is
-  // safe): without a bound this map grows once per distinct commandId for the process lifetime.
-  const commandIdentities = new Map<string, { deviceId: string | undefined; digest: string; expiresAt: number }>();
-  // Matches NONCE_TTL_MS in auth/verify.ts: the nonce cache already only guards a replayed
-  // envelope for 300s, so evicting a commandId identity sooner would let a body that has already
-  // fallen out of scope of that guard collide with a reused commandId while still looking "new"
-  // here. Keeping this window the same length as the nonce TTL means an entry can only expire
-  // here once the signature layer has already stopped treating its nonce as fresh, so eviction
-  // never opens a replay window the auth layer wasn't already exposed to.
-  const COMMAND_IDENTITY_TTL_MS = 300_000;
-  let nextEventId = 1;
   // Set once the provider instance exists (below); host.emit reads it lazily so an event's
   // `provider` tag always reflects what actually constructed/ran the session (provider.id),
   // never the raw env string, and so it can never diverge from session.provider.
@@ -245,19 +346,44 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       // TypeScript cannot verify that while T is still an unresolved type parameter, so the
       // envelope is asserted once here instead of weakening the public types.
       const event = {
-        eventId: nextEventId++,
+        eventId: eventLog.takeEventId(),
         sessionId,
         provider: emittedProviderId,
         type,
         timestamp: new Date().toISOString(),
         payload,
       } as AgentEventEnvelope<T> as AgentEvent;
-      log.push(event);
+      try {
+        eventLog.append(event);
+      } catch (error) {
+        // journal.ts now throws on a real fs failure instead of swallowing it. An event that
+        // could not be persisted must not be reported as delivered (durability contract), but a
+        // single append failure also must not take down the whole bridge process, so it is
+        // surfaced loudly here and then the request path continues to fail below.
+        console.error(
+          `Failed to persist event ${event.eventId} (session ${sessionId}, type ${type}) to the event log:`,
+          error,
+        );
+        throw error;
+      }
+      if (type === "session.started") {
+        try {
+          sessionIndex.record(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, now());
+        } catch (error) {
+          // The event itself is already durably appended above; this binding only backs the
+          // per-device project filter for retained events after a restart, so a failure here must
+          // not undo the emit or crash the caller — it is logged loudly instead of buried.
+          console.error(
+            `Failed to durably record project binding for session ${sessionId} (event ${event.eventId}):`,
+            error,
+          );
+        }
+      }
       wake();
       return event;
     },
     eventsAfter(after: number): AgentEvent[] {
-      return log.filter((event) => event.eventId > after);
+      return eventLog.after(after);
     },
     waitForChange(timeoutMs: number): Promise<void> {
       return new Promise((resolve) => {
@@ -317,6 +443,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     title: "demo",
   };
   provider.seedSession(session);
+  try {
+    sessionIndex.record(session.id, session.projectId, now());
+  } catch (error) {
+    // Same rationale as the emit-path guard above: the seeded session itself already exists in
+    // the provider, so a failure here must not crash startup, only be surfaced loudly.
+    console.error(`Failed to durably record project binding for seeded session ${session.id}:`, error);
+  }
 
   /** Runs one command. Returns the new session id when the command created a session. */
   async function execute(command: Command): Promise<string | undefined> {
@@ -450,38 +583,34 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ error: "decision_expired" }, 410);
     }
 
-    // 5. Request identity. commandId stays the idempotency key; the bridge also stores the
-    // SHA-256 of the exact command body and the issuing device with it. A repeat with a
-    // different digest or from a different device is a conflict, not a replay, and must not
-    // execute.
+    // 5. Request identity and idempotency, now durable (docs/durability-v0.md). commandId stays
+    // the idempotency key; the journal stores the SHA-256 of the exact body and the issuing
+    // device with it, and survives a restart. A repeat with a different digest or from a
+    // different device is a conflict, not a replay, and must not execute.
     const bodyDigest = createHash("sha256").update(rawBody).digest("hex");
-    const nowMs = now().getTime();
-    // Insertion order == expiry order here, same reasoning as NonceCache.pruneExpired in
-    // auth/verify.ts: every entry gets the same fixed TTL, so the oldest inserted entry is always
-    // the first to expire as long as the clock does not go backwards.
-    for (const [key, entry] of commandIdentities) {
-      if (entry.expiresAt > nowMs) {
-        break;
-      }
-      commandIdentities.delete(key);
-    }
-    const identity = commandIdentities.get(command.commandId);
-    if (identity !== undefined) {
-      if (identity.digest !== bodyDigest || identity.deviceId !== device?.deviceId) {
+    const deviceId = device?.deviceId ?? null;
+    commands.prune(now());
+
+    const entry = commands.get(command.commandId);
+    if (entry !== undefined) {
+      if (entry.digest !== bodyDigest || entry.deviceId !== deviceId) {
         return json({ error: "command_id_conflict" }, 409);
       }
-    } else {
-      commandIdentities.set(command.commandId, {
-        deviceId: device?.deviceId,
-        digest: bodyDigest,
-        expiresAt: nowMs + COMMAND_IDENTITY_TTL_MS,
-      });
+      if (entry.status === "completed" && entry.response !== undefined) {
+        return json({ ...entry.response, duplicate: true } satisfies CommandResponse);
+      }
+      // Whether the provider applied this command is unknown: either the previous process died
+      // mid-execution (`indeterminate` on load), or this process threw an unmapped error out of
+      // `execute` and the entry is still `in_flight` with nothing executing it. Replaying it
+      // could apply a decision twice; the client is told to reconcile against the event log
+      // instead of being handed a made-up answer.
+      if (entry.status === "indeterminate" || (entry.status === "in_flight" && !inFlight.has(command.commandId))) {
+        return json({ error: "command_indeterminate", commandId: command.commandId }, 409);
+      }
+      // "abandoned" means the provider refused it without applying anything, so the same
+      // command id may be retried and falls through to execution below.
     }
 
-    const previous = processed.get(command.commandId);
-    if (previous !== undefined) {
-      return json({ ...previous, duplicate: true } satisfies CommandResponse);
-    }
     if (inFlight.has(command.commandId)) {
       return json(
         { accepted: false, commandId: command.commandId, duplicate: true } satisfies CommandResponse,
@@ -489,6 +618,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     }
 
     inFlight.add(command.commandId);
+    try {
+      commands.begin(command.commandId, deviceId, bodyDigest, now());
+    } catch (error) {
+      // begin runs BEFORE the provider call: without a durable in_flight record, a client retry
+      // after a crash could re-execute this command, so a failure here must abort before
+      // execution rather than proceed and only warn.
+      inFlight.delete(command.commandId);
+      console.error(`Failed to durably record command ${command.commandId} as in_flight before execution:`, error);
+      return json({ error: "command_journal_unavailable" }, 503);
+    }
     let createdSessionId: string | undefined;
     try {
       createdSessionId = await execute(command);
@@ -496,8 +635,19 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       inFlight.delete(command.commandId);
       const mapped = mapProviderError(error);
       if (mapped !== undefined) {
+        // A mapped provider error is a refusal before anything was applied, so the command id is
+        // released for a retry rather than left looking indeterminate after a restart. The
+        // refusal already happened, so it is reported either way; a failure to record it durably
+        // is only logged, since silently dropping a real 409/404/429 response would be worse.
+        try {
+          commands.abandon(command.commandId, now());
+        } catch (abandonError) {
+          console.error(`Failed to durably record command ${command.commandId} as abandoned:`, abandonError);
+        }
         return mapped;
       }
+      // An unmapped throw is exactly the indeterminate case: the entry stays `in_flight`, and a
+      // later process reading the journal will treat it as indeterminate.
       throw error;
     }
 
@@ -507,8 +657,20 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       duplicate: false,
       ...(createdSessionId === undefined ? {} : { sessionId: createdSessionId }),
     };
-    processed.set(command.commandId, response);
-    inFlight.delete(command.commandId);
+    // The provider already applied this command, so `response` is reported either way; a
+    // failure to durably record the outcome (or the session's project binding) below is only
+    // logged, never converted into a failure response for work that already succeeded, and
+    // `inFlight` must still be released regardless so a retry is not stuck as a false duplicate.
+    try {
+      commands.complete(command.commandId, response, now());
+      if (createdSessionId !== undefined && command.type === "session.create") {
+        sessionIndex.record(createdSessionId, command.payload.projectId, now());
+      }
+    } catch (error) {
+      console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
+    } finally {
+      inFlight.delete(command.commandId);
+    }
     return json(response);
   }
 
@@ -597,19 +759,37 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     // all belong to a filtered-out project would see an empty page with a cursor that never
     // moves, and would re-poll the same "after" value forever. Reporting the true global max
     // lets its next request's `after` skip straight past those filtered events instead.
-    const last = log.at(-1);
+    const lastEventId = eventLog.lastEventId;
     if (device !== undefined) {
       // AGENTREMOTE_AUTH=off has no device, so nothing is filtered (today's behavior). A newly
       // paired device is granted every project, so this is a no-op until a project is narrowed.
       const projectOf = new Map((await provider.listSessions()).map((session) => [session.id, session.projectId]));
       events = events.filter((event) => {
-        const projectId = projectOf.get(event.sessionId);
+        // Live sessions first; the persisted index answers for a session the provider forgot
+        // across a restart, which is the only way a retained event stays authorizable.
+        const projectId = projectOf.get(event.sessionId) ?? sessionIndex.projectOf(event.sessionId);
+        // The index's binding is first-bind-wins and immutable (SessionIndex.record), so it is
+        // the authoritative project for every event ever emitted under this sessionId. If the
+        // live provider now reports a different project for the same id (the id was reused, or
+        // reassigned), that disagreement means these retained events belong to a project the
+        // requesting device may not be authorized for even though the live session is: fail
+        // closed and drop them rather than trusting the live value for old events.
+        const recordedProjectId = sessionIndex.projectOf(event.sessionId);
+        if (recordedProjectId !== undefined && projectId !== recordedProjectId) {
+          return false;
+        }
         // Fail closed: an event whose session cannot be resolved to a project is dropped for a
         // narrowed device rather than shown, since there is no allowedProjects check to pass.
         return projectId !== undefined && device.allowedProjects.includes(projectId);
       });
     }
-    return json({ events, lastEventId: last?.eventId ?? 0 } satisfies EventsResponse);
+    // `firstEventId` and `truncated` are how a reconnecting client learns its cursor points
+    // below the retained window (docs/durability-v0.md): polling can never recover those events,
+    // so the client must resync from the page it is given instead of assuming continuity.
+    const firstEventId = eventLog.firstEventId;
+    const floor = firstEventId > 0 ? firstEventId : eventLog.nextEventId;
+    const truncated = cursor < floor - 1;
+    return json({ events, lastEventId, firstEventId, truncated, bridgeId } satisfies EventsResponse);
   }
 
   return {
@@ -618,6 +798,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     bridgeId,
     pairingCode,
     pairingCodeExpiresAt,
+    close(): void {
+      releaseLock?.();
+    },
     async fetch(request: Request): Promise<Response> {
       // Catch-all around the whole route table: mapProviderError only translates the protocol's
       // known error classes, so anything else thrown by a provider or by route logic itself
@@ -645,16 +828,27 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
         let device: DeviceRecord | undefined;
         if (authEnabled) {
-          const result = verifyEnvelope({
-            headers: request.headers,
-            method: request.method,
-            pathWithQuery: url.pathname + url.search,
-            rawBody,
-            registry,
-            nonces,
-            now: now(),
-            skewMs: SKEW_MS,
-          });
+          let result: ReturnType<typeof verifyEnvelope>;
+          try {
+            result = verifyEnvelope({
+              headers: request.headers,
+              method: request.method,
+              pathWithQuery: url.pathname + url.search,
+              rawBody,
+              registry,
+              nonces,
+              now: now(),
+              skewMs: SKEW_MS,
+            });
+          } catch (error) {
+            // verifyEnvelope now throws when the nonce could not be durably recorded (fail
+            // closed): the signature may be genuine, but without a durable nonce record a replay
+            // of this exact envelope would verify again after a restart. Treated as "not
+            // verified", never as authorized, and answered the same way every other rejection
+            // reason is, without leaking that it was a storage failure rather than a bad request.
+            console.error("Failed to durably record nonce during envelope verification:", error);
+            return json({ error: "unauthenticated" }, 401);
+          }
           if (!result.ok) {
             return json({ error: result.code }, result.status);
           }

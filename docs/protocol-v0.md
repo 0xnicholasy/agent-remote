@@ -217,20 +217,32 @@ list. The bridge caps `wait` at 30 seconds.
 ## Reconnect semantics
 
 A client stores the highest `eventId` it has processed as `lastSeenEvent` and persists it
-across launches. Within one uninterrupted prototype process, it can issue
-`GET /v1/events?after=<lastSeenEvent>` and replay newer events.
+across launches, then issues `GET /v1/events?after=<lastSeenEvent>` and replays newer events.
+As of 2026-09-20 that cursor survives a bridge restart: the event log is persisted, event ids
+are never reused, and the response carries three further fields.
 
-That cursor alone is not durable state recovery. Before release, one of these recovery models
-must be chosen: retain the complete replay required to rebuild every client view; provide a
-state snapshot followed by an event tail; or persist an atomic derived state and its matching
-cursor. This decision is independent of the Mac remaining the authority.
+```ts
+interface EventsResponse {
+  events: AgentEvent[];
+  lastEventId: number;
+  firstEventId?: number; // oldest retained event id, 0 when the log is empty
+  truncated?: boolean;   // the requested cursor sits below firstEventId - 1
+  bridgeId?: string;     // same bridge restarted, or a different bridge
+}
+```
 
-The released protocol must also define bridge identity or generation, restart recovery, the
-oldest retained event id, and the response when a cursor belongs to another generation or has
-fallen behind the retained range. Returning an empty list for a stale cursor would incorrectly
-look current. Pending interactions and command outcomes must either recover consistently after
-restart or be explicitly invalidated through observable events or errors. No snapshot endpoint,
-generation field or stale-cursor response is part of the current v0 schemas yet.
+`truncated` is the stale-cursor answer: events between the cursor and this page were dropped by
+retention and can never be fetched again, so the client resyncs from the page it was given
+rather than treating it as a continuation. An empty list with `truncated: false` genuinely means
+current. Command outcomes recover with the same guarantee: a retry of a `commandId` the previous
+process applied gets that command's recorded response, and one the bridge died in the middle of
+is refused with `409 command_indeterminate` rather than replayed. The contract is
+[durability-v0.md](durability-v0.md) and the reasoning is
+[ADR 009](adr/009-durable-bridge-state.md).
+
+Still open: provider sessions themselves are not restored, so a restart leaves the conversation
+readable but the session gone, and pending interactions do not yet recover or emit an explicit
+terminal event on restart.
 
 ## Approval binding
 
@@ -292,7 +304,8 @@ placeholder `sessionId` on a `session.create` envelope is a wart that a later ve
 by making the field optional for that one type.
 
 The unsupported approval mappings above need explicit protocol representation before adapters
-may expose them. The recovery model, bridge identity or generation, stale-cursor response,
-bounded log retention, compaction of long `command.output` streams, partial replay, durable
-command-outcome window, pending-interaction restart policy, conversation reconstruction rules,
-runtime schema validation and authenticated envelope format are also open.
+may expose them. The recovery model, bridge identity, stale-cursor response, bounded log
+retention, durable command-outcome window and authenticated envelope format are now settled
+(see [durability-v0.md](durability-v0.md) and [pairing-v0.md](pairing-v0.md)). Compaction of
+long `command.output` streams, partial replay, pending-interaction restart policy, conversation
+reconstruction rules and runtime schema validation on the Swift side remain open.

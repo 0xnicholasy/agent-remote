@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -83,8 +83,26 @@ function pendingQuestion(events: AgentEvent[]) {
   return requested.payload;
 }
 
+// Every bridge built without an explicit devicesFilePath resolves its state dir from the
+// environment, and slice 2 made that dir hold durable journals (events, commands, nonces,
+// sessions). Pointing it at a fresh temp dir per test keeps one test's persisted command ids
+// from colliding with the next one's, and keeps the suite out of the real ~/.agentremote.
+let testStateDir: string;
+const originalStateDir = process.env.AGENTREMOTE_STATE_DIR;
+
 beforeEach(() => {
+  testStateDir = mkdtempSync(join(tmpdir(), "agentremote-bridge-test-"));
+  process.env.AGENTREMOTE_STATE_DIR = testStateDir;
   bridge = createBridge({ authEnabled: false });
+});
+
+afterEach(() => {
+  if (originalStateDir === undefined) {
+    delete process.env.AGENTREMOTE_STATE_DIR;
+  } else {
+    process.env.AGENTREMOTE_STATE_DIR = originalStateDir;
+  }
+  rmSync(testStateDir, { recursive: true, force: true });
 });
 
 describe("bridge HTTP surface", () => {
@@ -100,6 +118,14 @@ describe("bridge HTTP surface", () => {
     expect(first.duplicate).toBe(false);
     expect(second.duplicate).toBe(true);
     expect(afterSecond.length).toBe(afterFirst.length);
+  });
+
+  test("a fresh bridge with no event history never reports a cursor as truncated", async () => {
+    const response = await bridge.fetch(new Request("http://bridge.local/v1/events?after=0"));
+    const body = (await response.json()) as EventsResponse;
+
+    expect(body.firstEventId).toBe(0);
+    expect(body.truncated).toBe(false);
   });
 
   test("two concurrent retries of one commandId still execute it once", async () => {
@@ -425,6 +451,13 @@ class StubClaudeProvider implements AgentProvider {
 describe("AGENTREMOTE_PROVIDER selection", () => {
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
 
+  // Every test in this file gets a `bridge` from the top-level beforeEach, pointed at the same
+  // AGENTREMOTE_STATE_DIR this describe's own createBridge calls use by default. Close it first
+  // so this describe's bridges do not collide with it on the single-writer lock.
+  beforeEach(() => {
+    bridge.close();
+  });
+
   function restoreProviderEnv(): void {
     if (originalProvider === undefined) {
       delete process.env.AGENTREMOTE_PROVIDER;
@@ -670,6 +703,60 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
   });
 });
 
+describe("indeterminate commands", () => {
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+
+  // See the matching comment in "AGENTREMOTE_PROVIDER selection" above.
+  beforeEach(() => {
+    bridge.close();
+  });
+
+  afterEach(() => {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+  });
+
+  test("a command whose provider call threw an unmapped error is not replayed on retry", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    const stub = { current: undefined as StubClaudeProvider | undefined };
+    const claudeBridge = createBridge({
+      authEnabled: false,
+      createClaudeProvider: (host, providerOptions) => {
+        stub.current = new StubClaudeProvider(host, providerOptions);
+        return stub.current;
+      },
+    });
+    stub.current!.sendPromptError = new Error("boom: unexpected stub failure");
+
+    const command: Command = {
+      commandId: "b1111111-1111-4111-8111-111111111111",
+      sessionId: claudeBridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+    const request = (): Request =>
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      });
+
+    const first = await claudeBridge.fetch(request());
+    expect(first.status).toBe(500);
+
+    // The side effect may or may not have landed, so the retry must be refused rather than
+    // executed a second time - even without a restart in between.
+    stub.current!.sendPromptError = undefined;
+    const retry = await claudeBridge.fetch(request());
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
+  });
+});
+
 describe("projectIdFor", () => {
   test("produces a prj_<slug>_<hex> id built from the directory's basename and a path digest", () => {
     const id = projectIdFor("/Users/dev/checkouts/watch-2-code");
@@ -688,6 +775,11 @@ describe("projectIdFor", () => {
 describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
   const originalProvider = process.env.AGENTREMOTE_PROVIDER;
   const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+
+  // See the matching comment in "AGENTREMOTE_PROVIDER selection" above.
+  beforeEach(() => {
+    bridge.close();
+  });
 
   function restoreEnv(): void {
     if (originalProvider === undefined) {
@@ -728,9 +820,11 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
         authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
-      expect(() => createBridge(options)).not.toThrow();
-      const claudeBridge = createBridge(options);
-      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
+      let claudeBridge: Bridge | undefined;
+      expect(() => {
+        claudeBridge = createBridge(options);
+      }).not.toThrow();
+      expect(claudeBridge!.session.projectId).toBe(projectIdFor(process.cwd()));
     } finally {
       restoreEnv();
     }
@@ -744,10 +838,12 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
         authEnabled: false,
         createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
       };
-      expect(() => createBridge(options)).not.toThrow();
-      const claudeBridge = createBridge(options);
-      expect(claudeBridge.session.projectId).toBe(projectIdFor(process.cwd()));
-      const projectsResponse = await claudeBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      let claudeBridge: Bridge | undefined;
+      expect(() => {
+        claudeBridge = createBridge(options);
+      }).not.toThrow();
+      expect(claudeBridge!.session.projectId).toBe(projectIdFor(process.cwd()));
+      const projectsResponse = await claudeBridge!.fetch(new Request("http://bridge.local/v1/projects"));
       const projects = ((await projectsResponse.json()) as { projects: Project[] }).projects;
       expect(projects.map((project) => project.path)).toEqual([process.cwd()]);
     } finally {
@@ -1292,6 +1388,7 @@ describe("pairing", () => {
     expect(pairResponse.status).toBe(200);
     const deviceKey = deriveDeviceKey(firstBridge.pairingCode, deviceId, nonce);
 
+    firstBridge.close();
     const secondBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const response = await secondBridge.fetch(
       signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
@@ -1335,5 +1432,381 @@ describe("pairing", () => {
     );
     expect(afterRevoke.status).toBe(403);
     expect(await afterRevoke.json()).toEqual({ error: "device_revoked" });
+  });
+});
+
+describe("restart recovery", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-restart-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  /** A second `createBridge` over the same state dir is exactly what a bridge restart is. Closes
+   * the previous instance's single-writer lock first: a real restart's old process is gone by
+   * the time the new one starts, and no test here uses `first` after calling `restart()` again. */
+  let current: Bridge | undefined;
+  function restart(): Bridge {
+    current?.close();
+    current = createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+    return current;
+  }
+
+  function commandBody(commandId: string, sessionId: string): Command {
+    return {
+      commandId,
+      sessionId,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+  }
+
+  function postTo(target: Bridge, command: Command): Promise<Response> {
+    return target.fetch(
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      }),
+    );
+  }
+
+  async function eventsOf(target: Bridge, after: number): Promise<EventsResponse> {
+    const response = await target.fetch(new Request(`http://bridge.local/v1/events?after=${after}`));
+    return (await response.json()) as EventsResponse;
+  }
+
+  test("a command already applied before the restart is answered from the journal, not re-executed", async () => {
+    const first = restart();
+    const command = commandBody("a1111111-1111-4111-8111-111111111111", first.session.id);
+    const firstResponse = (await (await postTo(first, command)).json()) as CommandResponse;
+    expect(firstResponse.duplicate).toBe(false);
+    const eventsBefore = (await eventsOf(first, 0)).events.length;
+
+    const second = restart();
+    const retried = await postTo(second, command);
+    const retriedBody = (await retried.json()) as CommandResponse;
+
+    expect(retried.status).toBe(200);
+    expect(retriedBody.duplicate).toBe(true);
+    expect(retriedBody.accepted).toBe(firstResponse.accepted);
+    // Re-execution would have appended a second turn.started to the retained log.
+    expect((await eventsOf(second, 0)).events.length).toBe(eventsBefore);
+  });
+
+  test("retained events survive the restart and event ids keep increasing", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a2222222-2222-4222-8222-222222222222", first.session.id));
+    const before = await eventsOf(first, 0);
+    expect(before.events.length).toBeGreaterThan(0);
+
+    const second = restart();
+    const afterRestart = await eventsOf(second, 0);
+    expect(afterRestart.events.map((event) => event.eventId)).toEqual(before.events.map((event) => event.eventId));
+
+    await postTo(second, commandBody("a3333333-3333-4333-8333-333333333333", second.session.id));
+    const withNewEvents = await eventsOf(second, before.lastEventId);
+    expect(withNewEvents.events.length).toBeGreaterThan(0);
+    // Ids are never reused across a restart: a client cursor stays meaningful.
+    for (const event of withNewEvents.events) {
+      expect(event.eventId).toBeGreaterThan(before.lastEventId);
+    }
+  });
+
+  test("a cursor below the retained window is reported truncated instead of silently continued", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a4444444-4444-4444-8444-444444444444", first.session.id));
+    const page = await eventsOf(first, 0);
+
+    const stale = await eventsOf(first, 0);
+    expect(stale.truncated).toBe(false);
+    expect(stale.firstEventId).toBe(page.events[0]?.eventId);
+
+    // Rewrite the journal as if retention had dropped everything below id 500.
+    const retained = page.events.map((event, index) => ({ ...event, eventId: 500 + index }));
+    writeFileSync(join(stateDir, "events.jsonl"), retained.map((event) => `${JSON.stringify(event)}\n`).join(""));
+
+    const second = restart();
+    const gapped = await eventsOf(second, 10);
+    expect(gapped.firstEventId).toBe(500);
+    expect(gapped.truncated).toBe(true);
+
+    const continuous = await eventsOf(second, 500);
+    expect(continuous.truncated).toBe(false);
+  });
+
+  test("an id already reserved by the watermark is never reissued after a crash that lost the event log itself", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a7777777-7777-4777-8777-777777777777", first.session.id));
+    const before = await eventsOf(first, 0);
+    const highestBefore = before.lastEventId;
+    expect(highestBefore).toBeGreaterThan(0);
+
+    // A crash that loses the event log file itself, not just a graceful restart: the log alone
+    // can no longer prove which ids are already spent, which is exactly what the watermark file
+    // is for.
+    rmSync(join(stateDir, "events.jsonl"));
+
+    const second = restart();
+    const afterCrash = await postTo(second, commandBody("a8888888-8888-4888-8888-888888888888", second.session.id));
+    expect(afterCrash.status).toBe(200);
+    for (const emitted of (await eventsOf(second, 0)).events) {
+      expect(emitted.eventId).toBeGreaterThan(highestBefore);
+    }
+  });
+
+  test("a cursor against a log emptied by retention is reported truncated even though ids were already issued", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a9999999-9999-4999-8999-999999999999", first.session.id));
+
+    // Simulate retention having dropped every retained event: the file exists but holds
+    // nothing, so firstEventId reports 0 even though the bridge has already issued many ids.
+    writeFileSync(join(stateDir, "events.jsonl"), "");
+
+    const second = restart();
+    const stale = await eventsOf(second, 0);
+    expect(stale.firstEventId).toBe(0);
+    expect(stale.truncated).toBe(true);
+  });
+
+  test("a command the previous process died in the middle of is refused as indeterminate", async () => {
+    const command = commandBody("a5555555-5555-4555-8555-555555555555", "ses_seed");
+    const rawBody = JSON.stringify(command);
+    const entry = {
+      commandId: command.commandId,
+      deviceId: null,
+      digest: createHash("sha256").update(rawBody).digest("hex"),
+      status: "in_flight",
+      at: FIXED_NOW.getTime(),
+    };
+    writeFileSync(join(stateDir, "commands.jsonl"), `${JSON.stringify(entry)}\n`);
+
+    const after = restart();
+    const response = await postTo(after, command);
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
+    // Nothing was applied on this side either: the log holds no turn for it.
+    expect((await eventsOf(after, 0)).events.length).toBe(0);
+  });
+
+  test("a nonce used before the restart is still rejected as a replay", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord());
+    const nonce = randomBytes(16).toString("hex");
+
+    const first = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const accepted = await first.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(accepted.status).toBe(200);
+
+    first.close();
+    const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const replayed = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", nonce }));
+    expect(replayed.status).toBe(401);
+    expect(await replayed.json()).toEqual({ error: "replayed_request" });
+  });
+
+  test("a narrowed device still sees retained events of a session the provider forgot", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: ["prj_demo"] }));
+
+    const first = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const created = await first.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "a6666666-6666-4666-8666-666666666666",
+          sessionId: "ses_placeholder",
+          type: "session.create",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { projectId: "prj_demo", provider: "mock" },
+        },
+      }),
+    );
+    expect(created.status).toBe(200);
+    const createdSessionId = ((await created.json()) as CommandResponse).sessionId;
+    expect(createdSessionId).toBeDefined();
+
+    first.close();
+    const second = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const response = await second.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as EventsResponse;
+
+    // The restarted provider has no such session, so only the persisted session index can
+    // authorize these events; without it the device would reconnect to an empty history.
+    expect(page.events.some((event) => event.sessionId === createdSessionId)).toBe(true);
+  });
+});
+
+describe("single-writer state dir lock", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  test("a second bridge refuses to start while the first still holds a live lock", () => {
+    createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
+      /already holds the lock/,
+    );
+  });
+
+  test("a lock file left behind by a dead process is taken over instead of blocking startup", () => {
+    // No real process can hold this pid; it is well past any platform's max pid.
+    writeFileSync(join(stateDir, "bridge.lock"), "999999999", "utf8");
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).not.toThrow();
+  });
+
+  test("a bridge boots against a state dir that does not exist yet", () => {
+    // A fresh install has no ~/.agentremote at all: the lock is the first file written into it,
+    // so the directory has to be created before the exclusive create rather than by whatever
+    // journal happens to write first.
+    const freshDir = join(stateDir, "not-created-yet");
+    let fresh: Bridge | undefined;
+
+    expect(() => {
+      fresh = createBridge({
+        devicesFilePath: join(freshDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+    }).not.toThrow();
+    expect(readFileSync(join(freshDir, "bridge.lock"), "utf8").trim()).toBe(String(process.pid));
+
+    fresh?.close();
+  });
+});
+
+describe("retained events of a reused session id", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+  const originalProvider = process.env.AGENTREMOTE_PROVIDER;
+  const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+  const projectA = projectIdFor("/tmp/agentremote-project-a");
+  const projectB = projectIdFor("/tmp/agentremote-project-b");
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-rebind-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+    // Two projects are needed to reuse a session id across projects, and the stub claude
+    // provider is the only one wired to more than one.
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    process.env.AGENTREMOTE_PROJECT_DIRS = "/tmp/agentremote-project-a,/tmp/agentremote-project-b";
+  });
+
+  afterEach(() => {
+    if (originalProvider === undefined) {
+      delete process.env.AGENTREMOTE_PROVIDER;
+    } else {
+      process.env.AGENTREMOTE_PROVIDER = originalProvider;
+    }
+    if (originalDirs === undefined) {
+      delete process.env.AGENTREMOTE_PROJECT_DIRS;
+    } else {
+      process.env.AGENTREMOTE_PROJECT_DIRS = originalDirs;
+    }
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function boot(authEnabled: boolean): Bridge {
+    return createBridge({
+      devicesFilePath,
+      authEnabled,
+      now: () => FIXED_NOW,
+      createClaudeProvider: (host, providerOptions) => new StubClaudeProvider(host, providerOptions),
+    });
+  }
+
+  function send(target: Bridge, command: Command): Promise<Response> {
+    return target.fetch(
+      new Request("http://bridge.local/v1/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      }),
+    );
+  }
+
+  /** One boot that creates a session in `projectId`, records an event under it, and shuts down.
+   * The stub provider hands out the same session id (`ses_stub`) on every boot, which is how a
+   * session id really can be reused after a restart. */
+  async function bootAndRecord(projectId: string, suffix: string): Promise<string> {
+    const booted = boot(false);
+    const created = await send(booted, {
+      commandId: `b${suffix}111111-1111-4111-8111-111111111111`,
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId, provider: "claude" },
+    });
+    const body = (await created.json()) as CommandResponse;
+    expect(created.status).toBe(200);
+    const sessionId = body.sessionId;
+    if (sessionId === undefined) {
+      throw new Error("session.create did not report a session id");
+    }
+    const prompted = await send(booted, {
+      commandId: `c${suffix}222222-2222-4222-8222-222222222222`,
+      sessionId,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: `prompt under ${projectId}` },
+    });
+    expect(prompted.status).toBe(200);
+    booted.close();
+    return sessionId;
+  }
+
+  test("a session id live under a different project than its recorded binding is served to no one", async () => {
+    const first = await bootAndRecord(projectA, "1");
+
+    // sessions.jsonl is left in place, so the durable binding for this id still reads project
+    // A. The stub provider hands out `ses_stub` again on the next boot, so creating a session
+    // under project B makes the live provider disagree with that recorded binding.
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectA, projectB] }));
+
+    const reader = boot(true);
+    const createBody: Command = {
+      commandId: "d1111111-1111-4111-8111-111111111111",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: projectB, provider: "claude" },
+    };
+    const created = await reader.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createBody }),
+    );
+    expect(created.status).toBe(200);
+    const createdBody = (await created.json()) as CommandResponse;
+    expect(createdBody.sessionId).toBe(first);
+
+    const response = await reader.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }));
+    expect(response.status).toBe(200);
+    const page = (await response.json()) as EventsResponse;
+    reader.close();
+
+    // The device is allowed both projects, so nothing here is a project-narrowing drop: the
+    // recorded binding (A) and the live provider (B) disagree about what this id is, so none of
+    // its events can be attributed to a project and all of them are withheld.
+    expect(page.events.some((event) => event.sessionId === first)).toBe(false);
   });
 });

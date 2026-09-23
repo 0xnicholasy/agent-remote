@@ -55,13 +55,78 @@ function readHeader(headers: HeaderSource, name: string): string | undefined {
   return undefined;
 }
 
+/** One persisted nonce. `expiresAt` is epoch milliseconds. */
+export interface NonceRecord {
+  deviceId: string;
+  nonce: string;
+  expiresAt: number;
+}
+
+/**
+ * Storage a `NonceCache` writes through to so replay protection survives a bridge restart.
+ * Deliberately an interface rather than a file path: this module stays free of `node:fs`, and
+ * the bridge supplies the JSON Lines implementation from `src/state/nonces.ts`.
+ */
+export interface NonceJournal {
+  load(): NonceRecord[];
+  append(record: NonceRecord): void;
+  rewrite(records: readonly NonceRecord[]): void;
+}
+
+/** Appends since the last compaction that trigger a rewrite of the journal file. */
+const COMPACT_AFTER_APPENDS = 1_000;
+
 /**
  * Per-device nonce set with a 300s TTL and a 10,000-entry cap per device, oldest dropped first.
  * A `Map`'s keys iterate in insertion order, and since every entry's TTL is the same fixed
  * duration, insertion order and expiry order coincide as long as `now` does not go backwards.
+ *
+ * With a `NonceJournal` the same set is written through to disk and rehydrated on construction,
+ * so a request replayed across a bridge restart is still refused. Entries already expired at
+ * load time are dropped and never rehydrated.
  */
 export class NonceCache {
   private readonly perDevice = new Map<string, Map<string, number>>();
+  private readonly journal: NonceJournal | undefined;
+  private appendsSinceCompaction = 0;
+
+  constructor(options: { journal?: NonceJournal; now?: Date } = {}) {
+    this.journal = options.journal;
+    if (this.journal === undefined) {
+      return;
+    }
+
+    const nowMs = (options.now ?? new Date()).getTime();
+    // `load` throws on a filesystem failure (see JsonlJournal). Let it propagate rather than
+    // treating an unreadable journal as an empty one: the latter would silently accept every
+    // nonce this device has ever used, defeating replay protection after a restart.
+    const persistedRecords = this.journal.load();
+    let dropped = false;
+    for (const record of persistedRecords) {
+      if (typeof record?.deviceId !== "string" || typeof record.nonce !== "string" || typeof record.expiresAt !== "number") {
+        dropped = true;
+        continue;
+      }
+      if (record.expiresAt <= nowMs) {
+        dropped = true;
+        continue;
+      }
+      let nonces = this.perDevice.get(record.deviceId);
+      if (nonces === undefined) {
+        nonces = new Map<string, number>();
+        this.perDevice.set(record.deviceId, nonces);
+      }
+      nonces.set(record.nonce, record.expiresAt);
+    }
+    for (const nonces of this.perDevice.values()) {
+      if (this.evictOverflow(nonces)) {
+        dropped = true;
+      }
+    }
+    if (dropped) {
+      this.compact();
+    }
+  }
 
   has(deviceId: string, nonce: string, now: Date): boolean {
     const nonces = this.perDevice.get(deviceId);
@@ -80,13 +145,27 @@ export class NonceCache {
     }
 
     this.pruneExpired(nonces, now);
-    if (nonces.size >= MAX_NONCES_PER_DEVICE) {
-      const oldest = nonces.keys().next();
-      if (!oldest.done) {
-        nonces.delete(oldest.value);
-      }
+    const expiresAt = now.getTime() + NONCE_TTL_MS;
+
+    if (this.journal === undefined) {
+      nonces.set(nonce, expiresAt);
+      this.evictOverflow(nonces);
+      return;
     }
-    nonces.set(nonce, now.getTime() + NONCE_TTL_MS);
+    // Persist before marking the nonce used in memory, so the two can never disagree. `append`
+    // throws on a filesystem failure (see JsonlJournal); letting it propagate out of `record`
+    // and in turn out of `verifyEnvelope` is what makes an unpersistable nonce fail closed, and
+    // appending first means the throw leaves the in-memory set untouched rather than holding a
+    // nonce the journal never recorded (which would look spent now and replay cleanly after a
+    // restart). The same ordering keeps eviction honest: nothing is evicted on behalf of an
+    // entry that was never durably written.
+    this.journal.append({ deviceId, nonce, expiresAt });
+    nonces.set(nonce, expiresAt);
+    this.evictOverflow(nonces);
+    this.appendsSinceCompaction += 1;
+    if (this.appendsSinceCompaction >= COMPACT_AFTER_APPENDS) {
+      this.compact();
+    }
   }
 
   private pruneExpired(nonces: Map<string, number>, now: Date): void {
@@ -95,6 +174,48 @@ export class NonceCache {
         break; // insertion order == expiry order (see class comment)
       }
       nonces.delete(key);
+    }
+  }
+
+  /**
+   * Evicts oldest-first while over the per-device cap. Shared by `record` (evicts at most one,
+   * since insertion happens one nonce at a time) and the constructor's rehydrate path (may evict
+   * many at once), so the cap and its ordering can never drift between the live and reload paths.
+   * Returns whether anything was evicted.
+   */
+  private evictOverflow(nonces: Map<string, number>): boolean {
+    let evicted = false;
+    while (nonces.size > MAX_NONCES_PER_DEVICE) {
+      const oldest = nonces.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      nonces.delete(oldest.value);
+      evicted = true;
+    }
+    return evicted;
+  }
+
+  /** Rewrites the journal to exactly the live set, dropping expired and evicted entries. */
+  private compact(): void {
+    if (this.journal === undefined) {
+      return;
+    }
+    const records: NonceRecord[] = [];
+    for (const [deviceId, nonces] of this.perDevice) {
+      for (const [nonce, expiresAt] of nonces) {
+        records.push({ deviceId, nonce, expiresAt });
+      }
+    }
+    // Unlike `append`, a failed compaction is tolerated: every entry in `records` was already
+    // durably appended one at a time, so the journal on disk is still a correct (just uncompacted)
+    // superset of the live set. Log and retry at the next compaction threshold instead of failing
+    // the request that happened to trigger this compaction.
+    try {
+      this.journal.rewrite(records);
+      this.appendsSinceCompaction = 0;
+    } catch (error) {
+      console.error("Agent Remote bridge: failed to compact nonce journal, will retry later", error);
     }
   }
 }

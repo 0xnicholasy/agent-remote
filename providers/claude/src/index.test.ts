@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import {
   ApprovalBindingMismatchError,
   digest,
@@ -56,6 +56,27 @@ function createHost(): { host: ProviderHost; events: AgentEvent[] } {
     },
   };
   return { host, events };
+}
+
+/** A host whose `emit` throws for the given event types, standing in for the bridge's durable
+ * emit path after it was made to throw when an event cannot be appended to the event log. */
+function createFailingHost(failTypes: Array<AgentEvent["type"]>): { host: ProviderHost; events: AgentEvent[] } {
+  const inner = createHost();
+  const host: ProviderHost = {
+    emit(sessionId, type, payload) {
+      if (failTypes.includes(type)) {
+        throw new Error(`event log append failed for ${type}`);
+      }
+      return inner.host.emit(sessionId, type, payload);
+    },
+    eventsAfter(after: number) {
+      return inner.host.eventsAfter(after);
+    },
+    waitForChange(timeoutMs: number) {
+      return inner.host.waitForChange(timeoutMs);
+    },
+  };
+  return { host, events: inner.events };
 }
 
 // Minimal stand-ins for the real SDK message and tool-call shapes. `SDKAssistantMessage` and
@@ -429,6 +450,43 @@ describe("ClaudeProvider", () => {
     // fail rather than double-resolving the same interaction.
     await expectApproveRefused(provider.approve(session.id, binding));
     expect(events.filter((event) => event.type === "approval.resolved")).toHaveLength(1);
+  });
+
+  test("a decision on an already-expired approval settles the SDK call even if its event cannot be persisted", async () => {
+    let toolResult: PermissionResult | null = null;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        toolResult = await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    // `approval.resolved` cannot be persisted, and the clock is moved past `expiresAt` while the
+    // auto-expiry timer (armed for a full minute) has not fired, so `approve()` takes the expired
+    // branch itself. The emit failure there must not strand `canUseTool`: the timer is already
+    // cleared and the pending already detached, so nothing else would ever settle it.
+    const { host, events } = createFailingHost(["approval.resolved"]);
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      approvalTtlMs: 60_000,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    const binding = bindingOf(events);
+
+    setSystemTime(new Date(Date.now() + 120_000));
+    try {
+      await expectApproveRefused(provider.approve(session.id, binding));
+      await delay();
+      expect(toolResult).toMatchObject({ behavior: "deny" });
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("C1-003: a Bash approval is emitted with kind \"command\"", async () => {
@@ -1479,6 +1537,27 @@ describe("ClaudeProvider", () => {
     await expect(provider.createSession("p1")).resolves.toMatchObject({ projectId: "p1" });
   });
 
+  test("session ids do not collide across provider instances (simulated restarts)", async () => {
+    const queryFn: QueryFn = (() => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await new Promise<void>(() => {});
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    // A fresh instance mimics the bridge restarting; a per-instance counter would hand out the
+    // same first id (`ses_1`) again, colliding with a session recorded before the restart.
+    const { host: hostA } = createHost();
+    const providerA = new ClaudeProvider(hostA, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const sessionA = await providerA.createSession("p1");
+
+    const { host: hostB } = createHost();
+    const providerB = new ClaudeProvider(hostB, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const sessionB = await providerB.createSession("p1");
+
+    expect(sessionB.id).not.toBe(sessionA.id);
+  });
+
   test("seedSession refuses to exceed maxSessions (R2-001)", async () => {
     const queryFn: QueryFn = (() => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {
@@ -1816,5 +1895,50 @@ describe("ClaudeProvider", () => {
 
     expect((await provider.listSessions()).find((s) => s.id === session.id)?.state).toBe("running");
     releaseTurn?.();
+  });
+  test("an emit the bridge cannot persist does not reject unhandled: it is logged and the session fails (entry R-041)", async () => {
+    // `ProviderHost.emit` throws when the event log append fails. The message pump runs
+    // fire-and-forget, so before the fix that throw became an unhandled rejection that could
+    // take the whole bridge process down on a disk error.
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    const logged: string[] = [];
+    const realConsoleError = console.error;
+    console.error = (...args: unknown[]): void => {
+      logged.push(args.map((arg) => String(arg)).join(" "));
+    };
+    try {
+      // Both the event the pump tries to emit and the `error` event its own failure path would
+      // fall back to: before the fix that second throw escaped the unawaited pump as an
+      // unhandled rejection.
+      const { host, events } = createFailingHost(["agent.message", "error"]);
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        yield fakeAssistant("hello", "m1");
+        yield fakeResult("done");
+      }
+      const { query } = asQuery(gen());
+      const queryFn: QueryFn = (() => query) as QueryFn;
+      const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+      const session = await provider.createSession("p1");
+
+      await provider.sendPrompt(session.id, "go");
+      await delay();
+      await delay();
+
+      expect(rejections).toEqual([]);
+      // Not swallowed: the failure names the session and the event that was lost.
+      expect(logged.some((line) => line.includes(session.id) && line.includes("agent.message"))).toBe(true);
+      // Defined state: the session is torn down rather than left running with a hole in its
+      // event stream that the client's cursor cannot detect.
+      expect(await provider.listSessions()).toHaveLength(0);
+      expect(events.map((event) => event.type)).not.toContain("turn.completed");
+      await expect(provider.sendPrompt(session.id, "again")).rejects.toBeInstanceOf(UnknownSessionError);
+    } finally {
+      console.error = realConsoleError;
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 });
