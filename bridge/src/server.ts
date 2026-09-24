@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import Ajv2020 from "ajv/dist/2020";
@@ -165,6 +165,10 @@ export function projectIdFor(dir: string): string {
 // `unknown` is genuinely the right type here: this helper serialises whatever a route hands
 // it, including error shapes that are not part of the protocol, and it only ever passes the
 // value to JSON.stringify.
+function isAcceptedResponse(body: unknown): body is CommandResponse {
+  return typeof body === "object" && body !== null && (body as Partial<CommandResponse>).accepted === true;
+}
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -298,6 +302,23 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       }
     };
     process.on("exit", releaseLock);
+
+    // Every journal is opened for append once now, so a state file the bridge cannot write (wrong
+    // owner, read-only mode, a directory in its place) stops startup with the path in the error
+    // instead of surfacing later as a failed request and a console.error per write.
+    for (const name of ["nonces.jsonl", "events.jsonl", "sessions.jsonl", "commands.jsonl"]) {
+      const filePath = path.join(stateDirPath, name);
+      try {
+        closeSync(openSync(filePath, "a", 0o600));
+      } catch (error) {
+        releaseLock();
+        throw new Error(
+          `Agent Remote bridge cannot write its state file ${filePath}: ${(error as NodeJS.ErrnoException).code ?? String(error)}. ` +
+            "Fix its ownership or permissions, or point AGENTREMOTE_STATE_DIR at a writable directory.",
+        );
+      }
+    }
+    console.log(`Agent Remote bridge state dir: ${stateDirPath}`);
   }
 
   const nonces = new NonceCache({ journal: createNonceJournal(journalPath("nonces.jsonl")), now: now() });
@@ -339,8 +360,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
   const waiters = new Set<() => void>();
   // Reserves a command id for the duration of its execution, so two retries that arrive at
-  // the same time cannot both pass the journal check and run the command twice.
-  const inFlight = new Set<string>();
+  // the same time cannot both pass the journal check and run the command twice. A retry that
+  // arrives while the original is still running waits on `outcome` and gets the original's
+  // answer (docs/protocol-v0.md: same command identity, same eventual outcome), instead of a
+  // placeholder that could disagree with what the original request finally reports.
+  interface InFlightCommand {
+    digest: string;
+    deviceId: string | null;
+    outcome: Promise<{ status: number; body: unknown }>;
+  }
+  const inFlight = new Map<string, InFlightCommand>();
 
   // Per-session serialization: two commands (or a command and the dedicated cancel route)
   // targeting the same session must not interleave between the interaction-pending check and the
@@ -702,15 +731,28 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       // command id may be retried and falls through to execution below.
     }
 
-    if (inFlight.has(command.commandId)) {
-      return json(
-        { accepted: false, commandId: command.commandId, duplicate: true } satisfies CommandResponse,
-      );
+    const running = inFlight.get(command.commandId);
+    if (running !== undefined) {
+      // No journal entry is written until `commands.begin` inside the gate, so the identity check
+      // the journal branch above does has to be repeated against the in-flight claim itself.
+      if (running.digest !== bodyDigest || running.deviceId !== deviceId) {
+        return json({ error: "command_id_conflict" }, 409);
+      }
+      let original: { status: number; body: unknown };
+      try {
+        original = await running.outcome;
+      } catch {
+        // The original threw an unmapped error: whether the provider applied it is unknown, which
+        // is exactly what a later retry is told once the journal entry is left `in_flight`.
+        return json({ error: "command_indeterminate", commandId: command.commandId }, 409);
+      }
+      if (isAcceptedResponse(original.body)) {
+        return json({ ...original.body, duplicate: true } satisfies CommandResponse, original.status);
+      }
+      return json(original.body, original.status);
     }
 
-    inFlight.add(command.commandId);
-
-    // From here on this request holds an exclusive claim on `command.commandId` (above), but a
+    // From here on this request holds an exclusive claim on `command.commandId` (below), but a
     // *different* commandId for the same session — a second device's decision, or a cancel — can
     // still race it up to this point. The interaction gate and the provider call itself run
     // inside the per-session lock so two such commands serialize: the loser sees the winner's
@@ -728,9 +770,8 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       // the cap never evicts a pending record, and provider sessions do not survive a restart,
       // so an id the registry has not seen cannot be pending in the provider either.
       // Neither check below ever calls `commands.begin`, so neither leaves a journal entry
-      // behind; but both run after `inFlight.add` above, so both must release it themselves
-      // before returning, the same way the `commands.begin` failure a few lines down does, or a
-      // retry of this exact commandId would see it stuck in_flight forever.
+      // behind; the in-flight claim is released by the caller once this settles, and a retry
+      // that arrived meanwhile gets the same refusal.
       // Expiry. approval.accept/reject carry payload.binding.expiresAt; a binding whose deadline
       // already passed is rejected here, before the provider's own (live-binding) check ever
       // runs. It runs before the interaction gate because it reads only the caller's own binding,
@@ -740,18 +781,15 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         (command.type === "approval.accept" || command.type === "approval.reject") &&
         Date.parse(command.payload.binding.expiresAt) < now().getTime()
       ) {
-        inFlight.delete(command.commandId);
         return json({ error: "decision_expired" }, 410);
       }
       const interactionId = interactionIdFor(command);
       if (interactionId !== undefined) {
         const record = interactions.get(interactionId);
         if (record === undefined || record.sessionId !== command.sessionId) {
-          inFlight.delete(command.commandId);
           return json({ error: "interaction_not_pending", interactionId, state: "not_found" }, 409);
         }
         if (record.state !== "pending") {
-          inFlight.delete(command.commandId);
           return json({ error: "interaction_not_pending", interactionId, state: record.state }, 409);
         }
       }
@@ -762,7 +800,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       if (command.type === "question.answer") {
         const deadline = interactions.get(command.payload.questionId)?.expiresAt;
         if (deadline !== undefined && Date.parse(deadline) < now().getTime()) {
-          inFlight.delete(command.commandId);
           return json({ error: "decision_expired" }, 410);
         }
       }
@@ -773,7 +810,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         // begin runs BEFORE the provider call: without a durable in_flight record, a client retry
         // after a crash could re-execute this command, so a failure here must abort before
         // execution rather than proceed and only warn.
-        inFlight.delete(command.commandId);
         console.error(`Failed to durably record command ${command.commandId} as in_flight before execution:`, error);
         return json({ error: "command_journal_unavailable" }, 503);
       }
@@ -781,7 +817,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       try {
         createdSessionId = await execute(command);
       } catch (error) {
-        inFlight.delete(command.commandId);
         const mapped = mapProviderError(error);
         if (mapped !== undefined) {
           // A mapped provider error is a refusal before anything was applied, so the command id is
@@ -808,8 +843,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       };
       // The provider already applied this command, so `response` is reported either way; a
       // failure to durably record the outcome (or the session's project binding) below is only
-      // logged, never converted into a failure response for work that already succeeded, and
-      // `inFlight` must still be released regardless so a retry is not stuck as a false duplicate.
+      // logged, never converted into a failure response for work that already succeeded.
       try {
         commands.complete(command.commandId, response, now());
         if (createdSessionId !== undefined && command.type === "session.create") {
@@ -817,16 +851,27 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         }
       } catch (error) {
         console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
-      } finally {
-        inFlight.delete(command.commandId);
       }
       return json(response);
     };
 
-    if (command.type === "session.create") {
-      return await runGatedCommand();
-    }
-    return await withSessionLock(command.sessionId, runGatedCommand);
+    // The claim is registered synchronously, in the same turn as the journal and in-flight checks
+    // above, so a concurrent retry can never slip between them. It is released once the command
+    // settles however it settles; after that the journal entry answers any retry.
+    const execution =
+      command.type === "session.create" ? runGatedCommand() : withSessionLock(command.sessionId, runGatedCommand);
+    const outcome = execution.then(async (response) => ({
+      status: response.status,
+      body: (await response.clone().json()) as unknown,
+    }));
+    inFlight.set(command.commandId, { digest: bodyDigest, deviceId, outcome });
+    // A rejected outcome is reported to the caller below and to any waiting retry above; this
+    // handler only keeps the rejection from surfacing as unhandled when no retry is waiting.
+    outcome.then(
+      () => inFlight.delete(command.commandId),
+      () => inFlight.delete(command.commandId),
+    );
+    return await execution;
   }
 
   interface PairRequestBody {

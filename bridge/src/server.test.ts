@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -128,16 +128,35 @@ describe("bridge HTTP surface", () => {
     expect(body.truncated).toBe(false);
   });
 
-  test("two concurrent retries of one commandId still execute it once", async () => {
+  test("two concurrent retries of one commandId execute it once and get the same outcome", async () => {
     const command = promptCommand("77777777-7777-4777-8777-777777777777");
     const [first, second] = await Promise.all([post(command), post(command)]);
 
     const bodies = (await Promise.all([first.json(), second.json()])) as CommandResponse[];
-    const accepted = bodies.filter((body) => body.accepted);
-    expect(accepted.length).toBe(1);
+    // The retry that lands while the original is running waits for it and reports the original's
+    // outcome, marked as a duplicate, instead of a placeholder that disagrees with it.
+    expect(bodies.map((body) => body.accepted)).toEqual([true, true]);
+    expect(bodies.filter((body) => body.duplicate).length).toBe(1);
 
     const events = await eventsAfter(0);
     expect(events.filter((event) => event.type === "turn.started").length).toBe(1);
+  });
+
+  test("a concurrent retry with the same commandId but a different body is a conflict", async () => {
+    const command = promptCommand("78787878-7878-4878-8878-787878787878");
+    const altered: Command = {
+      commandId: command.commandId,
+      sessionId: command.sessionId,
+      type: "prompt.send",
+      timestamp: command.timestamp,
+      payload: { text: "something else entirely" },
+    };
+    const [first, second] = await Promise.all([post(command), post(altered)]);
+
+    expect(first.status).toBe(200);
+    expect(((await first.json()) as CommandResponse).accepted).toBe(true);
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: "command_id_conflict" });
   });
 
   test("GET /v1/events?after=N returns only newer events with increasing ids", async () => {
@@ -2126,6 +2145,17 @@ describe("single-writer state dir lock", () => {
     expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
       /already holds the lock/,
     );
+  });
+
+  test("a state file the bridge cannot write stops startup with its path, and releases the lock", () => {
+    // A directory where a journal should be makes the append open fail (EISDIR), which is what
+    // a wrong owner or a read-only file does too, without depending on the test user's privileges.
+    mkdirSync(join(stateDir, "events.jsonl"));
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
+      /cannot write its state file .*events\.jsonl/,
+    );
+    expect(existsSync(join(stateDir, "bridge.lock"))).toBe(false);
   });
 
   test("a lock file left behind by a dead process is taken over instead of blocking startup", () => {
