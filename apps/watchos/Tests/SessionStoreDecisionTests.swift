@@ -936,6 +936,82 @@ final class SessionStoreDecisionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertFalse(store.transcript.contains { $0.id.hasPrefix("gap-") })
+        XCTAssertEqual(store.lastSeenEventId, 50, "the fresh-cursor page must still be applied, not skipped")
+        XCTAssertEqual(store.syncState, .current)
+    }
+
+    /// A truncated page missing `firstEventId` falls back to the "expired on the bridge" gap
+    /// line keyed by `lastEventId`, which must not carry any event id in its text.
+    func testTruncatedPageWithoutFirstEventIdUsesLastEventIdGapLine() async throws {
+        let defaults = freshDefaults()
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0, truncated: true)),
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(store.transcript.first?.id, "gap-60")
+        XCTAssertFalse(store.transcript.first?.text.contains { $0.isNumber } ?? true, "the fallback gap line must not name an event id")
+    }
+
+    /// Regression for C-1: `discardLocalView()` must clear `lastQuestion`, or a `question.answered`
+    /// on the far side of a gap whose answer id collides with a discarded question's option id
+    /// would render the OLD question's label instead of falling back to the raw answer.
+    func testDiscardLocalViewClearsLastQuestionAcrossGap() async throws {
+        let defaults = freshDefaults()
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+
+        let questionRequested = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_1", "turnId": "turn_1", "text": "Continue?",
+                "options": [{ "id": "o1", "label": "Old label" }],
+                "allowFreeText": true
+            }
+        }
+        """)
+        store.apply(questionRequested)
+
+        let questionAnswered = try decodeEvent("""
+        {
+            "eventId": 60, "sessionId": "sess_2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "question.answered",
+            "payload": { "questionId": "q_2", "answer": "o1" }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(
+                events: [questionAnswered], lastEventId: 60, skipped: 0,
+                firstEventId: 60, truncated: true
+            )),
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0, firstEventId: 60)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(store.transcript.contains { $0.text == "Old label" }, "the discarded question's label must not survive the gap")
+        XCTAssertTrue(store.transcript.contains { $0.text == "o1" }, "an answer with no live question must fall back to the raw option id")
     }
 
     /// Syncing until the first page is applied, asked for without a long-poll wait; current
@@ -954,6 +1030,7 @@ final class SessionStoreDecisionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(store.syncState, .current)
+        XCTAssertTrue(store.connected, "current is a connected state")
         let waits = await client.waits
         XCTAssertEqual(waits.first, 0, "the first poll must not park for the full long-poll wait")
         XCTAssertEqual(waits.dropFirst().first, 20)
@@ -992,5 +1069,6 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         await store.reconnect()
         XCTAssertEqual(store.syncState, .syncing, "the old host's Current must not outlive reconnect()")
+        XCTAssertTrue(store.connected, "syncing counts as connected by design")
     }
 }

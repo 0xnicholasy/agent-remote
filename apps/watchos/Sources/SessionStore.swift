@@ -153,9 +153,7 @@ final class SessionStore {
         // A new host means a different bridge and session space: drop the old binding and
         // its state, or every event from the new bridge's session would be silently
         // dropped by the cross-session guard in apply() until relaunch.
-        resetSessionState()
-        transcript.removeAll()
-        turnState = .idle
+        discardLocalView()
         start()
     }
 
@@ -267,6 +265,7 @@ final class SessionStore {
         resetSessionState()
         transcript.removeAll()
         turnState = .idle
+        lastQuestion = nil
     }
 
     private func setKnownBridgeId(_ bridgeId: String?) {
