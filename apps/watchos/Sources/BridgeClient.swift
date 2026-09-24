@@ -117,6 +117,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case projectNotAllowed
     case decisionExpired
     case commandIdConflict
+    case rateLimited
 
     var description: String {
         switch self {
@@ -132,6 +133,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .projectNotAllowed: "This Watch is not allowed to use that project."
         case .decisionExpired: "That approval or question already expired."
         case .commandIdConflict: "That command was already sent with different contents."
+        case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
         }
     }
 
@@ -148,6 +150,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "project_not_allowed": .projectNotAllowed
         case "decision_expired": .decisionExpired
         case "command_id_conflict": .commandIdConflict
+        case "rate_limited": .rateLimited
         default: .http(status: status, message: message)
         }
     }

@@ -37,6 +37,10 @@ targets:
         TARGETED_DEVICE_FAMILY: "4"
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
+        # An unsigned simulator app has no keychain entitlement, so storing the pairing
+        # credential fails with errSecMissingEntitlement (-34018). Sign simulator builds ad hoc.
+        CODE_SIGNING_ALLOWED[sdk=watchsimulator*]: YES
+        CODE_SIGN_IDENTITY[sdk=watchsimulator*]: "-"
 
   AgentRemoteWatchTests:
     type: bundle.unit-test
@@ -65,15 +69,39 @@ targets:
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
 
+  AgentRemoteWatchUITests:
+    type: bundle.ui-testing
+    platform: watchOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: UITests
+    dependencies:
+      - target: AgentRemoteWatch
+    info:
+      path: Generated/UITests-Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.agentremote.watch.uitests
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: NO
+        TEST_TARGET_NAME: AgentRemoteWatch
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+
 schemes:
   AgentRemoteWatch:
     build:
       targets:
         AgentRemoteWatch: all
         AgentRemoteWatchTests: [test]
+        AgentRemoteWatchUITests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
         - AgentRemoteWatchTests
+        - AgentRemoteWatchUITests

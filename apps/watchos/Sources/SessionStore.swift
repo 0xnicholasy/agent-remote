@@ -93,6 +93,8 @@ final class SessionStore {
     @ObservationIgnored private var pollGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
+    /// Kept so a resolved approval can say what was decided, not only how.
+    @ObservationIgnored private var lastApproval: ApprovalRequest?
     /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
     /// meaningful against the bridge that issued it.
     @ObservationIgnored private var knownBridgeId: String?
@@ -284,6 +286,21 @@ final class SessionStore {
         transcript.removeAll()
         turnState = .idle
         lastQuestion = nil
+        lastApproval = nil
+    }
+
+    /// "Denied: Run git push origin main". Falls back to the decision alone when the request is
+    /// not known (it arrived before this page, or the view was discarded since).
+    static func resolutionLine(_ decision: ApprovalDecision, title: String?) -> String {
+        let outcome = switch decision {
+        case .accepted: "Allowed"
+        case .rejected: "Denied"
+        case .expired: "Expired"
+        case .cancelled: "Cancelled"
+        case .superseded: "Superseded"
+        }
+        guard let title else { return "Approval \(outcome.lowercased())" }
+        return "\(outcome): \(title)"
     }
 
     private func setKnownBridgeId(_ bridgeId: String?) {
@@ -358,11 +375,13 @@ final class SessionStore {
             speaker.speak(payload.text)
         case .approvalRequested(let payload):
             pendingApproval = payload
+            lastApproval = payload
             turnState = .waiting
             speaker.speak(payload.spokenSummary ?? payload.title)
         case .approvalResolved(let payload):
             pendingApproval = nil
-            append(.system, "Approval \(payload.decision.rawValue)", id: event.eventId)
+            let title = lastApproval?.binding.approvalId == payload.approvalId ? lastApproval?.title : nil
+            append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
         case .questionRequested(let payload):
             pendingQuestion = payload
             lastQuestion = payload

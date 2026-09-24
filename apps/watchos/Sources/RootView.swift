@@ -21,26 +21,19 @@ struct ConversationView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 4) {
-                                    statePill
-                                    syncLabel
-                                }
-                                if !store.connected
-                                    || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
-                                    Text(store.statusLine)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
+                        // No trailing controls on this row: the page indicator sits at the right
+                        // edge, and mute lives in Settings.
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                statePill
+                                syncLabel
                             }
-                            Spacer()
-                            Button {
-                                store.speaker.muted.toggle()
-                            } label: {
-                                Image(systemName: store.speaker.muted ? "speaker.slash" : "speaker.wave.2")
+                            if !store.connected
+                                || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
+                                Text(store.statusLine)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.plain)
                         }
                         ForEach(store.transcript) { item in
                             TranscriptRow(item: item).id(item.id)
@@ -58,11 +51,12 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: scrollAnchor) { _, anchor in
-                    withAnimation { proxy.scrollTo(anchor, anchor: .center) }
+                    // Top-aligned so a card's title sits just below the clock instead of in the
+                    // blurred edge under it.
+                    withAnimation { proxy.scrollTo(anchor, anchor: .top) }
                 }
             }
-            .navigationTitle("Agent Remote")
-            .navigationBarTitleDisplayMode(.inline)
+            // No navigation title: on this page it only covered the top of a pending card.
             .sheet(isPresented: $dictating) { DictateView() }
         }
     }

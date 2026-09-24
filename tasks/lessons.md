@@ -59,3 +59,13 @@ on the same cursor.
 ## 2026-09-24 M3 slice 4 client recovery
 
 - One green run of the Watch suite was luck. `SessionStore` tests never stop their poll loops, and every loop kept writing its cursor to `UserDefaults.standard`, so the next test's store started from another test's cursor; failures moved between runs. Rule: any persisted state a long-lived loop writes is injected (`SessionStore(defaults:)`, one suite per test), and a new Watch test file is run at least three times before its result counts.
+
+## 2026-09-24 launching a harden session in a new window
+
+- `open -na Ghostty.app --args --working-directory=... -e zsh -lic ...` starts a second Ghostty instance. With `window-save-state = always` that instance reopens every saved tab, and the login shell ignored `--working-directory`, so claude started in another project. Open the window through Ghostty's AppleScript (`new surface configuration` with `initial working directory` and `initial input`, then `new window with configuration`), and confirm the claude process's cwd with `lsof -a -p <pid> -d cwd` before relying on it.
+
+## 2026-09-25 Watch UI test run
+
+- The Watch UI test reads `AGENTREMOTE_UI_BRIDGE`, `AGENTREMOTE_UI_PAIR_CODE` and `AGENTREMOTE_UI_SHOT_DIR` through xcodebuild's `TEST_RUNNER_` prefix. Setting them inline (`TEST_RUNNER_X=... xcodebuild ...`) in the agent shell left the test skipped; `export` them first, then run xcodebuild. Scheme `EnvironmentVariables` did not reach the UI test runner either.
+- An unsigned watchOS simulator app cannot write to the keychain (`-34018`, errSecMissingEntitlement), so pairing fails there. Simulator builds are signed ad hoc in `project.yml` for this reason.
+- Check who owns a port before reusing it: 8787 was another project's dev server. The scratch bridge runs with `PORT=8799`.
