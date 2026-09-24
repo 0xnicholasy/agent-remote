@@ -5,10 +5,21 @@ import AgentRemoteProtocol
 /// The body of `GET /v1/events`, decoded leniently: an event that fails to decode (for
 /// example one missing `sessionId`) is skipped instead of failing the whole page, but its
 /// `eventId` still advances the cursor so the poll loop does not retry it forever.
+///
+/// `firstEventId`, `truncated` and `bridgeId` are optional on the wire (docs/durability-v0.md);
+/// a bridge that predates them decodes as nil / false.
 struct EventsPage: Sendable {
     var events: [AgentEvent]
     var lastEventId: Int
     var skipped: Int
+    /// Oldest event id the bridge still retains, 0 when its log is empty.
+    var firstEventId: Int? = nil
+    /// The requested cursor sits below the retained window: events between it and this page
+    /// were pruned and can never be fetched, so the page is not a continuation.
+    var truncated = false
+    /// Identifies the bridge's state dir, so a changed value means a different bridge (or one
+    /// whose state was wiped) rather than a restart of the same one.
+    var bridgeId: String? = nil
 }
 
 /// Decodes an events page leniently: `lastEventId` and the raw `events` array are parsed
@@ -38,7 +49,14 @@ enum EventsPageDecoder {
                 }
             }
         }
-        return EventsPage(events: events, lastEventId: maxEventId, skipped: skipped)
+        return EventsPage(
+            events: events,
+            lastEventId: maxEventId,
+            skipped: skipped,
+            firstEventId: root["firstEventId"] as? Int,
+            truncated: root["truncated"] as? Bool ?? false,
+            bridgeId: root["bridgeId"] as? String
+        )
     }
 }
 

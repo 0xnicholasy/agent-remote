@@ -24,6 +24,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
     /// One page per call, returned in order; the last one repeats once the list is exhausted.
     private var eventsResults: [Result<EventsPage, any Error & Sendable>] = []
     private(set) var sentCalls: [RecordedSend] = []
+    /// The `wait` argument of every events() call, in order.
+    private(set) var waits: [Int] = []
     private var eventsCallCount = 0
     /// When set, the events() call at this 1-based count suspends until `openGate()` is
     /// called, so a test can simulate a network response that lands late (e.g. after a
@@ -88,6 +90,7 @@ actor FakeBridgeClient: BridgeClientProtocol {
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
         eventsCallCount += 1
+        waits.append(wait)
         let currentCall = eventsCallCount
         let result: Result<EventsPage, any Error & Sendable>
         if eventsResults.isEmpty {
@@ -139,15 +142,28 @@ actor FakeBridgeClient: BridgeClientProtocol {
 final class SessionStoreDecisionTests: XCTestCase {
     private let decoder = JSONDecoder()
 
+    /// A private defaults suite per store. Poll loops from earlier tests are never stopped and
+    /// keep persisting their cursor; in shared standard defaults the next test's store would
+    /// start from that cursor.
+    private func freshDefaults() -> UserDefaults {
+        let name = "SessionStoreDecisionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return defaults
+    }
+
     private func decodeEvent(_ json: String) throws -> AgentEvent {
         try decoder.decode(AgentEvent.self, from: Data(json.utf8))
     }
 
     /// Builds a store already bound to "sess_1" with a pending approval card, backed by a
     /// fake client whose next `send` result is under the test's control.
-    private func makeStoreWithPendingApproval() async throws -> (SessionStore, FakeBridgeClient) {
+    private func makeStoreWithPendingApproval(
+        defaults: UserDefaults? = nil
+    ) async throws -> (SessionStore, FakeBridgeClient) {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = defaults ?? freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
 
         let started = try decodeEvent("""
         {
@@ -183,7 +199,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// fake client whose next `send` result is under the test's control.
     private func makeStoreWithPendingQuestion() async throws -> (SessionStore, FakeBridgeClient) {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
 
         let started = try decodeEvent("""
         {
@@ -307,7 +324,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// Regression for E-005: a clean page with nothing skipped should report .connected.
     func testPollLoopReportsConnected() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setEventsResults([
             .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
         ])
@@ -322,7 +340,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// .skippedEvents, the state RootView branches its status line on.
     func testPollLoopReportsSkippedEvents() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setEventsResults([
             .success(EventsPage(events: [], lastEventId: 0, skipped: 2)),
         ])
@@ -336,7 +355,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// Regression for E-005: when events() throws, the poll loop should report .reconnecting.
     func testPollLoopReportsReconnectingOnFailure() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setEventsResults([
             .failure(BridgeError.http(status: 500, message: "boom")),
         ])
@@ -351,7 +371,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// re-bind sessionId when its in-flight request finally resolves.
     func testStalePollGenerationDoesNotRebindAfterReconnect() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
 
         let sessionAStarted = try decodeEvent("""
         {
@@ -433,7 +454,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// must not rebind sessionId to a session the new generation knows nothing about.
     func testCreateSessionDoesNotRebindAfterConcurrentReconnect() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
         await client.gateSendCall(1)
 
@@ -581,7 +603,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// carries must not be returned to sendPrompt() as a valid target.
     func testCreateSessionReturnsNilWhenRebindRejected() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
         await client.gateSendCall(1)
 
@@ -672,7 +695,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// already past that event.
     func testApplyBindsToFirstEventWhenNotSessionStarted() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
 
         let turnStarted = try decodeEvent("""
         {
@@ -716,7 +740,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// createSession() must not be overwritten by the create response.
     func testCreateSessionDoesNotOverwriteConcurrentApplyBind() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
         await client.gateSendCall(1)
 
@@ -745,7 +770,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// to true just because the call was attempted.
     func testPairFailureSetsPairingErrorAndLeavesUnpaired() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
         // The real client only reports paired == true once a credential is actually stored;
         // simulate that a failed pair leaves the credential store empty.
@@ -762,7 +788,8 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// until the app relaunches or the user changes host in Settings.
     func testSuccessfulRePairResumesPollingAfterTerminalAuthFailure() async throws {
         let client = FakeBridgeClient()
-        let store = SessionStore(client: client)
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
         // Call 1 is a terminal auth failure that stops the loop; every call after (once
         // re-paired) sees a clean, empty page.
         await client.setEventsResults([
@@ -779,5 +806,152 @@ final class SessionStoreDecisionTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(store.statusKind, .connected, "a successful re-pair must resume polling without a relaunch or host change")
+    }
+
+    // MARK: - Recovery (M3 slice 4)
+    //
+    // Each test parks its poll loop on the fake's gate after the last page, so it does not keep
+    // spinning on the main actor for the rest of the run.
+
+    /// A different bridgeId means the cursor, session and transcript belong to a log that no
+    /// longer exists, even though the new bridge's event ids are higher than the cursor.
+    func testBridgeIdChangeDiscardsSessionTranscriptAndCursor() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 2, skipped: 0, bridgeId: "brg_a")),
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+            .success(EventsPage(events: [], lastEventId: 7, skipped: 0, bridgeId: "brg_b")),
+        ])
+        await client.gateEventsCall(4)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.sessionId, "a different bridge must drop the old session binding")
+        XCTAssertNil(store.pendingApproval, "a different bridge must not leave the old approval card")
+        XCTAssertTrue(store.transcript.isEmpty, "the old bridge's transcript must not stay on screen")
+        XCTAssertEqual(store.lastSeenEventId, 7, "the cursor must restart against the new bridge, not keep 900")
+        XCTAssertEqual(store.syncState, .current)
+    }
+
+    /// The same bridgeId across pages is a continuation: nothing is discarded.
+    func testSameBridgeIdKeepsSessionAndCard() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 2, skipped: 0, bridgeId: "brg_a")),
+            .success(EventsPage(events: [], lastEventId: 3, skipped: 0, bridgeId: "brg_a")),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(store.sessionId, "sess_1")
+        XCTAssertNotNil(store.pendingApproval)
+    }
+
+    /// A truncated page cannot be a continuation: the pending card and the session binding may
+    /// have been resolved in the pruned events, so the store rebuilds from the page and says so.
+    func testTruncatedCursorRebuildsFromPageAndMarksGap() async throws {
+        let defaults = freshDefaults()
+        defaults.set(2, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let (store, client) = try await makeStoreWithPendingApproval(defaults: defaults)
+        let laterSession = try decodeEvent("""
+        {
+            "eventId": 50, "sessionId": "sess_9", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(
+                events: [laterSession], lastEventId: 50, skipped: 0,
+                firstEventId: 50, truncated: true, bridgeId: "brg_a"
+            )),
+            .success(EventsPage(events: [], lastEventId: 50, skipped: 0, firstEventId: 50, bridgeId: "brg_a")),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.pendingApproval, "a card from before the gap must not survive it")
+        XCTAssertEqual(store.sessionId, "sess_9", "the page after the gap must be applied, not ignored as another session")
+        XCTAssertEqual(store.transcript.first?.id, "gap-50", "the gap must be stated in the transcript")
+        XCTAssertEqual(store.lastSeenEventId, 50)
+        XCTAssertEqual(store.syncState, .current)
+    }
+
+    /// A first launch (cursor 0) has shown nothing, so a truncated page is not a gap to report.
+    func testTruncatedPageOnFreshCursorAddsNoGapLine() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 50, skipped: 0, firstEventId: 40, truncated: true)),
+            .success(EventsPage(events: [], lastEventId: 50, skipped: 0, firstEventId: 40)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(store.transcript.contains { $0.id.hasPrefix("gap-") })
+    }
+
+    /// Syncing until the first page is applied, asked for without a long-poll wait; current
+    /// afterwards, and only then does the loop park in a long poll.
+    func testSyncStateBecomesCurrentAfterFirstPageThenLongPolls() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        XCTAssertEqual(store.syncState, .disconnected)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(store.syncState, .current)
+        let waits = await client.waits
+        XCTAssertEqual(waits.first, 0, "the first poll must not park for the full long-poll wait")
+        XCTAssertEqual(waits.dropFirst().first, 20)
+    }
+
+    func testFailedPollReportsDisconnected() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([.failure(URLError(.cannotConnectToHost))])
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(store.syncState, .disconnected)
+        XCTAssertFalse(store.connected)
+    }
+
+    /// reconnect() discards the old host's cursor and session, so the old "Current" must not
+    /// survive into the window before the new host's first page.
+    func testReconnectDropsCurrentBeforeNewHostAnswers() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+            // The new generation's loop ends here instead of spinning (see the MARK note above).
+            .failure(BridgeError.unauthenticated),
+        ])
+        await client.gateEventsCall(2)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(store.syncState, .current)
+
+        await store.reconnect()
+        XCTAssertEqual(store.syncState, .syncing, "the old host's Current must not outlive reconnect()")
     }
 }

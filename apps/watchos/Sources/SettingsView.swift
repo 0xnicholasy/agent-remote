@@ -21,7 +21,7 @@ struct SettingsView: View {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
                 }
                 Section("Status") {
-                    LabeledContent("State", value: store.connected ? "Connected" : "Offline")
+                    LabeledContent("State", value: store.syncState.label)
                     LabeledContent("Last event", value: String(store.lastSeenEventId))
                     LabeledContent("Session", value: store.sessionId ?? "none")
                     Text(store.statusLine).font(.caption2).foregroundStyle(.secondary)
