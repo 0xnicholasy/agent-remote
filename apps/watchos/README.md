@@ -6,7 +6,7 @@ This directory contains an XcodeGen standalone Watch prototype targeting watchOS
 
 The current prototype is conversation-first. Its root view shows a transcript, an inline approval or question card, a turn-state pill, and a reply button. A settings page holds the speech mute toggle, accepts a Mac bridge address, reports connection details, creates a mock session, and exposes cancel. The client long-polls the bridge, sends choices and reviewed text, and stores the bridge address, mute setting, and last event cursor locally. Its bridge-loop test skips when no bridge is listening.
 
-`AgentRemoteWatchUITests` pairs the app with a local bridge and screenshots the idle conversation, a pending approval, the conversation after a decision, and Settings. Start the bridge with `AGENTREMOTE_AUTH=off PORT=8799 bun run src/server.ts`, then export `TEST_RUNNER_AGENTREMOTE_UI_BRIDGE=http://localhost:8799` and `TEST_RUNNER_AGENTREMOTE_UI_PAIR_CODE=<code the bridge printed>` (and optionally `TEST_RUNNER_AGENTREMOTE_UI_SHOT_DIR`) before running `xcodebuild test`. Without them the test skips.
+`AgentRemoteWatchUITests` pairs the app with a local bridge and screenshots the idle conversation, a pending approval, the conversation after a decision, and Settings. Start the bridge from the repo's `bridge/` directory with `AGENTREMOTE_AUTH=off PORT=8799 bun run src/server.ts`, then export `TEST_RUNNER_AGENTREMOTE_UI_BRIDGE=http://localhost:8799` and `TEST_RUNNER_AGENTREMOTE_UI_PAIR_CODE=<code the bridge printed>` (and optionally `TEST_RUNNER_AGENTREMOTE_UI_SHOT_DIR`) before running `xcodebuild test`. Without them the test skips.
 
 ## Current limitations
 

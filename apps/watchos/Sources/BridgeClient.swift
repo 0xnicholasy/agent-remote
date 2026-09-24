@@ -133,7 +133,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .projectNotAllowed: "This Watch is not allowed to use that project."
         case .decisionExpired: "That approval or question already expired."
         case .commandIdConflict: "That command was already sent with different contents."
-        case .rateLimited: "Too many requests from this Watch; try again in a few minutes."
+        case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
         }
     }
 
