@@ -1,9 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type {
   AgentCapabilities,
   AgentEvent,
@@ -128,16 +128,35 @@ describe("bridge HTTP surface", () => {
     expect(body.truncated).toBe(false);
   });
 
-  test("two concurrent retries of one commandId still execute it once", async () => {
+  test("two concurrent retries of one commandId execute it once and get the same outcome", async () => {
     const command = promptCommand("77777777-7777-4777-8777-777777777777");
     const [first, second] = await Promise.all([post(command), post(command)]);
 
     const bodies = (await Promise.all([first.json(), second.json()])) as CommandResponse[];
-    const accepted = bodies.filter((body) => body.accepted);
-    expect(accepted.length).toBe(1);
+    // The retry that lands while the original is running waits for it and reports the original's
+    // outcome, marked as a duplicate, instead of a placeholder that disagrees with it.
+    expect(bodies.map((body) => body.accepted)).toEqual([true, true]);
+    expect(bodies.filter((body) => body.duplicate).length).toBe(1);
 
     const events = await eventsAfter(0);
     expect(events.filter((event) => event.type === "turn.started").length).toBe(1);
+  });
+
+  test("a concurrent retry with the same commandId but a different body is a conflict", async () => {
+    const command = promptCommand("78787878-7878-4878-8878-787878787878");
+    const altered: Command = {
+      commandId: command.commandId,
+      sessionId: command.sessionId,
+      type: "prompt.send",
+      timestamp: command.timestamp,
+      payload: { text: "something else entirely" },
+    };
+    const [first, second] = await Promise.all([post(command), post(altered)]);
+
+    expect(first.status).toBe(200);
+    expect(((await first.json()) as CommandResponse).accepted).toBe(true);
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: "command_id_conflict" });
   });
 
   test("GET /v1/events?after=N returns only newer events with increasing ids", async () => {
@@ -373,10 +392,19 @@ class StubClaudeProvider implements AgentProvider {
   private readonly sessions = new Map<string, Session>();
   /** Set by a test to make the next sendPrompt call throw instead of emitting a reply. */
   sendPromptError: Error | undefined;
+  /** Set by a test to make sendPrompt wait for this promise before resolving or throwing, so a
+   * retry can be sent while the original is provably still in flight. */
+  sendPromptGate: Promise<void> | undefined;
   /** Set by a test to make the next cancel call throw instead of resolving. */
   cancelError: Error | undefined;
   /** Set by a test to make the next createSession call throw instead of returning a session. */
   createSessionError: Error | undefined;
+  /** Set by a test to make createSession wait for this promise before resolving or throwing, so a
+   * retry can be sent while the original session.create is provably still in flight. */
+  createSessionGate: Promise<void> | undefined;
+  /** Incremented on every createSession call, so a test can assert a retry never caused a second
+   * session to be created. */
+  createSessionCallCount = 0;
   /** Set by a test to make the next listSessions call throw instead of returning sessions. */
   listSessionsError: Error | undefined;
 
@@ -401,6 +429,10 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async createSession(projectId: string): Promise<Session> {
+    this.createSessionCallCount += 1;
+    if (this.createSessionGate !== undefined) {
+      await this.createSessionGate;
+    }
     if (this.createSessionError !== undefined) {
       throw this.createSessionError;
     }
@@ -419,6 +451,9 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async sendPrompt(sessionId: string): Promise<void> {
+    if (this.sendPromptGate !== undefined) {
+      await this.sendPromptGate;
+    }
     if (this.sendPromptError !== undefined) {
       throw this.sendPromptError;
     }
@@ -676,6 +711,69 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     }
   });
 
+  test("R-011: a concurrent retry of session.create waits for the in-flight original instead of creating a second session", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    let releaseGate: () => void = () => {};
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        authEnabled: false,
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.createSessionGate = new Promise((resolve) => {
+        releaseGate = resolve;
+      });
+
+      const command: Command = {
+        commandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        sessionId: "ses_placeholder",
+        type: "session.create",
+        timestamp: new Date().toISOString(),
+        payload: { projectId: claudeBridge.session.projectId, provider: "claude" },
+      };
+      const send = () =>
+        claudeBridge.fetch(
+          new Request("http://bridge.local/v1/commands", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(command),
+          }),
+        );
+
+      const originalPromise = send();
+      // Give the original's execution a chance to register itself as in-flight and block on the
+      // gate before the retry is sent, so the retry provably observes it still running.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const retryPromise = send();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      releaseGate();
+
+      const [original, retry] = await Promise.all([originalPromise, retryPromise]);
+      expect(original.status).toBe(200);
+      expect(retry.status).toBe(200);
+      const originalBody = (await original.json()) as CommandResponse;
+      const retryBody = (await retry.json()) as CommandResponse;
+      expect(originalBody.accepted).toBe(true);
+      expect(retryBody.accepted).toBe(true);
+      // The retry waited for and reports the original's outcome, marked as a duplicate, instead
+      // of racing the provider into creating a second session.
+      expect(originalBody.duplicate).toBe(false);
+      expect(retryBody.duplicate).toBe(true);
+      expect(retryBody.sessionId).toBe(originalBody.sessionId);
+      expect(stub.current!.createSessionCallCount).toBe(1);
+    } finally {
+      // Release unconditionally so a failure above can never leave the gated createSession call
+      // (and this test) hanging.
+      releaseGate();
+      restoreProviderEnv();
+    }
+  });
+
   test("C1-002: an unmapped provider error on GET /v1/sessions returns a generic 500 with no leaked detail", async () => {
     process.env.AGENTREMOTE_PROVIDER = "claude";
     try {
@@ -754,6 +852,168 @@ describe("indeterminate commands", () => {
     const retry = await claudeBridge.fetch(request());
     expect(retry.status).toBe(409);
     expect(await retry.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
+  });
+
+  test("a concurrent retry waiting on an original that throws gets 409 command_indeterminate and the original gets 500", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectIdFor(process.cwd())] }));
+    const stub = { current: undefined as StubClaudeProvider | undefined };
+    const claudeBridge = createBridge({
+      registry,
+      now: () => FIXED_NOW,
+      createClaudeProvider: (host, providerOptions) => {
+        stub.current = new StubClaudeProvider(host, providerOptions);
+        return stub.current;
+      },
+    });
+    let releaseGate: () => void = () => {};
+    stub.current!.sendPromptGate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    stub.current!.sendPromptError = new Error("boom: unexpected stub failure");
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+
+    const command: Command = {
+      commandId: "c1111111-1111-4111-8111-111111111111",
+      sessionId: claudeBridge.session.id,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+
+    try {
+      const originalPromise = claudeBridge.fetch(
+        signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: command }),
+      );
+      // Give the original's execution a chance to register itself as in-flight and block on the
+      // gate before the retry is sent, so the retry provably observes it still running.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const retryPromise = claudeBridge.fetch(
+        signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: command, nonce: "retry-nonce" }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      releaseGate();
+
+      const [original, retry] = await Promise.all([originalPromise, retryPromise]);
+      expect(original.status).toBe(500);
+      expect(await original.json()).toEqual({ error: "internal" });
+      expect(retry.status).toBe(409);
+      expect(await retry.json()).toEqual({ error: "command_indeterminate", commandId: command.commandId });
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a concurrent retry signed by a different device while the original is in flight is a conflict", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    const registry = new DeviceRegistry();
+    const allowedProjects = [projectIdFor(process.cwd())];
+    registry.register(sampleDeviceRecord({ allowedProjects }));
+    const deviceId2 = "dev_2222222222222222";
+    const deviceKey2 = Buffer.from("ee".repeat(32), "hex");
+    registry.register(
+      sampleDeviceRecord({
+        deviceId: deviceId2,
+        deviceKeyHex: deviceKey2.toString("hex"),
+        keyId: "key_second",
+        allowedProjects,
+      }),
+    );
+    const stub = { current: undefined as StubClaudeProvider | undefined };
+    const claudeBridge = createBridge({
+      registry,
+      now: () => FIXED_NOW,
+      createClaudeProvider: (host, providerOptions) => {
+        stub.current = new StubClaudeProvider(host, providerOptions);
+        return stub.current;
+      },
+    });
+    let releaseGate: () => void = () => {};
+    stub.current!.sendPromptGate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+
+    const command: Command = {
+      commandId: "c2222222-2222-4222-8222-222222222222",
+      sessionId: claudeBridge.session.id,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+
+    const originalPromise = claudeBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: command }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const retryResponse = await claudeBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: command,
+        deviceId: deviceId2,
+        deviceKey: deviceKey2,
+      }),
+    );
+    expect(retryResponse.status).toBe(409);
+    expect(await retryResponse.json()).toEqual({ error: "command_id_conflict" });
+
+    releaseGate();
+    const original = await originalPromise;
+    expect(original.status).toBe(200);
+    expect(((await original.json()) as CommandResponse).accepted).toBe(true);
+  });
+
+  test("a concurrent retry waiting on an original that resolves to a mapped non-accepted response gets the same status and body", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord({ allowedProjects: [projectIdFor(process.cwd())] }));
+    const stub = { current: undefined as StubClaudeProvider | undefined };
+    const claudeBridge = createBridge({
+      registry,
+      now: () => FIXED_NOW,
+      createClaudeProvider: (host, providerOptions) => {
+        stub.current = new StubClaudeProvider(host, providerOptions);
+        return stub.current;
+      },
+    });
+    let releaseGate: () => void = () => {};
+    stub.current!.sendPromptGate = new Promise((resolve) => {
+      releaseGate = resolve;
+    });
+    stub.current!.sendPromptError = new TurnInProgressError("turn already in progress");
+
+    const command: Command = {
+      commandId: "c3333333-3333-4333-8333-333333333333",
+      sessionId: claudeBridge.session.id,
+      type: "prompt.send",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+
+    const originalPromise = claudeBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: command }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const retryPromise = claudeBridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: command, nonce: "retry-nonce" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseGate();
+
+    const [original, retry] = await Promise.all([originalPromise, retryPromise]);
+    expect(original.status).toBe(409);
+    const originalBody = (await original.json()) as { error: string };
+    expect(originalBody.error).toBe("turn already in progress");
+
+    expect(retry.status).toBe(409);
+    const retryBody = await retry.json();
+    expect(retryBody).toEqual(originalBody);
+    expect((retryBody as { duplicate?: boolean }).duplicate).toBeUndefined();
   });
 });
 
@@ -2126,6 +2386,17 @@ describe("single-writer state dir lock", () => {
     expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
       /already holds the lock/,
     );
+  });
+
+  test("a state file the bridge cannot write stops startup with its path, and releases the lock", () => {
+    // A directory where a journal should be makes the append open fail (EISDIR), which is what
+    // a wrong owner or a read-only file does too, without depending on the test user's privileges.
+    mkdirSync(join(stateDir, "events.jsonl"));
+
+    expect(() => createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW })).toThrow(
+      /cannot write its state file .*events\.jsonl/,
+    );
+    expect(existsSync(join(stateDir, "bridge.lock"))).toBe(false);
   });
 
   test("a lock file left behind by a dead process is taken over instead of blocking startup", () => {
