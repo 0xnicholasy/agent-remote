@@ -399,6 +399,12 @@ class StubClaudeProvider implements AgentProvider {
   cancelError: Error | undefined;
   /** Set by a test to make the next createSession call throw instead of returning a session. */
   createSessionError: Error | undefined;
+  /** Set by a test to make createSession wait for this promise before resolving or throwing, so a
+   * retry can be sent while the original session.create is provably still in flight. */
+  createSessionGate: Promise<void> | undefined;
+  /** Incremented on every createSession call, so a test can assert a retry never caused a second
+   * session to be created. */
+  createSessionCallCount = 0;
   /** Set by a test to make the next listSessions call throw instead of returning sessions. */
   listSessionsError: Error | undefined;
 
@@ -423,6 +429,10 @@ class StubClaudeProvider implements AgentProvider {
   }
 
   async createSession(projectId: string): Promise<Session> {
+    this.createSessionCallCount += 1;
+    if (this.createSessionGate !== undefined) {
+      await this.createSessionGate;
+    }
     if (this.createSessionError !== undefined) {
       throw this.createSessionError;
     }
@@ -697,6 +707,69 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       expect(body.code).toBe("session_limit");
       expect(body.error).toBe("session limit reached");
     } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("R-011: a concurrent retry of session.create waits for the in-flight original instead of creating a second session", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
+    let releaseGate: () => void = () => {};
+    try {
+      const stub = { current: undefined as StubClaudeProvider | undefined };
+      const options: CreateBridgeOptions = {
+        authEnabled: false,
+        createClaudeProvider: (host, providerOptions) => {
+          stub.current = new StubClaudeProvider(host, providerOptions);
+          return stub.current;
+        },
+      };
+      const claudeBridge = createBridge(options);
+      stub.current!.createSessionGate = new Promise((resolve) => {
+        releaseGate = resolve;
+      });
+
+      const command: Command = {
+        commandId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        sessionId: "ses_placeholder",
+        type: "session.create",
+        timestamp: new Date().toISOString(),
+        payload: { projectId: claudeBridge.session.projectId, provider: "claude" },
+      };
+      const send = () =>
+        claudeBridge.fetch(
+          new Request("http://bridge.local/v1/commands", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(command),
+          }),
+        );
+
+      const originalPromise = send();
+      // Give the original's execution a chance to register itself as in-flight and block on the
+      // gate before the retry is sent, so the retry provably observes it still running.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const retryPromise = send();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      releaseGate();
+
+      const [original, retry] = await Promise.all([originalPromise, retryPromise]);
+      expect(original.status).toBe(200);
+      expect(retry.status).toBe(200);
+      const originalBody = (await original.json()) as CommandResponse;
+      const retryBody = (await retry.json()) as CommandResponse;
+      expect(originalBody.accepted).toBe(true);
+      expect(retryBody.accepted).toBe(true);
+      // The retry waited for and reports the original's outcome, marked as a duplicate, instead
+      // of racing the provider into creating a second session.
+      expect(originalBody.duplicate).toBe(false);
+      expect(retryBody.duplicate).toBe(true);
+      expect(retryBody.sessionId).toBe(originalBody.sessionId);
+      expect(stub.current!.createSessionCallCount).toBe(1);
+    } finally {
+      // Release unconditionally so a failure above can never leave the gated createSession call
+      // (and this test) hanging.
+      releaseGate();
       restoreProviderEnv();
     }
   });
