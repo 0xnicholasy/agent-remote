@@ -1,11 +1,16 @@
 import XCTest
 
 /// Drives the app against a running bridge started with AGENTREMOTE_AUTH=off and captures the
-/// core screens: idle conversation, a pending approval, a pending question, and Settings.
-/// Skips unless AGENTREMOTE_UI_BRIDGE (e.g. http://localhost:8799) and AGENTREMOTE_UI_PAIR_CODE
-/// are set; xcodebuild passes them through as TEST_RUNNER_AGENTREMOTE_UI_BRIDGE and
-/// TEST_RUNNER_AGENTREMOTE_UI_PAIR_CODE. Screenshots are kept as test attachments, and also
-/// written as PNGs to AGENTREMOTE_UI_SHOT_DIR when that is set.
+/// core screens: idle conversation, a pending approval, the conversation after a decision, and
+/// Settings. Skips unless AGENTREMOTE_UI_BRIDGE (e.g. http://localhost:8799) and
+/// AGENTREMOTE_UI_PAIR_CODE are set; xcodebuild passes them through as
+/// TEST_RUNNER_AGENTREMOTE_UI_BRIDGE and TEST_RUNNER_AGENTREMOTE_UI_PAIR_CODE. Screenshots are
+/// kept as test attachments, and also written as PNGs to AGENTREMOTE_UI_SHOT_DIR when that is
+/// set.
+private struct SessionTimeout: Error, CustomStringConvertible {
+    var description: String { "bridge never reported a new session within 15s" }
+}
+
 @MainActor
 final class CoreScreensUITests: XCTestCase {
     private var bridge: URL!
@@ -41,21 +46,37 @@ final class CoreScreensUITests: XCTestCase {
 
         button("Deny").tap()
         XCTAssertTrue(button("Allow").waitForNonExistence(timeout: 15))
+        // The mock provider's approval title is always "Run git push origin main", so the
+        // resolution line SessionStore.resolutionLine renders is deterministic regardless of
+        // the prompt text sent above.
+        XCTAssertTrue(
+            app.staticTexts.matching(NSPredicate(format: "label == %@", "Denied: Run git push origin main")).firstMatch
+                .waitForExistence(timeout: 5),
+            "expected the transcript to show the deny resolution line"
+        )
         shot("3-after-deny")
 
         app.swipeUp()
         shot("4-settings")
     }
 
+    /// The simulator's pairing state carries over from a prior run, so this cannot assume a
+    /// fresh install. It detects which of the two states it is in, takes the matching path, and
+    /// asserts the postcondition for that path explicitly rather than assuming success.
     private func pairIfNeeded() throws {
         app.swipeUp()
         XCTAssertTrue(button("Create session").waitForExistence(timeout: 10))
         let pairLink = labeled("Pair Watch")
         reveal(pairLink)
-        if app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'Paired' OR value == 'Paired'")).firstMatch.exists {
+        let pairedIndicator = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'Paired' OR value == 'Paired'")).firstMatch
+        if pairedIndicator.exists {
+            XCTContext.runActivity(named: "already paired from a prior simulator run") { _ in }
             relaunchToSettings()
+            reveal(pairLink)
+            XCTAssertTrue(pairedIndicator.exists, "expected pairing to remain intact across relaunch")
             return
         }
+        XCTContext.runActivity(named: "pairing for the first time") { _ in }
         pairLink.tap()
         let field = app.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
@@ -70,6 +91,8 @@ final class CoreScreensUITests: XCTestCase {
         // A successful pair pops back to Settings; a failed one stays on the pairing form.
         XCTAssertTrue(button("Pair").waitForNonExistence(timeout: 15), "pairing did not complete")
         relaunchToSettings()
+        reveal(pairLink)
+        XCTAssertTrue(pairedIndicator.exists, "expected pairing to have completed")
     }
 
     /// Scrolling the form back up can overshoot onto the previous page, so start Settings fresh.
@@ -116,7 +139,11 @@ final class CoreScreensUITests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(500))
         }
-        throw XCTSkip("bridge never reported a session")
+        // The bridge and pair code are already confirmed reachable by setUp; a session that
+        // never appears here is a real regression, not an environment gap, so this must fail
+        // the test rather than skip it.
+        XCTFail("bridge never reported a new session within 15s")
+        throw SessionTimeout()
     }
 
     private func sendPrompt(_ text: String, sessionId: String) async throws {
@@ -142,7 +169,12 @@ final class CoreScreensUITests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         if let dir = ProcessInfo.processInfo.environment["AGENTREMOTE_UI_SHOT_DIR"] {
-            try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: dir).appending(path: "\(name).png"))
+            let path = URL(fileURLWithPath: dir).appending(path: "\(name).png")
+            do {
+                try screenshot.pngRepresentation.write(to: path)
+            } catch {
+                XCTFail("failed to write screenshot to \(path.path): \(error)")
+            }
         }
     }
 }

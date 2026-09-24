@@ -1357,4 +1357,112 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(SessionStore.resolutionLine(.accepted, title: "Edit README.md"), "Allowed: Edit README.md")
         XCTAssertEqual(SessionStore.resolutionLine(.expired, title: nil), "Approval expired")
     }
+
+    /// Drives approval.resolved through the real apply() path: a matching approvalId must surface
+    /// the pending approval's own title, not just clear the card.
+    func testApprovalResolvedNamesTheApprovalWhenIdMatches() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "rejected" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Denied: Run git push origin main" },
+            "a matching approvalId must surface the approval's own title"
+        )
+    }
+
+    /// A resolved event whose approvalId does not match the pending approval must not misattribute
+    /// that approval's title to an unrelated decision.
+    func testApprovalResolvedFallsBackWhenApprovalIdDoesNotMatch() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_unrelated", "decision": "rejected" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertFalse(
+            store.transcript.contains { $0.text.contains("Run git push origin main") },
+            "an unrelated approvalId must not borrow the pending approval's title"
+        )
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Approval denied" },
+            "an unknown approvalId falls back to the decision alone"
+        )
+    }
+
+    /// Mirrors the C-1 discardLocalView regression written for lastQuestion: discarding the local
+    /// view across a truncated gap must also clear lastApproval, or an approval.resolved on the far
+    /// side whose approvalId happens to match the discarded approval would render its OLD title.
+    func testDiscardLocalViewClearsLastApprovalAcrossGap() async throws {
+        let defaults = freshDefaults()
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+
+        let approvalRequested = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_1", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_1", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Old title"
+            }
+        }
+        """)
+        store.apply(approvalRequested)
+
+        let approvalResolved = try decodeEvent("""
+        {
+            "eventId": 60, "sessionId": "sess_2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "rejected" }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(
+                events: [approvalResolved], lastEventId: 60, skipped: 0,
+                firstEventId: 60, truncated: true
+            )),
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0, firstEventId: 60)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(
+            store.transcript.contains { $0.text == "Denied: Old title" },
+            "the discarded approval's title must not survive the gap"
+        )
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Approval denied" },
+            "an approvalId reused after discard must fall back to the decision alone"
+        )
+    }
 }
