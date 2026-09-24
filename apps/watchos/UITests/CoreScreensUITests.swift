@@ -11,6 +11,15 @@ private struct SessionTimeout: Error, CustomStringConvertible {
     var description: String { "bridge never reported a new session within 15s" }
 }
 
+/// Thrown after XCTFail records a non-2xx bridge response, so the request helper cannot
+/// continue on into decoding with an unusable body.
+private struct BridgeRequestFailed: Error, CustomStringConvertible {
+    var context: String
+    var statusCode: Int
+    var body: String
+    var description: String { "\(context) failed with status \(statusCode): \(body)" }
+}
+
 @MainActor
 final class CoreScreensUITests: XCTestCase {
     private var bridge: URL!
@@ -130,8 +139,23 @@ final class CoreScreensUITests: XCTestCase {
     }
 
     private func sessionIds() async throws -> Set<String> {
-        let (data, _) = try await URLSession.shared.data(from: bridge.appending(path: "v1/sessions"))
+        let (data, response) = try await URLSession.shared.data(from: bridge.appending(path: "v1/sessions"))
+        try Self.requireSuccess(response, data: data, context: "GET v1/sessions")
         return Set(try JSONDecoder().decode(SessionList.self, from: data).sessions.map(\.id))
+    }
+
+    /// Fails fast on a non-2xx bridge response so the real status code and body surface instead
+    /// of an opaque decode error (or, for polling call sites, a misleading timeout).
+    private static func requireSuccess(_ response: URLResponse, data: Data, context: String) throws {
+        guard let http = response as? HTTPURLResponse else {
+            XCTFail("\(context): response was not an HTTPURLResponse")
+            return
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = String(decoding: data.prefix(500), as: UTF8.self)
+            XCTFail("\(context) failed with status \(http.statusCode): \(body)")
+            throw BridgeRequestFailed(context: context, statusCode: http.statusCode, body: body)
+        }
     }
 
     private func waitForSession(notIn existing: Set<String>) async throws -> String {
@@ -160,8 +184,8 @@ final class CoreScreensUITests: XCTestCase {
             "payload": ["text": text],
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, response) = try await URLSession.shared.data(for: request)
-        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.requireSuccess(response, data: data, context: "POST v1/commands")
     }
 
     private func shot(_ name: String) {
