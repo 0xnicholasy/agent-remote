@@ -47,4 +47,11 @@ final class EventsPageDecoderTests: XCTestCase {
         XCTAssertTrue(page.truncated)
         XCTAssertEqual(page.bridgeId, "brg_1a2b3c4d")
     }
+
+    func testThrowsOnWrongTypedTruncated() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "truncated": "true" }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
 }

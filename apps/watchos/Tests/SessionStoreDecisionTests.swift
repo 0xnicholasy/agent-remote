@@ -834,6 +834,45 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.syncState, .current)
     }
 
+    /// A bridgeId loaded from defaults at init (i.e. persisted across a relaunch) must still be
+    /// compared against later pages, or a relaunch would blind the bridge-change guard.
+    func testPersistedBridgeIdSurvivesRelaunchAndDetectsChange() async throws {
+        let defaults = freshDefaults()
+        defaults.set("brg_a", forKey: "dev.agentremote.watch.bridgeId")
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let (store, client) = try await makeStoreWithPendingApproval(defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+            .success(EventsPage(events: [], lastEventId: 7, skipped: 0, bridgeId: "brg_b")),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.sessionId, "a bridgeId loaded at init must still detect a bridge change")
+        XCTAssertNil(store.pendingApproval, "a bridge change after relaunch must not leave the old approval card")
+        XCTAssertTrue(store.transcript.isEmpty, "a bridge change after relaunch must not leave the old transcript")
+        XCTAssertEqual(store.lastSeenEventId, 7, "the cursor must restart against the new bridge")
+    }
+
+    /// reconnect() clears the stored bridgeId, or a relaunch right after would treat the old
+    /// bridge's id as still current and silently drop the new bridge's first page as unchanged.
+    func testReconnectClearsPersistedBridgeId() async throws {
+        let defaults = freshDefaults()
+        defaults.set("brg_a", forKey: "dev.agentremote.watch.bridgeId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .failure(BridgeError.unauthenticated),
+        ])
+
+        await store.reconnect()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertNil(defaults.string(forKey: "dev.agentremote.watch.bridgeId"), "reconnect() must clear the persisted bridgeId")
+    }
+
     /// The same bridgeId across pages is a continuation: nothing is discarded.
     func testSameBridgeIdKeepsSessionAndCard() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()

@@ -220,12 +220,19 @@ final class SessionStore {
                 }
                 // Inserted after applying, or a session.started in the page would clear it.
                 if gap {
-                    let first = response.firstEventId ?? 0
-                    transcript.insert(TranscriptItem(
-                        id: "gap-\(first)",
-                        role: .system,
-                        text: "Earlier events expired on the bridge; showing from event \(first)"
-                    ), at: 0)
+                    if let first = response.firstEventId {
+                        transcript.insert(TranscriptItem(
+                            id: "gap-\(first)",
+                            role: .system,
+                            text: "Earlier events expired on the bridge; showing from event \(first)"
+                        ), at: 0)
+                    } else {
+                        transcript.insert(TranscriptItem(
+                            id: "gap-\(response.lastEventId)",
+                            role: .system,
+                            text: "Earlier events expired on the bridge"
+                        ), at: 0)
+                    }
                 }
                 // Advances past skipped (undecodable) events too, not just the decoded ones.
                 lastSeenEventId = max(lastSeenEventId, response.lastEventId)

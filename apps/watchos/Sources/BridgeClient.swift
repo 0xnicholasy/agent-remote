@@ -49,13 +49,43 @@ enum EventsPageDecoder {
                 }
             }
         }
+        let firstEventId: Int?
+        if let raw = root["firstEventId"], !(raw is NSNull) {
+            guard let value = raw as? Int else {
+                throw BridgeError.malformedResponse("firstEventId has the wrong type")
+            }
+            firstEventId = value
+        } else {
+            firstEventId = nil
+        }
+
+        let truncated: Bool
+        if let raw = root["truncated"], !(raw is NSNull) {
+            guard let value = raw as? Bool else {
+                throw BridgeError.malformedResponse("truncated has the wrong type")
+            }
+            truncated = value
+        } else {
+            truncated = false
+        }
+
+        let bridgeId: String?
+        if let raw = root["bridgeId"], !(raw is NSNull) {
+            guard let value = raw as? String else {
+                throw BridgeError.malformedResponse("bridgeId has the wrong type")
+            }
+            bridgeId = value
+        } else {
+            bridgeId = nil
+        }
+
         return EventsPage(
             events: events,
             lastEventId: maxEventId,
             skipped: skipped,
-            firstEventId: root["firstEventId"] as? Int,
-            truncated: root["truncated"] as? Bool ?? false,
-            bridgeId: root["bridgeId"] as? String
+            firstEventId: firstEventId,
+            truncated: truncated,
+            bridgeId: bridgeId
         )
     }
 }
