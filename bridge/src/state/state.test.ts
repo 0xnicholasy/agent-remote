@@ -545,7 +545,7 @@ describe("NonceCache persistence", () => {
     const muchLater = new Date(NOW.getTime() + 10 * 60 * 1000); // past the 300s nonce TTL
     const afterExpiry = new NonceCache({ journal: createNonceJournal(filePath), now: muchLater });
     expect(afterExpiry.has("dev_a", "nonce-fresh", muchLater)).toBe(false);
-    expect(lineCount(filePath)).toBe(0);
+    expect(lineCount(filePath)).toBe(1); // only the watermark is left
   });
 
   test("crossing the append-count compaction threshold rewrites the journal down to the live set", () => {
@@ -562,7 +562,7 @@ describe("NonceCache persistence", () => {
       cache.record("dev_a", `nonce-${index}`, now);
     }
 
-    expect(lineCount(filePath)).toBe(1); // compacted to just the one still-live nonce
+    expect(lineCount(filePath)).toBe(2); // compacted to the watermark and the one still-live nonce
     expect(cache.has("dev_a", "nonce-999", now)).toBe(true);
 
     const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now });
@@ -593,25 +593,36 @@ describe("NonceCache persistence", () => {
     expect(reloaded.has("dev_a", "nonce-durable", NOW)).toBe(true);
   });
 
-  test("the per-device nonce cap and journal persistence agree on who survives a restart", () => {
+  test("a full device refuses new nonces, and every recorded one survives a restart", () => {
     const filePath = join(stateDir, "nonces.jsonl");
     const MAX_NONCES_PER_DEVICE = 10_000; // mirrors auth/verify.ts's cap, which is not exported
     const cache = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
 
-    const total = MAX_NONCES_PER_DEVICE + 10;
-    for (let index = 0; index < total; index += 1) {
+    for (let index = 0; index < MAX_NONCES_PER_DEVICE; index += 1) {
       cache.record("dev_a", `nonce-${index}`, NOW);
     }
-
-    // In-memory eviction dropped the oldest 10 before any restart happens at all.
-    expect(cache.has("dev_a", "nonce-9", NOW)).toBe(false);
-    expect(cache.has("dev_a", "nonce-10", NOW)).toBe(true);
+    expect(cache.record("dev_a", "nonce-over", NOW)).toBe(false);
 
     const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
-    // The journal must agree with the in-memory eviction: a survivor the cap kept must still be
-    // known after a restart, and one it evicted must not come back as if it were still fresh.
-    expect(reloaded.has("dev_a", "nonce-9", NOW)).toBe(false);
-    expect(reloaded.has("dev_a", "nonce-10", NOW)).toBe(true);
-    expect(reloaded.has("dev_a", `nonce-${total - 1}`, NOW)).toBe(true);
+    expect(reloaded.has("dev_a", "nonce-0", NOW)).toBe(true);
+    expect(reloaded.has("dev_a", `nonce-${MAX_NONCES_PER_DEVICE - 1}`, NOW)).toBe(true);
+    expect(reloaded.has("dev_a", "nonce-over", NOW)).toBe(false);
+    expect(reloaded.record("dev_a", "nonce-over", NOW)).toBe(false);
+  });
+
+  test("the clock watermark survives a restart after every nonce has expired", () => {
+    const filePath = join(stateDir, "nonces.jsonl");
+    const cache = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+    cache.record("dev_a", "nonce-early", NOW);
+
+    // Restart well after expiry: the nonce is compacted away, and only the watermark remains.
+    const ahead = new Date(NOW.getTime() + 10 * 60 * 1000);
+    new NonceCache({ journal: createNonceJournal(filePath), now: ahead });
+    expect(lineCount(filePath)).toBe(1);
+
+    // Another restart with the host clock set back to NOW still judges time from `ahead`, so the
+    // pruned nonce's envelope would be stale rather than fresh and unrecorded.
+    const rolledBack = new NonceCache({ journal: createNonceJournal(filePath), now: NOW });
+    expect(rolledBack.referenceTime(NOW)).toBe(ahead.getTime());
   });
 });

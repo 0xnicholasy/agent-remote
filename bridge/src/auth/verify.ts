@@ -63,23 +63,45 @@ export interface NonceRecord {
 }
 
 /**
+ * The latest bridge time the cache has ever acted on, persisted so it survives compaction and a
+ * restart. Written as the first line of every compaction; a nonce record carries its own lower
+ * bound (`expiresAt - NONCE_TTL_MS`), so appends never need to write one.
+ */
+export interface NonceWatermarkRecord {
+  watermarkMs: number;
+}
+
+/** One line of `nonces.jsonl`: a spent nonce, or the watermark a compaction leaves behind. */
+export type NonceJournalRecord = NonceRecord | NonceWatermarkRecord;
+
+/**
  * Storage a `NonceCache` writes through to so replay protection survives a bridge restart.
  * Deliberately an interface rather than a file path: this module stays free of `node:fs`, and
  * the bridge supplies the JSON Lines implementation from `src/state/nonces.ts`.
  */
 export interface NonceJournal {
-  load(): NonceRecord[];
+  load(): NonceJournalRecord[];
   append(record: NonceRecord): void;
-  rewrite(records: readonly NonceRecord[]): void;
+  rewrite(records: readonly NonceJournalRecord[]): void;
 }
 
 /** Appends since the last compaction that trigger a rewrite of the journal file. */
 const COMPACT_AFTER_APPENDS = 1_000;
 
 /**
- * Per-device nonce set with a 300s TTL and a 10,000-entry cap per device, oldest dropped first.
- * A `Map`'s keys iterate in insertion order, and since every entry's TTL is the same fixed
- * duration, insertion order and expiry order coincide as long as `now` does not go backwards.
+ * Per-device nonce set with a 300s TTL and a 10,000-entry cap per device.
+ *
+ * Every time the cache reads is `max(now, watermark)`, where the watermark is the latest time it
+ * has ever acted on. A host clock that moves backwards therefore cannot make an entry look
+ * unexpired-then-expired twice, and `verifyEnvelope` judges timestamp freshness against the same
+ * reference (see `referenceTime`), so a nonce pruned while the clock was ahead can never come
+ * back into the freshness window after the clock is corrected. It also keeps insertion order and
+ * expiry order identical, which `pruneExpired` relies on.
+ *
+ * A full device is refused, never evicted: dropping a nonce that is still inside its validity
+ * window would make that exact envelope replayable. `record` returns false instead and the
+ * request is rejected with `rate_limited`. Only a holder of the device key can fill the set,
+ * since nothing is recorded before the signature verifies.
  *
  * With a `NonceJournal` the same set is written through to disk and rehydrated on construction,
  * so a request replayed across a bridge restart is still refused. Entries already expired at
@@ -89,6 +111,7 @@ export class NonceCache {
   private readonly perDevice = new Map<string, Map<string, number>>();
   private readonly journal: NonceJournal | undefined;
   private appendsSinceCompaction = 0;
+  private watermarkMs = Number.NEGATIVE_INFINITY;
 
   constructor(options: { journal?: NonceJournal; now?: Date } = {}) {
     this.journal = options.journal;
@@ -96,18 +119,23 @@ export class NonceCache {
       return;
     }
 
-    const nowMs = (options.now ?? new Date()).getTime();
     // `load` throws on a filesystem failure (see JsonlJournal). Let it propagate rather than
     // treating an unreadable journal as an empty one: the latter would silently accept every
     // nonce this device has ever used, defeating replay protection after a restart.
     const persistedRecords = this.journal.load();
+    for (const record of persistedRecords) {
+      if (typeof (record as NonceWatermarkRecord | undefined)?.watermarkMs === "number") {
+        this.advanceWatermark((record as NonceWatermarkRecord).watermarkMs);
+      } else if (isNonceRecord(record)) {
+        this.advanceWatermark(record.expiresAt - NONCE_TTL_MS);
+      }
+    }
+    const nowMs = this.referenceTime(options.now ?? new Date());
+    this.advanceWatermark(nowMs);
+
     let dropped = false;
     for (const record of persistedRecords) {
-      if (typeof record?.deviceId !== "string" || typeof record.nonce !== "string" || typeof record.expiresAt !== "number") {
-        dropped = true;
-        continue;
-      }
-      if (record.expiresAt <= nowMs) {
+      if (!isNonceRecord(record) || record.expiresAt <= nowMs) {
         dropped = true;
         continue;
       }
@@ -118,14 +146,17 @@ export class NonceCache {
       }
       nonces.set(record.nonce, record.expiresAt);
     }
-    for (const nonces of this.perDevice.values()) {
-      if (this.evictOverflow(nonces)) {
-        dropped = true;
-      }
-    }
     if (dropped) {
       this.compact();
     }
+  }
+
+  /**
+   * `max(now, watermark)` in epoch milliseconds: the time this cache, and the freshness check in
+   * `verifyEnvelope`, treat as current. Equal to `now` unless the host clock has moved backwards.
+   */
+  referenceTime(now: Date): number {
+    return Math.max(now.getTime(), this.watermarkMs);
   }
 
   has(deviceId: string, nonce: string, now: Date): boolean {
@@ -134,43 +165,55 @@ export class NonceCache {
       return false;
     }
     const expiresAt = nonces.get(nonce);
-    return expiresAt !== undefined && expiresAt > now.getTime();
+    return expiresAt !== undefined && expiresAt > this.referenceTime(now);
   }
 
-  record(deviceId: string, nonce: string, now: Date): void {
+  /**
+   * Marks `nonce` spent. Returns false, recording nothing, when the device already holds the
+   * maximum number of unexpired nonces; the caller must refuse the request.
+   */
+  record(deviceId: string, nonce: string, now: Date): boolean {
     let nonces = this.perDevice.get(deviceId);
     if (nonces === undefined) {
       nonces = new Map<string, number>();
       this.perDevice.set(deviceId, nonces);
     }
 
-    this.pruneExpired(nonces, now);
-    const expiresAt = now.getTime() + NONCE_TTL_MS;
-
-    if (this.journal === undefined) {
-      nonces.set(nonce, expiresAt);
-      this.evictOverflow(nonces);
-      return;
+    const nowMs = this.referenceTime(now);
+    this.pruneExpired(nonces, nowMs);
+    if (nonces.size >= MAX_NONCES_PER_DEVICE) {
+      return false;
     }
+    const expiresAt = nowMs + NONCE_TTL_MS;
+
     // Persist before marking the nonce used in memory, so the two can never disagree. `append`
     // throws on a filesystem failure (see JsonlJournal); letting it propagate out of `record`
     // and in turn out of `verifyEnvelope` is what makes an unpersistable nonce fail closed, and
-    // appending first means the throw leaves the in-memory set untouched rather than holding a
-    // nonce the journal never recorded (which would look spent now and replay cleanly after a
-    // restart). The same ordering keeps eviction honest: nothing is evicted on behalf of an
-    // entry that was never durably written.
-    this.journal.append({ deviceId, nonce, expiresAt });
+    // appending first means the throw leaves the in-memory set (and the watermark) untouched
+    // rather than holding a nonce the journal never recorded (which would look spent now and
+    // replay cleanly after a restart).
+    this.journal?.append({ deviceId, nonce, expiresAt });
     nonces.set(nonce, expiresAt);
-    this.evictOverflow(nonces);
+    this.advanceWatermark(nowMs);
+    if (this.journal === undefined) {
+      return true;
+    }
     this.appendsSinceCompaction += 1;
     if (this.appendsSinceCompaction >= COMPACT_AFTER_APPENDS) {
       this.compact();
     }
+    return true;
   }
 
-  private pruneExpired(nonces: Map<string, number>, now: Date): void {
+  private advanceWatermark(ms: number): void {
+    if (ms > this.watermarkMs) {
+      this.watermarkMs = ms;
+    }
+  }
+
+  private pruneExpired(nonces: Map<string, number>, nowMs: number): void {
     for (const [key, expiresAt] of nonces) {
-      if (expiresAt > now.getTime()) {
+      if (expiresAt > nowMs) {
         break; // insertion order == expiry order (see class comment)
       }
       nonces.delete(key);
@@ -178,30 +221,18 @@ export class NonceCache {
   }
 
   /**
-   * Evicts oldest-first while over the per-device cap. Shared by `record` (evicts at most one,
-   * since insertion happens one nonce at a time) and the constructor's rehydrate path (may evict
-   * many at once), so the cap and its ordering can never drift between the live and reload paths.
-   * Returns whether anything was evicted.
+   * Rewrites the journal to the watermark plus exactly the live set, dropping expired entries.
+   * The watermark line is what keeps the clock-rollback guarantee across a restart once every
+   * nonce has expired and there is no record left to derive it from.
    */
-  private evictOverflow(nonces: Map<string, number>): boolean {
-    let evicted = false;
-    while (nonces.size > MAX_NONCES_PER_DEVICE) {
-      const oldest = nonces.keys().next();
-      if (oldest.done) {
-        break;
-      }
-      nonces.delete(oldest.value);
-      evicted = true;
-    }
-    return evicted;
-  }
-
-  /** Rewrites the journal to exactly the live set, dropping expired and evicted entries. */
   private compact(): void {
     if (this.journal === undefined) {
       return;
     }
-    const records: NonceRecord[] = [];
+    const records: NonceJournalRecord[] = [];
+    if (Number.isFinite(this.watermarkMs)) {
+      records.push({ watermarkMs: this.watermarkMs });
+    }
     for (const [deviceId, nonces] of this.perDevice) {
       for (const [nonce, expiresAt] of nonces) {
         records.push({ deviceId, nonce, expiresAt });
@@ -209,8 +240,9 @@ export class NonceCache {
     }
     // Unlike `append`, a failed compaction is tolerated: every entry in `records` was already
     // durably appended one at a time, so the journal on disk is still a correct (just uncompacted)
-    // superset of the live set. Log and retry at the next compaction threshold instead of failing
-    // the request that happened to trigger this compaction.
+    // superset of the live set, and the watermark is still derivable from it. Log and retry at the
+    // next compaction threshold instead of failing the request that happened to trigger this
+    // compaction.
     try {
       this.journal.rewrite(records);
       this.appendsSinceCompaction = 0;
@@ -220,11 +252,25 @@ export class NonceCache {
   }
 }
 
-export type VerifyRejectionCode = "unauthenticated" | "device_revoked" | "stale_request" | "replayed_request";
+function isNonceRecord(record: NonceJournalRecord | undefined): record is NonceRecord {
+  const candidate = record as Partial<NonceRecord> | undefined;
+  return (
+    typeof candidate?.deviceId === "string" &&
+    typeof candidate.nonce === "string" &&
+    typeof candidate.expiresAt === "number"
+  );
+}
+
+export type VerifyRejectionCode =
+  | "unauthenticated"
+  | "device_revoked"
+  | "stale_request"
+  | "replayed_request"
+  | "rate_limited";
 
 export type VerifyEnvelopeResult =
   | { ok: true; device: DeviceRecord }
-  | { ok: false; status: 401 | 403; code: VerifyRejectionCode };
+  | { ok: false; status: 401 | 403 | 429; code: VerifyRejectionCode };
 
 export interface VerifyEnvelopeParams {
   headers: HeaderSource;
@@ -273,9 +319,12 @@ export function verifyEnvelope(params: VerifyEnvelopeParams): VerifyEnvelopeResu
     return { ok: false, status: 403, code: "device_revoked" };
   }
 
-  // 4. Timestamp parses and is within skew of the bridge clock.
+  // 4. Timestamp parses and is within skew of the bridge clock. The clock read is the nonce
+  // cache's reference time, not raw `now`: after the host clock moves backwards, a timestamp is
+  // still judged against the latest time the cache has acted on, so an envelope whose nonce was
+  // already pruned cannot become fresh again (see NonceCache).
   const timestampMs = Date.parse(timestamp);
-  if (Number.isNaN(timestampMs) || Math.abs(params.now.getTime() - timestampMs) > params.skewMs) {
+  if (Number.isNaN(timestampMs) || Math.abs(params.nonces.referenceTime(params.now) - timestampMs) > params.skewMs) {
     return { ok: false, status: 401, code: "stale_request" };
   }
 
@@ -297,6 +346,11 @@ export function verifyEnvelope(params: VerifyEnvelopeParams): VerifyEnvelopeResu
     return { ok: false, status: 401, code: "unauthenticated" };
   }
 
-  params.nonces.record(deviceId, nonce, params.now);
+  // 7. Room left in this device's nonce set. Only reachable with a valid signature, so only a
+  // holder of the device key can hit it; refusing keeps every recorded nonce spent until it
+  // expires instead of evicting one that could then be replayed.
+  if (!params.nonces.record(deviceId, nonce, params.now)) {
+    return { ok: false, status: 429, code: "rate_limited" };
+  }
   return { ok: true, device };
 }

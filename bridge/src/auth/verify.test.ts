@@ -93,16 +93,33 @@ describe("NonceCache", () => {
     expect(cache.has("dev_1", "n1", now)).toBe(true);
   });
 
-  test("evicts the oldest entry once a device hits the 10,000 cap", () => {
+  test("a full device is refused instead of evicting a nonce that is still valid", () => {
     const cache = new NonceCache();
     const now = new Date();
     for (let i = 0; i < 10_000; i++) {
-      cache.record("dev_1", `n${i}`, now);
+      expect(cache.record("dev_1", `n${i}`, now)).toBe(true);
     }
+    // Evicting n0 here would let its captured envelope replay inside its validity window.
+    expect(cache.record("dev_1", "n10000", now)).toBe(false);
     expect(cache.has("dev_1", "n0", now)).toBe(true);
-    cache.record("dev_1", "n10000", now);
-    expect(cache.has("dev_1", "n0", now)).toBe(false);
-    expect(cache.has("dev_1", "n10000", now)).toBe(true);
+    expect(cache.has("dev_1", "n10000", now)).toBe(false);
+    // Another device has its own budget.
+    expect(cache.record("dev_2", "n0", now)).toBe(true);
+    // Room comes back only as entries actually expire.
+    expect(cache.record("dev_1", "n10000", new Date(now.getTime() + 300_000))).toBe(true);
+  });
+
+  test("a clock that moves backwards cannot make a pruned nonce's timestamp fresh again", () => {
+    const cache = new NonceCache();
+    const recordedAt = new Date("2026-09-20T10:15:00.000Z");
+    cache.record("dev_1", "n1", recordedAt);
+
+    // The host clock jumps forward past the TTL, a new request prunes n1, then the clock is set
+    // back to where n1 was recorded.
+    const jumpedAhead = new Date(recordedAt.getTime() + 600_000);
+    cache.record("dev_1", "n2", jumpedAhead);
+    expect(cache.referenceTime(recordedAt)).toBe(jumpedAhead.getTime());
+    expect(cache.has("dev_1", "n2", recordedAt)).toBe(true);
   });
 
   // NONCE_TTL_MS is 300_000 (5 minutes). The accepted timestamp-skew window used in production
@@ -206,6 +223,41 @@ describe("verifyEnvelope", () => {
     params.nonces.record("dev_9f2c4a1b7d3e5061", "n0nce", params.now);
     const result = verifyEnvelope(params);
     expect(result).toEqual({ ok: false, status: 401, code: "replayed_request" });
+  });
+
+  test("an envelope replayed after the host clock jumps ahead and back is refused", () => {
+    const params = baseParams();
+    expect(verifyEnvelope(params).ok).toBe(true);
+
+    // A later request while the clock is 10 minutes ahead prunes the first envelope's nonce.
+    const ahead = new Date(params.now.getTime() + 600_000);
+    const laterNonce = "n0nce-later";
+    const laterHeaders = {
+      "X-AgentRemote-Device": "dev_9f2c4a1b7d3e5061",
+      "X-AgentRemote-Timestamp": ahead.toISOString(),
+      "X-AgentRemote-Nonce": laterNonce,
+      "X-AgentRemote-Signature": signRequest(DEVICE_KEY, {
+        method: "GET",
+        pathWithQuery: "/v1/events?after=0",
+        timestamp: ahead.toISOString(),
+        nonce: laterNonce,
+        bodySha256: createHash("sha256").update("").digest("hex"),
+      }),
+    };
+    expect(verifyEnvelope({ ...params, headers: laterHeaders, now: ahead }).ok).toBe(true);
+    expect(params.nonces.has("dev_9f2c4a1b7d3e5061", "n0nce", ahead)).toBe(false);
+
+    // The clock is corrected back; the captured first envelope is inside skew of raw `now` again.
+    expect(verifyEnvelope(params)).toEqual({ ok: false, status: 401, code: "stale_request" });
+  });
+
+  test("a device whose nonce set is full -> 429 rate_limited, and nothing is evicted", () => {
+    const params = baseParams();
+    for (let i = 0; i < 10_000; i++) {
+      params.nonces.record("dev_9f2c4a1b7d3e5061", `filler-${i}`, params.now);
+    }
+    expect(verifyEnvelope(params)).toEqual({ ok: false, status: 429, code: "rate_limited" });
+    expect(params.nonces.has("dev_9f2c4a1b7d3e5061", "filler-0", params.now)).toBe(true);
   });
 
   test("bad signature -> unauthenticated", () => {

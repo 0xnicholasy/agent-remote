@@ -1,4 +1,4 @@
-import type { NonceJournal, NonceRecord } from "../auth/verify";
+import type { NonceJournal, NonceJournalRecord } from "../auth/verify";
 
 import { JsonlJournal } from "./journal";
 
@@ -13,7 +13,7 @@ import { JsonlJournal } from "./journal";
  * successfully-written journal.
  */
 export function createNonceJournal(filePath?: string): NonceJournal {
-  const journal = new JsonlJournal<NonceRecord>(filePath);
+  const journal = new JsonlJournal<NonceJournalRecord>(filePath);
   return {
     load: () => journal.load(),
     append: (record) => journal.append(record),
