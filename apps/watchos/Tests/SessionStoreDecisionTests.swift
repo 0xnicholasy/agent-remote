@@ -344,9 +344,10 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
     }
 
-    /// A send that got a verdict must not leave its id behind for reuse: the next identical
-    /// payload is a new command.
-    func testFailedSendDoesNotReuseCommandId() async throws {
+    /// Regression for E-02: a generic (non-offline) failure does not mean the command never
+    /// reached the bridge -- the response could simply have been lost. A retry of the same
+    /// choice must reuse the id, or the bridge could apply the decision twice.
+    func testFailedSendReusesCommandIdForSameChoice() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()
         await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
 
@@ -355,8 +356,22 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         let calls = await client.sentCalls
         XCTAssertEqual(calls.count, 2)
-        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId, "a retry of the same choice after a failure must reuse the command id")
         XCTAssertEqual(store.outcome(forCard: "appr_1"), .failed)
+    }
+
+    /// A different choice after a generic failure is still a different command: it must not
+    /// reuse the id the first choice remembered.
+    func testFailedThenDifferentChoiceUsesNewCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+
+        await store.approve()
+        await store.reject()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
     }
 
     /// The outcome belongs to the card it was sent for; a newer card starts with none.
@@ -710,6 +725,111 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.pendingQuestion?.questionId, "q_2", "the newer card must survive the stale 409")
         XCTAssertEqual(store.statusLine, statusLineBeforeStale409, "the newer card's status line must not be stomped by the stale 409")
         XCTAssertNotEqual(store.statusKind, .requestInvalid)
+    }
+
+    /// Regression for E-01: a stale generic failure for approve() must not stomp the status
+    /// line or turn state for a newer, still-valid card that replaced it while the send was in
+    /// flight.
+    func testStaleFailedDoesNotStompNewerCardStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerApprovalRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main --force"
+            }
+        }
+        """)
+        store.apply(newerApprovalRequested)
+        let statusLineBeforeStaleFailure = store.statusLine
+        let statusKindBeforeStaleFailure = store.statusKind
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale failure")
+        XCTAssertEqual(store.statusLine, statusLineBeforeStaleFailure, "the newer card's status line must not be stomped by the stale failure")
+        XCTAssertEqual(store.statusKind, statusKindBeforeStaleFailure, "the newer card's status kind must not be stomped by the stale failure")
+    }
+
+    /// Regression for E-05: classify() must not collapse a rate-limited response into the same
+    /// generic outcome as an arbitrary failure -- the two need distinct messages so the Watch
+    /// can tell the user which situation they are in.
+    func testRateLimitedIsDistinctFromGenericFailure() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.rateLimited), .rateLimited)
+        XCTAssertNotEqual(ActionOutcome.classify(BridgeError.rateLimited), ActionOutcome.classify(BridgeError.http(status: 500, message: "boom")))
+        XCTAssertNotEqual(ActionOutcome.rateLimited.label, ActionOutcome.failed.label)
+    }
+
+    /// Regression for E-05: an auth failure (revoked/unpaired/unauthenticated credential) must
+    /// not be reported as a generic, retry-worthy failure -- retrying will never succeed until
+    /// the Watch is paired again.
+    func testAuthFailuresClassifyDistinctlyFromGenericFailure() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.notPaired), .authRequired)
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.unauthenticated), .authRequired)
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.deviceRevoked), .authRequired)
+        XCTAssertNotEqual(ActionOutcome.authRequired.label, ActionOutcome.failed.label)
+    }
+
+    /// Regression for E-11: commandIdConflict is the one classify() branch that had no test --
+    /// it must be reported the same way a stale/superseded interaction is, not as a generic
+    /// failure, since retrying with a fresh id would only be refused again.
+    func testCommandIdConflictClassifiesAsNoLongerValid() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.commandIdConflict), .noLongerValid)
+    }
+
+    /// Regression for E-11: a commandIdConflict from an in-flight decide() call clears the card
+    /// and reports it as no longer valid, exactly like the other terminal outcomes.
+    func testCommandIdConflictClearsCardAndSetsStatus() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.commandIdConflict))
+
+        await store.approve()
+
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .noLongerValid)
+        XCTAssertEqual(store.statusKind, .requestInvalid)
+    }
+
+    /// Regression for E-09: decide()'s response can land after reconnect() has already bumped
+    /// pollGeneration and discarded the card it was answering for. The stale response must not
+    /// resurrect the outcome/status for a binding the new generation knows nothing about
+    /// (mirrors the equivalent guard in createSession()).
+    func testDecideDoesNotWriteOutcomeAfterConcurrentReconnect() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before reconnect() runs.
+        try await Task.sleep(for: .milliseconds(20))
+
+        // Hold reconnect()'s own poll loop's first events() call in flight, or its "Syncing"
+        // status write would race the assertions below.
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.sessionId)
+        XCTAssertNil(store.pendingApproval, "reconnect() must have already discarded the old card")
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertNil(store.actionOutcome, "a stale generation's response must not resurrect an outcome for a discarded card")
+        XCTAssertNil(store.pendingApproval, "a stale generation's response must not resurrect the discarded card")
     }
 
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a

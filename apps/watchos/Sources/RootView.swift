@@ -43,6 +43,13 @@ struct ConversationView: View {
                         } else if let question = store.pendingQuestion {
                             ChoiceCardView(question: question, onOther: { dictating = true })
                                 .id("choice-\(question.questionId)")
+                        } else if store.actionOutcome == .acknowledged {
+                            // The card that was just approved/denied/answered is already gone;
+                            // this is the only place its "Sent" outcome is still visible. Clears
+                            // itself as soon as the next card arrives or the outcome changes.
+                            Text(ActionOutcome.acknowledged.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                         Button("Reply") { dictating = true }
                             .buttonStyle(.bordered)

@@ -38,6 +38,12 @@ enum ActionOutcome: Equatable {
     case indeterminate
     /// Any other failure; the card stays for a retry.
     case failed
+    /// The bridge is rate limiting this device; the card stays and the same choice can be
+    /// sent again, same as offline.
+    case rateLimited
+    /// This Watch's credential is missing, rejected or revoked; retrying will not help until
+    /// it is paired again.
+    case authRequired
 
     var label: String {
         switch self {
@@ -48,6 +54,8 @@ enum ActionOutcome: Equatable {
         case .offline: "Not sent: offline. Tap again to retry."
         case .indeterminate: "Outcome unknown. Check at the desk."
         case .failed: "Not sent. Tap again to retry."
+        case .rateLimited: "Bridge is busy. Tap again in a moment."
+        case .authRequired: "Not sent: this Watch needs to be paired again."
         }
     }
 
@@ -57,6 +65,7 @@ enum ActionOutcome: Equatable {
         case .noLongerValid: "Request no longer valid"
         case .expired: "Decision expired before it reached the bridge"
         case .indeterminate: "Outcome unknown; check at the desk"
+        case .authRequired: "Not authorized: pair this Watch again"
         default: nil
         }
     }
@@ -68,6 +77,8 @@ enum ActionOutcome: Equatable {
         case BridgeError.interactionNotPending, BridgeError.commandIdConflict: return .noLongerValid
         // Pre-typed 409 bodies, such as a stale approval binding.
         case BridgeError.http(let status, _) where status == 409: return .noLongerValid
+        case BridgeError.rateLimited: return .rateLimited
+        case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
         case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
         default: return .failed
         }
@@ -585,14 +596,19 @@ final class SessionStore {
 
     /// Sends a decision for a pending card and records its outcome.
     ///
-    /// A send that fails without reaching a verdict (no connection, lost response) keeps the
-    /// card and remembers the command id. Repeating the same choice reuses that id, so if the
-    /// first send did land the bridge returns its recorded outcome instead of refusing the
-    /// retry as no longer pending. A different choice gets a fresh id.
+    /// A send that fails without reaching a verdict (no connection, lost response, rate limit,
+    /// or any other indeterminate failure) keeps the card and remembers the command id.
+    /// Repeating the same choice reuses that id, so if the first send did land the bridge
+    /// returns its recorded outcome instead of refusing the retry as no longer pending, or
+    /// double-applying it. A different choice gets a fresh id.
     private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async {
         guard !isSending else { return }
         isSending = true
         defer { isSending = false }
+        // Bumped by reconnect(); if it moves while the send is in flight, this call's response
+        // belongs to a bridge binding that has since been discarded, so it must not resurrect
+        // a card or status line for it (mirrors the guard in createSession()).
+        let generation = pollGeneration
         let commandId: String
         if let unconfirmed = unconfirmedSend, unconfirmed.payload == payload, unconfirmed.sessionId == sessionId {
             commandId = unconfirmed.commandId
@@ -602,27 +618,33 @@ final class SessionStore {
         setOutcome(.sending, for: card)
         do {
             try await client.send(payload, sessionId: sessionId, commandId: commandId)
+            guard generation == pollGeneration else { return }
             unconfirmedSend = nil
             setOutcome(.acknowledged, for: card)
             clearCard(card)
         } catch {
+            guard generation == pollGeneration else { return }
             unconfirmedSend = nil
-            switch ActionOutcome.classify(error) {
-            case .offline:
-                unconfirmedSend = UnconfirmedSend(payload: payload, sessionId: sessionId, commandId: commandId)
-                setOutcome(.offline, for: card)
-            case .failed:
-                // Keep the card so the choice can be retried.
-                setOutcome(.failed, for: card)
-                report(error)
-            case let terminal:
-                // Only touch the card and status line if a newer card has not replaced this
-                // one while the send was in flight, or its status would be stomped.
+            let outcome = ActionOutcome.classify(error)
+            switch outcome {
+            case .offline, .failed, .rateLimited:
+                // Keep the card so the choice can be retried, and remember the command id: the
+                // send may have reached the bridge even though its outcome did not reach the
+                // Watch, so a retry must reuse it rather than mint a fresh one (which the bridge
+                // would treat as a distinct command).
                 guard isCurrent(card) else { return }
+                unconfirmedSend = UnconfirmedSend(payload: payload, sessionId: sessionId, commandId: commandId)
+                setOutcome(outcome, for: card)
+                if outcome == .failed { report(error) }
+            case let terminal:
+                // Recorded even when a newer card has replaced this one, so the outcome is not
+                // silently lost; only the visible card/status line is guarded, so a newer card's
+                // status is never stomped by this stale send.
                 setOutcome(terminal, for: card)
+                guard isCurrent(card) else { return }
                 clearCard(card)
                 statusLine = terminal.statusText ?? statusLine
-                statusKind = .requestInvalid
+                statusKind = terminal == .authRequired ? .authFailed : .requestInvalid
             }
         }
     }
