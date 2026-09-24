@@ -44,6 +44,9 @@ enum ActionOutcome: Equatable {
     /// This Watch's credential is missing, rejected or revoked; retrying will not help until
     /// it is paired again.
     case authRequired
+    /// The bridge's device policy does not allow this Watch that action or project; retrying
+    /// the same command will be refused again.
+    case notAllowed
 
     var label: String {
         switch self {
@@ -56,6 +59,7 @@ enum ActionOutcome: Equatable {
         case .failed: "Not sent. Tap again to retry."
         case .rateLimited: "Bridge is busy. Tap again in a moment."
         case .authRequired: "Not sent: this Watch needs to be paired again."
+        case .notAllowed: "Not allowed from this Watch."
         }
     }
 
@@ -66,6 +70,7 @@ enum ActionOutcome: Equatable {
         case .expired: "Decision expired before it reached the bridge"
         case .indeterminate: "Outcome unknown; check at the desk"
         case .authRequired: "Not authorized: pair this Watch again"
+        case .notAllowed: "This Watch is not allowed to do that"
         default: nil
         }
     }
@@ -79,6 +84,8 @@ enum ActionOutcome: Equatable {
         case BridgeError.http(let status, _) where status == 409: return .noLongerValid
         case BridgeError.rateLimited: return .rateLimited
         case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
+        // Static device policy; must stay in step with BridgeClient.isRetryableWithSameCommandId.
+        case BridgeError.actionNotAllowed, BridgeError.projectNotAllowed: return .notAllowed
         case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
         default: return .failed
         }

@@ -832,6 +832,57 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNil(store.pendingApproval, "a stale generation's response must not resurrect the discarded card")
     }
 
+    /// Covers E-18: the catch-path twin of the test above. A terminal failure (which records its
+    /// outcome even when the card is no longer current) landing after reconnect() bumped
+    /// pollGeneration must not write any outcome or status line for the discarded binding.
+    func testDecideFailureDoesNotWriteOutcomeAfterConcurrentReconnect() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.pendingApproval, "reconnect() must have already discarded the old card")
+        let statusLineAfterReconnect = store.statusLine
+        let statusKindAfterReconnect = store.statusKind
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertNil(store.actionOutcome, "a stale generation's failure must not record an outcome")
+        XCTAssertNil(store.outcome(forCard: "appr_1"))
+        XCTAssertEqual(store.statusLine, statusLineAfterReconnect, "a stale generation's failure must not write the status line")
+        XCTAssertEqual(store.statusKind, statusKindAfterReconnect)
+    }
+
+    /// Covers E-05: action_not_allowed / project_not_allowed come from static device policy, so
+    /// the same command can never succeed on retry. They must classify as a terminal outcome,
+    /// not the generic retryable `.failed`.
+    func testPolicyRefusalsClassifyAsTerminalNotAllowed() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.actionNotAllowed), .notAllowed)
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.projectNotAllowed), .notAllowed)
+        XCTAssertNotNil(ActionOutcome.notAllowed.statusText)
+    }
+
+    /// Covers E-05: a policy refusal clears the card instead of keeping it for a retry, and a
+    /// later decision on a new card does not reuse the refused command id.
+    func testPolicyRefusalClearsCardAndDoesNotKeepRetryPath() async throws {
+        for error in [BridgeError.actionNotAllowed, BridgeError.projectNotAllowed] {
+            let (store, client) = try await makeStoreWithPendingApproval()
+            await client.setSendResult(.failure(error))
+
+            await store.approve()
+
+            XCTAssertNil(store.pendingApproval, "\(error) must not keep the card for a retry")
+            XCTAssertEqual(store.actionOutcome, .notAllowed)
+            XCTAssertEqual(store.statusLine, ActionOutcome.notAllowed.statusText)
+            XCTAssertEqual(store.statusKind, .requestInvalid)
+        }
+    }
+
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
     /// reconnect() moved on to a new generation while the send was in flight), the stale id it
     /// carries must not be returned to sendPrompt() as a valid target.

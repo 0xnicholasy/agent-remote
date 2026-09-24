@@ -452,6 +452,68 @@ final class BridgeClientAuthTests: XCTestCase {
         )
     }
 
+    /// Covers E-05: the bridge's static device-policy refusals are terminal, so BridgeClient
+    /// must not treat them as same-commandId retryable, and must drop their cached timestamp.
+    func testPolicyRefusalsAreNotRetryableAndDropTheCachedTimestamp() async throws {
+        XCTAssertFalse(BridgeClient.isRetryableWithSameCommandId(status: 403, code: "action_not_allowed"))
+        XCTAssertFalse(BridgeClient.isRetryableWithSameCommandId(status: 403, code: "project_not_allowed"))
+
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        for (index, code) in ["action_not_allowed", "project_not_allowed"].enumerated() {
+            server.respondOnce(statusLine: "HTTP/1.1 403 Forbidden", body: #"{"error":"\#(code)"}"#)
+            do {
+                _ = try await client.send(
+                    .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                    sessionId: "sess_demo",
+                    commandId: "cmd_policy_\(index)"
+                )
+                XCTFail("expected the 403 \(code) to throw")
+            } catch {
+                // expected
+            }
+            let cached = await client.cachedCommandTimestampCount()
+            XCTAssertEqual(cached, 0, "a terminal \(code) must not leave a cached timestamp behind")
+        }
+    }
+
+    /// Covers E-17: a send that throws before any request leaves the Watch (not paired) must
+    /// not leave a cached timestamp behind.
+    func testNotPairedSendLeavesNoCachedTimestamp() async throws {
+        let client = BridgeClient(baseURL: URL(string: "http://127.0.0.1:1")!, credentialStore: InMemoryCredentialStore(nil))
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_unpaired"
+            )
+            XCTFail("expected notPaired")
+        } catch BridgeError.notPaired {
+            // expected
+        }
+        let cached = await client.cachedCommandTimestampCount()
+        XCTAssertEqual(cached, 0)
+    }
+
+    /// Covers E-17: retryable failures for commandIds that are never resent (an abandoned or
+    /// changed card) must not grow the timestamp cache without limit.
+    func testAbandonedRetryableCommandTimestampsAreBounded() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        for index in 0..<(BridgeClient.commandTimestampCap + 4) {
+            server.respondOnce(statusLine: "HTTP/1.1 500 Internal Server Error", body: #"{"error":"internal"}"#)
+            _ = try? await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_abandoned_\(index)"
+            )
+        }
+        let cached = await client.cachedCommandTimestampCount()
+        XCTAssertEqual(cached, BridgeClient.commandTimestampCap)
+    }
+
     /// Investigates E-15: a `stale_request` (401) is rejected by `verifyEnvelope`
     /// (bridge/src/auth/verify.ts:341-343) purely on the `X-AgentRemote-Timestamp` *header*,
     /// checked before the command idempotency store is ever consulted (bridge/src/server.ts:714).

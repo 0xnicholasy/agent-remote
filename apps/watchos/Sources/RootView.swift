@@ -29,7 +29,7 @@ struct ConversationView: View {
                                 syncLabel
                             }
                             if !store.connected
-                                || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
+                                || [.skippedEvents, .requestInvalid, .error, .authFailed].contains(store.statusKind) {
                                 Text(store.statusLine)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
