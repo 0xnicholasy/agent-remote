@@ -149,6 +149,22 @@ private final class RequestCapture: @unchecked Sendable {
         let bodyData = raw[range.upperBound...]
         return (try? JSONSerialization.jsonObject(with: Data(bodyData))) as? [String: Any]
     }
+
+    /// Lowercased header name -> value, parsed from the same captured raw request bytes.
+    func requestHeaders(at index: Int) -> [String: String]? {
+        lock.lock()
+        let raw = bodies[safe: index]
+        lock.unlock()
+        guard let raw, let range = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let headerText = String(decoding: raw[..<range.lowerBound], as: UTF8.self)
+        var headers: [String: String] = [:]
+        for line in headerText.split(separator: "\r\n").dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
+        }
+        return headers
+    }
 }
 
 private extension Array {
@@ -433,6 +449,54 @@ final class BridgeClientAuthTests: XCTestCase {
             first["timestamp"] as? String,
             second["timestamp"] as? String,
             "a same-commandId retry after a decoded HTTP error must resend the original timestamp"
+        )
+    }
+
+    /// Investigates E-15: a `stale_request` (401) is rejected by `verifyEnvelope`
+    /// (bridge/src/auth/verify.ts:341-343) purely on the `X-AgentRemote-Timestamp` *header*,
+    /// checked before the command idempotency store is ever consulted (bridge/src/server.ts:714).
+    /// `signedRequest` mints that header's timestamp fresh on every call (see
+    /// `testSigningIsFreshPerRequest` above) independently of `commandTimestamps[commandId]`,
+    /// which only feeds the request *body*'s redundant `timestamp` field used solely to keep the
+    /// idempotency digest stable (bridge/src/server.ts:710, `bodyDigest = sha256(rawBody)`). Since
+    /// a stale_request rejection never reaches that digest check, retrying with the same
+    /// commandId cannot resend "the same stale timestamp" to the check that produced the 401: the
+    /// header is rebuilt fresh, and the retry succeeds once it is back inside the skew window.
+    func testRetryAfterStaleRequestGetsAFreshHeaderTimestampAndSucceeds() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+
+        server.respondOnce(
+            statusLine: "HTTP/1.1 401 Unauthorized",
+            body: #"{"error":"stale_request"}"#,
+            onRequest: capture.record
+        )
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_stale_9012"
+            )
+            XCTFail("expected the decoded stale_request response to throw")
+        } catch BridgeError.staleRequest {
+            // expected
+        }
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"accepted":true}"#, onRequest: capture.record)
+        _ = try await client.send(
+            .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+            sessionId: "sess_demo",
+            commandId: "cmd_stale_9012"
+        )
+
+        let firstHeaders = try XCTUnwrap(capture.requestHeaders(at: 0))
+        let secondHeaders = try XCTUnwrap(capture.requestHeaders(at: 1))
+        XCTAssertNotEqual(
+            firstHeaders["x-agentremote-timestamp"],
+            secondHeaders["x-agentremote-timestamp"],
+            "a retry after stale_request must carry a freshly minted header timestamp, not the rejected one"
         )
     }
 }
