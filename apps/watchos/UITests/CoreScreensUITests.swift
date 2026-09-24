@@ -38,6 +38,7 @@ final class CoreScreensUITests: XCTestCase {
         button("Create session").tap()
         let sessionId = try await waitForSession(notIn: before)
         app.swipeDown()
+        XCTAssertTrue(button("Reply").waitForExistence(timeout: 10), "expected the idle conversation's Reply button to render")
         shot("1-idle")
 
         try await sendPrompt("run the tests and push", sessionId: sessionId)
@@ -57,6 +58,7 @@ final class CoreScreensUITests: XCTestCase {
         shot("3-after-deny")
 
         app.swipeUp()
+        XCTAssertTrue(button("Cancel turn").waitForExistence(timeout: 10), "expected Settings to render")
         shot("4-settings")
     }
 

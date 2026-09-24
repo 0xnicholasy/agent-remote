@@ -1402,6 +1402,69 @@ final class SessionStoreDecisionTests: XCTestCase {
         )
     }
 
+    /// Drives approval.resolved with a cancelled decision through the real apply() path: the
+    /// cancelled branch of resolutionLine() must render "Cancelled: <title>", not just clear the
+    /// pending card (that alone is covered by testApprovalResolvedCancelledClearsPendingApproval).
+    func testApprovalResolvedCancelledNamesTheApprovalWhenIdMatches() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "cancelled" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Cancelled: Run git push origin main" },
+            "a matching approvalId must surface the approval's own title on the cancelled branch"
+        )
+    }
+
+    /// Drives approval.resolved with a superseded decision through the real apply() path: the
+    /// superseded branch of resolutionLine() must render "Superseded: <title>" when the pending
+    /// approval's id matches.
+    func testApprovalResolvedSupersededNamesTheApprovalWhenIdMatches() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "superseded" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Superseded: Run git push origin main" },
+            "a matching approvalId must surface the approval's own title on the superseded branch"
+        )
+    }
+
+    /// Drives approval.resolved with an accepted decision through the real apply() path: the
+    /// accepted branch of resolutionLine() was previously only unit-tested directly, never
+    /// through apply(); this exercises the full event-to-transcript mapping.
+    func testApprovalResolvedAcceptedNamesTheApprovalWhenIdMatches() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "accepted" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertTrue(
+            store.transcript.contains { $0.text == "Allowed: Run git push origin main" },
+            "a matching approvalId must surface the approval's own title on the accepted branch"
+        )
+    }
+
     /// Mirrors the C-1 discardLocalView regression written for lastQuestion: discarding the local
     /// view across a truncated gap must also clear lastApproval, or an approval.resolved on the far
     /// side whose approvalId happens to match the discarded approval would render its OLD title.
