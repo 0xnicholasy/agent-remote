@@ -1,11 +1,35 @@
 import { createHash, createHmac } from "node:crypto";
-import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
+import { JsonlJournal } from "../state/journal";
+import { createNonceJournal } from "../state/nonces";
 import { DeviceRegistry, type DeviceRecord } from "./devices";
-import { NonceCache, signingString, signRequest, verifyEnvelope, type VerifyEnvelopeParams } from "./verify";
+import {
+  NonceCache,
+  signingString,
+  signRequest,
+  verifyEnvelope,
+  type NonceJournalRecord,
+  type VerifyEnvelopeParams,
+} from "./verify";
 
 const DEVICE_KEY = Buffer.from("bb".repeat(32), "hex");
 const SKEW_MS = 120_000;
+const NONCE_TTL_MS = 300_000; // mirrors auth/verify.ts's TTL, which is not exported
+
+let stateDir: string;
+
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), "agentremote-verify-test-"));
+});
+
+afterEach(() => {
+  rmSync(stateDir, { recursive: true, force: true });
+});
 
 function sampleRecord(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
   return {
@@ -147,6 +171,32 @@ describe("NonceCache", () => {
     // only because SKEW_MS < NONCE_TTL_MS as explained above.
     cache.record("dev_1", "n1", atExpiry);
     expect(cache.has("dev_1", "n1", atExpiry)).toBe(true);
+  });
+
+  test("a journal holding more than the per-device cap loads to exactly the cap, and the drop is persisted", () => {
+    const filePath = join(stateDir, "nonces.jsonl");
+    const CAP = 10_000;
+    const now = new Date("2026-09-20T10:15:00.000Z");
+
+    // Bypass record()'s own cap check by writing the raw journal directly, as if it had
+    // accumulated one entry over the cap some other way (e.g. an old build without the check).
+    const rawJournal = new JsonlJournal<NonceJournalRecord>(filePath);
+    for (let index = 0; index <= CAP; index += 1) {
+      rawJournal.append({ deviceId: "dev_a", nonce: `nonce-${index}`, expiresAt: now.getTime() + NONCE_TTL_MS });
+    }
+
+    const cache = new NonceCache({ journal: createNonceJournal(filePath), now });
+    expect(cache.has("dev_a", "nonce-0", now)).toBe(true);
+    // Insertion order == expiry order, so the kept set is the oldest CAP entries; the (CAP+1)th
+    // (the one over budget) is the one dropped.
+    expect(cache.has("dev_a", `nonce-${CAP}`, now)).toBe(false);
+
+    // The drop must be persisted, not just held in memory: a reload sees the same capped set,
+    // which only holds if the constructor rewrote the journal.
+    const reloaded = new NonceCache({ journal: createNonceJournal(filePath), now });
+    expect(reloaded.has("dev_a", "nonce-0", now)).toBe(true);
+    expect(reloaded.has("dev_a", `nonce-${CAP - 1}`, now)).toBe(true);
+    expect(reloaded.has("dev_a", `nonce-${CAP}`, now)).toBe(false);
   });
 });
 

@@ -65,7 +65,9 @@ export interface NonceRecord {
 /**
  * The latest bridge time the cache has ever acted on, persisted so it survives compaction and a
  * restart. Written as the first line of every compaction; a nonce record carries its own lower
- * bound (`expiresAt - NONCE_TTL_MS`), so appends never need to write one.
+ * bound (`expiresAt - NONCE_TTL_MS`), so appends never need to write one. If the host clock was
+ * far ahead and then corrected, requests are refused as stale until real time reaches the
+ * watermark; recovery is to stop the bridge and delete `nonces.jsonl`.
  */
 export interface NonceWatermarkRecord {
   watermarkMs: number;
@@ -130,10 +132,12 @@ export class NonceCache {
         this.advanceWatermark(record.expiresAt - NONCE_TTL_MS);
       }
     }
+
+    let dropped = false;
     const nowMs = this.referenceTime(options.now ?? new Date());
     this.advanceWatermark(nowMs);
 
-    let dropped = false;
+    const cappedDevices = new Set<string>();
     for (const record of persistedRecords) {
       if (!isNonceRecord(record) || record.expiresAt <= nowMs) {
         dropped = true;
@@ -143,6 +147,16 @@ export class NonceCache {
       if (nonces === undefined) {
         nonces = new Map<string, number>();
         this.perDevice.set(record.deviceId, nonces);
+      }
+      if (nonces.size >= MAX_NONCES_PER_DEVICE) {
+        dropped = true;
+        if (!cappedDevices.has(record.deviceId)) {
+          cappedDevices.add(record.deviceId);
+          console.error(
+            `Agent Remote bridge: nonces.jsonl held more than ${MAX_NONCES_PER_DEVICE} unexpired nonces for device ${record.deviceId}; extra entries dropped`,
+          );
+        }
+        continue;
       }
       nonces.set(record.nonce, record.expiresAt);
     }

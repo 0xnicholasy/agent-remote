@@ -27,7 +27,7 @@ created 0700, files are 0600, and a full rewrite goes through a temp file and a 
 | `events.jsonl` | The event log | 24 hours, at most 2000 events |
 | `events.jsonl.watermark` | Highest reserved event id | Forever |
 | `commands.jsonl` | Command identity and outcome | 24 hours, soft cap of 5000 commands |
-| `nonces.jsonl` | Seen request nonces | 300 seconds (the nonce TTL) |
+| `nonces.jsonl` | Seen request nonces, plus a `{"watermarkMs": ...}` line on compaction | 300 seconds (the nonce TTL) |
 | `sessions.jsonl` | Session to project bindings | 24 hours |
 
 The four journals are JSON Lines: one record per line, appended as it happens, and rewritten in
