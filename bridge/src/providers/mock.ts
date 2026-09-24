@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   APPROVAL_TTL_MS,
   ApprovalBindingMismatchError,
@@ -19,11 +20,26 @@ export { ApprovalBindingMismatchError, InteractionPendingError, type ProviderHos
 interface PendingApproval {
   binding: ApprovalBinding;
   turnId: string;
+  /** Fires `ttlMs` after the approval was created and auto-resolves it as expired if nobody has
+   * approved/rejected/cancelled it by then, mirroring `ClaudeProvider`'s C1-001 timer. Cleared by
+   * every path that takes this approval out of `pending` for any other reason. */
+  expiryTimer: ReturnType<typeof setTimeout>;
 }
 
 interface PendingQuestion {
   sessionId: string;
   turnId: string;
+  /** The question-side counterpart of `PendingApproval.expiryTimer`. */
+  expiryTimer: ReturnType<typeof setTimeout>;
+}
+
+export interface MockProviderOptions {
+  /** Overrides `APPROVAL_TTL_MS` for both approvals and questions. Exists for tests that need to
+   * exercise expiry deterministically instead of waiting out the production default. */
+  ttlMs?: number;
+  /** Clock used to compute `expiresAt` on approvals and questions. Production uses the real
+   * clock; tests pass a fixed one for determinism. */
+  now?: () => Date;
 }
 
 /**
@@ -47,11 +63,15 @@ export class MockProvider implements AgentProvider {
   private readonly sessions: Map<string, Session> = new Map();
   private readonly pending: Map<string, PendingApproval> = new Map();
   private readonly pendingQuestions: Map<string, PendingQuestion> = new Map();
+  private readonly ttlMs: number;
+  private readonly now: () => Date;
   private counter = 0;
 
-  constructor(host: ProviderHost) {
+  constructor(host: ProviderHost, options: MockProviderOptions = {}) {
     this.host = host;
     this.projects = [{ id: "prj_demo", name: "demo", path: "/Users/you/code/demo" }];
+    this.ttlMs = options.ttlMs ?? APPROVAL_TTL_MS;
+    this.now = options.now ?? ((): Date => new Date());
   }
 
   /** Registers a session the bridge already knows about, without emitting anything. */
@@ -112,14 +132,15 @@ export class MockProvider implements AgentProvider {
 
     const action = "git push origin main";
     const binding: ApprovalBinding = {
-      approvalId: `apr_${++this.counter}`,
+      approvalId: `apr_${randomUUID()}`,
       sessionId,
       turnId,
       toolCallId: `tc_${++this.counter}`,
       actionDigest: digest(action),
-      expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
+      expiresAt: new Date(this.now().getTime() + this.ttlMs).toISOString(),
     };
-    this.pending.set(binding.approvalId, { binding, turnId });
+    const expiryTimer = this.armApprovalExpiry(sessionId, binding.approvalId);
+    this.pending.set(binding.approvalId, { binding, turnId, expiryTimer });
     this.host.emit(sessionId, "approval.requested", {
       binding,
       kind: "command",
@@ -136,8 +157,10 @@ export class MockProvider implements AgentProvider {
       decision: "accepted",
     });
 
-    const questionId = `qst_${++this.counter}`;
-    this.pendingQuestions.set(questionId, { sessionId, turnId: pending.turnId });
+    const questionId = `qst_${randomUUID()}`;
+    const expiresAt = new Date(this.now().getTime() + this.ttlMs).toISOString();
+    const expiryTimer = this.armQuestionExpiry(sessionId, questionId);
+    this.pendingQuestions.set(questionId, { sessionId, turnId: pending.turnId, expiryTimer });
     this.host.emit(sessionId, "question.requested", {
       questionId,
       turnId: pending.turnId,
@@ -148,6 +171,7 @@ export class MockProvider implements AgentProvider {
       ],
       allowFreeText: true,
       spokenSummary: "Should I open a pull request for this change, or just push?",
+      expiresAt,
     });
   }
 
@@ -162,14 +186,21 @@ export class MockProvider implements AgentProvider {
   }
 
   async cancel(sessionId: string): Promise<void> {
+    // Reported to the client before `session.completed` below, so a card still on screen for
+    // one of this session's pending interactions is told why it is going away rather than just
+    // vanishing when the session ends.
     for (const [approvalId, pending] of this.pending) {
       if (pending.binding.sessionId === sessionId) {
+        clearTimeout(pending.expiryTimer);
         this.pending.delete(approvalId);
+        this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "cancelled" });
       }
     }
     for (const [questionId, pending] of this.pendingQuestions) {
       if (pending.sessionId === sessionId) {
+        clearTimeout(pending.expiryTimer);
         this.pendingQuestions.delete(questionId);
+        this.host.emit(sessionId, "question.answered", { questionId, answer: "", outcome: "cancelled" });
       }
     }
     this.host.emit(sessionId, "session.completed", { reason: "cancelled" });
@@ -180,11 +211,19 @@ export class MockProvider implements AgentProvider {
     if (pending === undefined) {
       throw new Error(`no pending question ${answer.questionId}`);
     }
+    if (pending.sessionId !== sessionId) {
+      // Mirrors `take`'s binding check for approvals: a question answered under a different
+      // session's id must not resolve another session's pending question, and must not leak
+      // whether that question exists.
+      throw new ApprovalBindingMismatchError(`no pending question ${answer.questionId}`);
+    }
+    clearTimeout(pending.expiryTimer);
     this.pendingQuestions.delete(answer.questionId);
     const answerText = answer.optionId ?? answer.text ?? "";
     this.host.emit(sessionId, "question.answered", {
       questionId: answer.questionId,
       answer: answerText,
+      outcome: "answered",
     });
     const summary =
       answer.optionId === "opt_yes"
@@ -235,7 +274,11 @@ export class MockProvider implements AgentProvider {
     if (!matches) {
       throw new ApprovalBindingMismatchError(`binding does not match approval ${binding.approvalId}`);
     }
-    if (Date.parse(expected.expiresAt) < Date.now()) {
+    if (Date.parse(expected.expiresAt) < this.now().getTime()) {
+      // Belt-and-braces, mirroring `ClaudeProvider.takeApproval`: the armed expiry timer should
+      // already have resolved this approval by the time `expiresAt` passes, but clear it
+      // regardless so a race between the timer firing and this call can never double-resolve.
+      clearTimeout(pending.expiryTimer);
       this.pending.delete(binding.approvalId);
       this.host.emit(sessionId, "approval.resolved", {
         approvalId: binding.approvalId,
@@ -243,7 +286,40 @@ export class MockProvider implements AgentProvider {
       });
       throw new ApprovalBindingMismatchError(`approval ${binding.approvalId} expired`);
     }
+    clearTimeout(pending.expiryTimer);
     this.pending.delete(binding.approvalId);
     return pending;
+  }
+
+  /** Arms an unref'd timer that auto-resolves `approvalId` as expired if nobody has taken it off
+   * `pending` by the time `ttlMs` elapses. Mirrors `ClaudeProvider`'s C1-001 timer so an approval
+   * nobody ever decides cannot hold the interaction open forever. */
+  private armApprovalExpiry(sessionId: string, approvalId: string): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      if (!this.pending.has(approvalId)) {
+        return;
+      }
+      this.pending.delete(approvalId);
+      this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "expired" });
+    }, this.ttlMs);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    return timer;
+  }
+
+  /** The question-side counterpart of `armApprovalExpiry`. */
+  private armQuestionExpiry(sessionId: string, questionId: string): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      if (!this.pendingQuestions.has(questionId)) {
+        return;
+      }
+      this.pendingQuestions.delete(questionId);
+      this.host.emit(sessionId, "question.answered", { questionId, answer: "", outcome: "expired" });
+    }, this.ttlMs);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    return timer;
   }
 }

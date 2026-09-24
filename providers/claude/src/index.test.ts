@@ -1645,7 +1645,119 @@ describe("ClaudeProvider", () => {
     const answered = events.find((event) => event.type === "question.answered");
     expect(answered?.payload).toMatchObject({
       questionId: requested?.type === "question.requested" ? requested.payload.questionId : "",
-      answer: "(session terminated)",
+      answer: "",
+      outcome: "cancelled",
+    });
+  });
+
+  test("a pending approval force-resolved by teardown is reported cancelled", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+    const binding = bindingOf(events);
+
+    await provider.cancel(session.id);
+    await delay();
+
+    expect(events.find((event) => event.type === "approval.resolved")?.payload).toMatchObject({
+      approvalId: binding.approvalId,
+      decision: "cancelled",
+      reason: "session terminated",
+    });
+  });
+
+  test("the SDK aborting a pending question marks it superseded", async () => {
+    const controller = new AbortController();
+    let releaseTurn: (() => void) | undefined;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!(
+          "AskUserQuestion",
+          { questions: [{ question: "Which one?", options: [{ label: "a" }], multiSelect: false }] },
+          callOpts({ signal: controller.signal }),
+        );
+        await new Promise<void>((resolve) => {
+          releaseTurn = resolve;
+        });
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "ask something");
+    await delay();
+    const requested = events.find((event) => event.type === "question.requested");
+    expect(requested).toBeDefined();
+
+    controller.abort();
+    await delay();
+
+    const answered = events.find((event) => event.type === "question.answered");
+    expect(answered?.payload).toMatchObject({
+      questionId: requested?.type === "question.requested" ? requested.payload.questionId : "",
+      answer: "",
+      outcome: "superseded",
+    });
+    releaseTurn?.();
+  });
+
+  test("a question nobody answers auto-resolves as expired once its TTL elapses", async () => {
+    let toolResult: PermissionResult | null = null;
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        const result = await args.options!.canUseTool!(
+          "AskUserQuestion",
+          { questions: [{ question: "Which one?", options: [{ label: "a" }], multiSelect: false }] },
+          callOpts(),
+        );
+        toolResult = result;
+        yield fakeResult(result?.behavior === "allow" ? "picked" : "denied");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    // Reuses the shared approvalTtlMs option (questions have no TTL option of their own, per
+    // task: "the same TTL option approvals use").
+    const provider = new ClaudeProvider(host, {
+      projects: [project("p1", "/tmp/p1")],
+      query: queryFn,
+      approvalTtlMs: 20,
+    });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "pick one");
+    await delay();
+    const requested = events.find((event) => event.type === "question.requested");
+    expect(requested).toBeDefined();
+
+    await delay(60);
+
+    expect(toolResult).toMatchObject({ behavior: "deny" });
+    const answeredEvents = events.filter((event) => event.type === "question.answered");
+    expect(answeredEvents).toHaveLength(1);
+    expect(answeredEvents[0]?.payload).toMatchObject({
+      questionId: requested?.type === "question.requested" ? requested.payload.questionId : "",
+      answer: "",
+      outcome: "expired",
     });
   });
 

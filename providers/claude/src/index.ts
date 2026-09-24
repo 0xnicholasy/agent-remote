@@ -21,11 +21,13 @@ import {
   type AgentCapabilities,
   type AgentProvider,
   type ApprovalBinding,
+  type ApprovalDecision,
   type ApprovalKind,
   type CreateSessionOptions,
   type Project,
   type ProviderHost,
   type QuestionAnswerPayload,
+  type QuestionOutcome,
   type Session,
   type SessionCompletedPayload,
   type SessionState,
@@ -78,6 +80,10 @@ interface PendingQuestion {
   turnId: string;
   resolve: (result: PermissionResult) => void;
   question: AskUserQuestionInput["questions"][number];
+  /** Mirrors `PendingApproval.expiryTimer`: fires `approvalTtlMs` after the question was asked
+   * and auto-resolves it as expired if nobody answered by then. Cleared by every path that takes
+   * this question off `pendingQuestion` for any other reason, so it never double-resolves. */
+  expiryTimer: ReturnType<typeof setTimeout>;
 }
 
 interface Conversation {
@@ -437,11 +443,16 @@ export class ClaudeProvider implements AgentProvider {
         );
       }
     }
+    clearTimeout(pending.expiryTimer);
     conversation.pendingQuestion = undefined;
 
     const answerText = optionLabel ?? answer.text ?? "";
 
-    this.host.emit(sessionId, "question.answered", { questionId: answer.questionId, answer: answerText });
+    this.host.emit(sessionId, "question.answered", {
+      questionId: answer.questionId,
+      answer: answerText,
+      outcome: "answered",
+    });
     this.restoreRunningState(sessionId, conversation);
 
     pending.resolve({
@@ -614,13 +625,14 @@ export class ClaudeProvider implements AgentProvider {
       const pending = conversation.pendingApproval;
       clearTimeout(pending.expiryTimer);
       conversation.pendingApproval = undefined;
-      this.resolvePendingApprovalEvent(sessionId, pending.binding.approvalId, "session terminated");
+      this.resolvePendingApprovalEvent(sessionId, pending.binding.approvalId, "cancelled", "session terminated");
       pending.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
     }
     if (conversation.pendingQuestion !== undefined) {
       const pending = conversation.pendingQuestion;
+      clearTimeout(pending.expiryTimer);
       conversation.pendingQuestion = undefined;
-      this.resolvePendingQuestionEvent(sessionId, pending.questionId, "session terminated");
+      this.resolvePendingQuestionEvent(sessionId, pending.questionId, "cancelled");
       pending.resolve({ behavior: "deny", message: "session terminated", interrupt: true });
     }
     let terminalMessage = message;
@@ -657,23 +669,27 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   /** Tells the client that a pending approval it is still showing a card for was resolved for it,
-   * without a user decision (teardown, or the SDK aborting the tool call). Reuses the
-   * `approval.resolved` shape the expiry path already emits: `ApprovalDecision` has no
-   * "cancelled" member in the schema, so the forced outcome is reported as `expired` with the
-   * real cause in `reason`, which is what lets the watch clear the card. */
-  private resolvePendingApprovalEvent(sessionId: string, approvalId: string, reason: string): void {
+   * without a user decision: `cancelled` on session teardown, `superseded` when the SDK aborts or
+   * withdraws the tool call, `expired` when the TTL timer fires (that path emits directly rather
+   * than through here; see the timer in `runInteraction`). `reason` carries the free-text cause
+   * the schema's `ApprovalResolvedPayload.reason` allows. */
+  private resolvePendingApprovalEvent(
+    sessionId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+    reason?: string,
+  ): void {
     this.safeEmit(sessionId, "approval.resolved", () => {
-      this.host.emit(sessionId, "approval.resolved", { approvalId, decision: "expired", reason });
+      this.host.emit(sessionId, "approval.resolved", { approvalId, decision, ...(reason === undefined ? {} : { reason }) });
     });
   }
 
-  /** The question-side counterpart. The protocol has no separate question-cancelled event, and
-   * `question.answered` is the only outcome event for a question, so the forced resolve is
-   * reported through it with the cause in place of an answer — otherwise the watch keeps showing
-   * a question card for an interaction the agent has already given up on. */
-  private resolvePendingQuestionEvent(sessionId: string, questionId: string, reason: string): void {
+  /** The question-side counterpart. `question.answered` is the only outcome event for a
+   * question, so a forced resolve (no user answer) is reported through it with an empty
+   * `answer` and `outcome` set to the real cause, which is what lets the watch clear the card. */
+  private resolvePendingQuestionEvent(sessionId: string, questionId: string, outcome: QuestionOutcome): void {
     this.safeEmit(sessionId, "question.answered", () => {
-      this.host.emit(sessionId, "question.answered", { questionId, answer: `(${reason})` });
+      this.host.emit(sessionId, "question.answered", { questionId, answer: "", outcome });
     });
   }
 
@@ -1023,7 +1039,7 @@ export class ClaudeProvider implements AgentProvider {
         if (conversation.terminal) {
           return { behavior: "deny", message: "session terminated", interrupt: true };
         }
-        const questionId = `qst_${++this.counter}`;
+        const questionId = `qst_${randomUUID()}`;
         this.setSessionState(sessionId, "waiting");
         const result = await this.awaitInteraction(
           callOptions.signal,
@@ -1031,8 +1047,9 @@ export class ClaudeProvider implements AgentProvider {
             // Only emits when this question is the one still occupying the slot: an abort that
             // beats registration has no outstanding card for the client to clear.
             if (conversation.pendingQuestion?.questionId === questionId) {
+              clearTimeout(conversation.pendingQuestion.expiryTimer);
               conversation.pendingQuestion = undefined;
-              this.resolvePendingQuestionEvent(sessionId, questionId, "cancelled by agent");
+              this.resolvePendingQuestionEvent(sessionId, questionId, "superseded");
             }
             // The SDK can abort this specific call (e.g. the agent gives up on its own question)
             // without the conversation as a whole ending, so `Session.state` must come back from
@@ -1040,7 +1057,24 @@ export class ClaudeProvider implements AgentProvider {
             this.restoreRunningState(sessionId, conversation);
           },
           (settle) => {
-            conversation.pendingQuestion = { questionId, turnId, resolve: settle, question };
+            const questionExpiresAt = new Date(Date.now() + this.approvalTtlMs).toISOString();
+            // Mirrors the approval expiry timer below (C1-001): without an active timer, a
+            // question nobody ever answers would hold the interaction lock and subprocess open
+            // forever. Fires unless the question is taken off `pendingQuestion` for some other
+            // reason first.
+            const expiryTimer = setTimeout(() => {
+              if (conversation.pendingQuestion?.questionId !== questionId) {
+                return;
+              }
+              conversation.pendingQuestion = undefined;
+              this.resolvePendingQuestionEvent(sessionId, questionId, "expired");
+              this.restoreRunningState(sessionId, conversation);
+              settle({ behavior: "deny", message: "question expired" });
+            }, this.approvalTtlMs);
+            if (typeof expiryTimer.unref === "function") {
+              expiryTimer.unref();
+            }
+            conversation.pendingQuestion = { questionId, turnId, resolve: settle, question, expiryTimer };
             const emitted = this.safeEmit(sessionId, "question.requested", () => {
               this.host.emit(sessionId, "question.requested", {
                 questionId,
@@ -1048,6 +1082,7 @@ export class ClaudeProvider implements AgentProvider {
                 text: question.question,
                 options: question.options.map((option, index) => ({ id: `opt_${index}`, label: option.label })),
                 allowFreeText: true,
+                expiresAt: questionExpiresAt,
               });
             });
             if (!emitted) {
@@ -1057,6 +1092,7 @@ export class ClaudeProvider implements AgentProvider {
               // settle below is normally a no-op; it stays as the guard for the case where the
               // conversation was already terminal.
               if (conversation.pendingQuestion?.questionId === questionId) {
+                clearTimeout(conversation.pendingQuestion.expiryTimer);
                 conversation.pendingQuestion = undefined;
               }
               settle({ behavior: "deny", message: "question.requested could not be persisted", interrupt: true });
@@ -1106,7 +1142,7 @@ export class ClaudeProvider implements AgentProvider {
         truncationNote = ` … (+${derived.fullLength - derived.text.length} more chars)`;
       }
     }
-    const approvalId = `apr_${++this.counter}`;
+    const approvalId = `apr_${randomUUID()}`;
     const binding: ApprovalBinding = {
       approvalId,
       sessionId,
@@ -1123,7 +1159,7 @@ export class ClaudeProvider implements AgentProvider {
         if (conversation.pendingApproval?.binding.approvalId === approvalId) {
           clearTimeout(conversation.pendingApproval.expiryTimer);
           conversation.pendingApproval = undefined;
-          this.resolvePendingApprovalEvent(sessionId, approvalId, "cancelled by agent");
+          this.resolvePendingApprovalEvent(sessionId, approvalId, "superseded", "cancelled by agent");
         }
         // Same reasoning as the question path's abort branch: an SDK-initiated abort of this one
         // call does not end the conversation, so `waiting` must be restored to `running` here too.

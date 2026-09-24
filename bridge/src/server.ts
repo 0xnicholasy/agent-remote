@@ -25,7 +25,7 @@ import {
 } from "@agentremote/protocol";
 import { ClaudeProvider } from "@agentremote/provider-claude";
 
-import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider } from "./providers/mock";
+import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, type MockProviderOptions } from "./providers/mock";
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
@@ -35,6 +35,7 @@ import { atomicWriteFileSync } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { CommandJournal } from "./state/commands";
 import { EventLog } from "./state/event-log";
+import { InteractionRegistry } from "./state/interactions";
 import { createNonceJournal } from "./state/nonces";
 import { SessionIndex } from "./state/sessions";
 
@@ -103,6 +104,10 @@ export interface CreateBridgeOptions {
   now?: () => Date;
   /** Overrides `AGENTREMOTE_AUTH` for tests. Production reads the environment variable. */
   authEnabled?: boolean;
+  /** Passed straight through to `MockProvider` when it is the selected provider. Exists so tests
+   * can exercise its approval/question expiry timers with a short `ttlMs` instead of waiting out
+   * the production default. Ignored when `AGENTREMOTE_PROVIDER=claude`. */
+  mockProviderOptions?: MockProviderOptions;
 }
 
 /** Every command type a newly paired device is granted, per the "Device registry" section of
@@ -320,6 +325,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const sessionIndex = new SessionIndex(journalPath("sessions.jsonl"), { now: now() });
   const commands = new CommandJournal(journalPath("commands.jsonl"), { now: now() });
 
+  // Approval/question lifecycle, per the interaction registry this slice adds. Not durable on
+  // its own (see interactions.ts's class doc): it only reacts to events already appended to the
+  // durable `eventLog` above, so a restart rebuilds it from that log instead of persisting a
+  // second copy of the same state.
+  const interactions = new InteractionRegistry();
+  interactions.rebuild(eventLog.all());
+
   // Project of every session this process has started or seeded, which is what each emitted
   // event is stamped with. Separate from `sessionIndex`: that one survives restarts to authorize
   // events from a previous boot, this one is the current boot's truth about a live session.
@@ -329,6 +341,41 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   // Reserves a command id for the duration of its execution, so two retries that arrive at
   // the same time cannot both pass the journal check and run the command twice.
   const inFlight = new Set<string>();
+
+  // Per-session serialization: two commands (or a command and the dedicated cancel route)
+  // targeting the same session must not interleave between the interaction-pending check and the
+  // provider call that acts on it, or two devices racing to decide the same approval could both
+  // pass the check before either resolves it. `inFlight`/`CommandJournal` already dedupe a retried
+  // commandId; this instead orders distinct commandIds against each other, and only within one
+  // session — a different session's commands are never held up by this chain.
+  const sessionLocks = new Map<string, Promise<void>>();
+
+  async function withSessionLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const prior = sessionLocks.get(sessionId) ?? Promise.resolve();
+    // A prior turn's rejection must not wedge every later command for this session; only its
+    // completion (success or failure) matters for ordering.
+    const gate = prior.then(
+      () => undefined,
+      () => undefined,
+    );
+    let release: () => void;
+    const marker = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    sessionLocks.set(sessionId, marker);
+    await gate;
+    try {
+      return await fn();
+    } finally {
+      release!();
+      // Only the last-enqueued caller for this session removes the entry, so the map never
+      // retains a stale marker for a session that has since gone idle, but also never drops a
+      // marker a still-waiting caller needs.
+      if (sessionLocks.get(sessionId) === marker) {
+        sessionLocks.delete(sessionId);
+      }
+    }
+  }
   // Set once the provider instance exists (below); host.emit reads it lazily so an event's
   // `provider` tag always reflects what actually constructed/ran the session (provider.id),
   // never the raw env string, and so it can never diverge from session.provider.
@@ -387,6 +434,10 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         );
         throw error;
       }
+      // The registry only ever reacts to events that made it durably into the log above, so a
+      // process that crashed between the append and this call rebuilds the same state from the
+      // log on its next start instead of ever observing a half-persisted event.
+      interactions.observe(event);
       if (type === "session.started") {
         try {
           sessionIndex.record(sessionId, (payload as AgentEventPayloadMap["session.started"]).projectId, now());
@@ -448,7 +499,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     provider = createClaudeProvider(host, { projects });
     seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
   } else {
-    provider = new MockProvider(host);
+    provider = new MockProvider(host, options.mockProviderOptions);
     seedProjectId = "prj_demo";
   }
   emittedProviderId = provider.id;
@@ -512,6 +563,20 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   async function sessionExists(sessionId: string): Promise<boolean> {
     const sessions = await provider.listSessions();
     return sessions.some((session) => session.id === sessionId);
+  }
+
+  /** The approval/question id a decision command targets, or undefined for a command that does
+   * not target one. */
+  function interactionIdFor(command: Command): string | undefined {
+    switch (command.type) {
+      case "approval.accept":
+      case "approval.reject":
+        return command.payload.binding.approvalId;
+      case "question.answer":
+        return command.payload.questionId;
+      default:
+        return undefined;
+    }
   }
 
   // Maps the protocol error types a provider call can throw to the HTTP response both
@@ -604,21 +669,15 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       }
     }
 
-    // 4. Expiry. approval.accept/reject carry payload.binding.expiresAt; a binding whose
-    // deadline already passed is rejected here, before the provider's own (live-binding) check
-    // ever runs.
-    if (
-      device !== undefined &&
-      (command.type === "approval.accept" || command.type === "approval.reject") &&
-      Date.parse(command.payload.binding.expiresAt) < now().getTime()
-    ) {
-      return json({ error: "decision_expired" }, 410);
-    }
-
-    // 5. Request identity and idempotency, now durable (docs/durability-v0.md). commandId stays
-    // the idempotency key; the journal stores the SHA-256 of the exact body and the issuing
-    // device with it, and survives a restart. A repeat with a different digest or from a
-    // different device is a conflict, not a replay, and must not execute.
+    // Request identity and idempotency, now durable (docs/durability-v0.md). commandId stays the
+    // idempotency key; the journal stores the SHA-256 of the exact body and the issuing device
+    // with it, and survives a restart. A repeat with a different digest or from a different
+    // device is a conflict, not a replay, and must not execute. This whole check-then-set stays
+    // unlocked and runs synchronously with no `await` in between, exactly as before: that is what
+    // makes it atomic against a truly concurrent retry of the same commandId (two requests racing
+    // for the same commandId still only ever see one winner, whichever's synchronous turn runs
+    // first), and is a separate concern from the per-session lock below, which instead orders
+    // *different* commandIds against each other.
     const bodyDigest = createHash("sha256").update(rawBody).digest("hex");
     const deviceId = device?.deviceId ?? null;
     commands.prune(now());
@@ -650,60 +709,124 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     }
 
     inFlight.add(command.commandId);
-    try {
-      commands.begin(command.commandId, deviceId, bodyDigest, now());
-    } catch (error) {
-      // begin runs BEFORE the provider call: without a durable in_flight record, a client retry
-      // after a crash could re-execute this command, so a failure here must abort before
-      // execution rather than proceed and only warn.
-      inFlight.delete(command.commandId);
-      console.error(`Failed to durably record command ${command.commandId} as in_flight before execution:`, error);
-      return json({ error: "command_journal_unavailable" }, 503);
-    }
-    let createdSessionId: string | undefined;
-    try {
-      createdSessionId = await execute(command);
-    } catch (error) {
-      inFlight.delete(command.commandId);
-      const mapped = mapProviderError(error);
-      if (mapped !== undefined) {
-        // A mapped provider error is a refusal before anything was applied, so the command id is
-        // released for a retry rather than left looking indeterminate after a restart. The
-        // refusal already happened, so it is reported either way; a failure to record it durably
-        // is only logged, since silently dropping a real 409/404/429 response would be worse.
-        try {
-          commands.abandon(command.commandId, now());
-        } catch (abandonError) {
-          console.error(`Failed to durably record command ${command.commandId} as abandoned:`, abandonError);
-        }
-        return mapped;
-      }
-      // An unmapped throw is exactly the indeterminate case: the entry stays `in_flight`, and a
-      // later process reading the journal will treat it as indeterminate.
-      throw error;
-    }
 
-    const response: CommandResponse = {
-      accepted: true,
-      commandId: command.commandId,
-      duplicate: false,
-      ...(createdSessionId === undefined ? {} : { sessionId: createdSessionId }),
-    };
-    // The provider already applied this command, so `response` is reported either way; a
-    // failure to durably record the outcome (or the session's project binding) below is only
-    // logged, never converted into a failure response for work that already succeeded, and
-    // `inFlight` must still be released regardless so a retry is not stuck as a false duplicate.
-    try {
-      commands.complete(command.commandId, response, now());
-      if (createdSessionId !== undefined && command.type === "session.create") {
-        sessionIndex.record(createdSessionId, command.payload.projectId, now());
+    // From here on this request holds an exclusive claim on `command.commandId` (above), but a
+    // *different* commandId for the same session — a second device's decision, or a cancel — can
+    // still race it up to this point. The interaction gate and the provider call itself run
+    // inside the per-session lock so two such commands serialize: the loser sees the winner's
+    // effect on the interaction registry and the command journal instead of both passing the
+    // pending check before either resolves it. `session.create` has no real session yet — its
+    // envelope sessionId is a client generated placeholder (see the comment on
+    // SessionCreatePayload) — so it never enters the lock.
+    const runGatedCommand = async (): Promise<Response> => {
+      // Interaction gate. A decision command (approval.accept/reject, question.answer) names the
+      // interaction it targets; refuse it unless that interaction is still pending for THIS
+      // session. A record belonging to another session is reported as "not_found" rather than
+      // its real state, and an id with no record at all gets the same "not_found" body, so a
+      // device probing ids cannot tell "exists in another session" from "never existed". No
+      // record is safe to refuse: every provider event passes through `observe` in `host.emit`,
+      // the cap never evicts a pending record, and provider sessions do not survive a restart,
+      // so an id the registry has not seen cannot be pending in the provider either.
+      // Neither check below ever calls `commands.begin`, so neither leaves a journal entry
+      // behind; but both run after `inFlight.add` above, so both must release it themselves
+      // before returning, the same way the `commands.begin` failure a few lines down does, or a
+      // retry of this exact commandId would see it stuck in_flight forever.
+      // Expiry. approval.accept/reject carry payload.binding.expiresAt; a binding whose deadline
+      // already passed is rejected here, before the provider's own (live-binding) check ever
+      // runs. It runs before the interaction gate because it reads only the caller's own binding,
+      // so a 410 reveals nothing about any registry record. Checked regardless of auth: the deadline is carried in the signed/unsigned command
+      // body either way, and a decision past it must never reach the provider.
+      if (
+        (command.type === "approval.accept" || command.type === "approval.reject") &&
+        Date.parse(command.payload.binding.expiresAt) < now().getTime()
+      ) {
+        inFlight.delete(command.commandId);
+        return json({ error: "decision_expired" }, 410);
       }
-    } catch (error) {
-      console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
-    } finally {
-      inFlight.delete(command.commandId);
+      const interactionId = interactionIdFor(command);
+      if (interactionId !== undefined) {
+        const record = interactions.get(interactionId);
+        if (record === undefined || record.sessionId !== command.sessionId) {
+          inFlight.delete(command.commandId);
+          return json({ error: "interaction_not_pending", interactionId, state: "not_found" }, 409);
+        }
+        if (record.state !== "pending") {
+          inFlight.delete(command.commandId);
+          return json({ error: "interaction_not_pending", interactionId, state: record.state }, 409);
+        }
+      }
+
+      // question.answer carries no binding of its own, so its deadline is whatever the registry
+      // recorded from the matching question.requested (undefined means no TTL was offered, so
+      // this never rejects on expiry for it).
+      if (command.type === "question.answer") {
+        const deadline = interactions.get(command.payload.questionId)?.expiresAt;
+        if (deadline !== undefined && Date.parse(deadline) < now().getTime()) {
+          inFlight.delete(command.commandId);
+          return json({ error: "decision_expired" }, 410);
+        }
+      }
+
+      try {
+        commands.begin(command.commandId, deviceId, bodyDigest, now());
+      } catch (error) {
+        // begin runs BEFORE the provider call: without a durable in_flight record, a client retry
+        // after a crash could re-execute this command, so a failure here must abort before
+        // execution rather than proceed and only warn.
+        inFlight.delete(command.commandId);
+        console.error(`Failed to durably record command ${command.commandId} as in_flight before execution:`, error);
+        return json({ error: "command_journal_unavailable" }, 503);
+      }
+      let createdSessionId: string | undefined;
+      try {
+        createdSessionId = await execute(command);
+      } catch (error) {
+        inFlight.delete(command.commandId);
+        const mapped = mapProviderError(error);
+        if (mapped !== undefined) {
+          // A mapped provider error is a refusal before anything was applied, so the command id is
+          // released for a retry rather than left looking indeterminate after a restart. The
+          // refusal already happened, so it is reported either way; a failure to record it durably
+          // is only logged, since silently dropping a real 409/404/429 response would be worse.
+          try {
+            commands.abandon(command.commandId, now());
+          } catch (abandonError) {
+            console.error(`Failed to durably record command ${command.commandId} as abandoned:`, abandonError);
+          }
+          return mapped;
+        }
+        // An unmapped throw is exactly the indeterminate case: the entry stays `in_flight`, and a
+        // later process reading the journal will treat it as indeterminate.
+        throw error;
+      }
+
+      const response: CommandResponse = {
+        accepted: true,
+        commandId: command.commandId,
+        duplicate: false,
+        ...(createdSessionId === undefined ? {} : { sessionId: createdSessionId }),
+      };
+      // The provider already applied this command, so `response` is reported either way; a
+      // failure to durably record the outcome (or the session's project binding) below is only
+      // logged, never converted into a failure response for work that already succeeded, and
+      // `inFlight` must still be released regardless so a retry is not stuck as a false duplicate.
+      try {
+        commands.complete(command.commandId, response, now());
+        if (createdSessionId !== undefined && command.type === "session.create") {
+          sessionIndex.record(createdSessionId, command.payload.projectId, now());
+        }
+      } catch (error) {
+        console.error(`Failed to durably record completion of command ${command.commandId}:`, error);
+      } finally {
+        inFlight.delete(command.commandId);
+      }
+      return json(response);
+    };
+
+    if (command.type === "session.create") {
+      return await runGatedCommand();
     }
-    return json(response);
+    return await withSessionLock(command.sessionId, runGatedCommand);
   }
 
   interface PairRequestBody {
@@ -942,8 +1065,14 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
           if (targetSession === undefined) {
             return json({ error: "unknown_session" }, 404);
           }
+          // Shares the per-session lock POST /v1/commands uses, so a cancel racing a decision
+          // command for the same session (or another cancel) serializes with it rather than
+          // running concurrently with it.
           try {
-            await provider.cancel(sessionId);
+            return await withSessionLock(sessionId, async () => {
+              await provider.cancel(sessionId);
+              return json({ cancelled: true, sessionId });
+            });
           } catch (error) {
             // The listSessions lookup above and cancel are two separate provider calls, so a
             // session that existed a moment ago can still disappear (or otherwise fail to
@@ -954,7 +1083,6 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
             }
             throw error;
           }
-          return json({ cancelled: true, sessionId });
         }
 
         return json({ error: "not found" }, 404);
