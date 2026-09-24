@@ -160,6 +160,7 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 403, code: "project_not_allowed", message: ""), .projectNotAllowed)
         XCTAssertEqual(BridgeError.from(status: 410, code: "decision_expired", message: ""), .decisionExpired)
         XCTAssertEqual(BridgeError.from(status: 409, code: "command_id_conflict", message: ""), .commandIdConflict)
+        XCTAssertEqual(BridgeError.from(status: 429, code: "rate_limited", message: ""), .rateLimited)
         // Unknown/pre-existing codes fall back to the generic case so old 409 handling still works.
         XCTAssertEqual(BridgeError.from(status: 409, code: nil, message: "stale binding"), .http(status: 409, message: "stale binding"))
     }

@@ -1351,4 +1351,10 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertNil(store.pendingQuestion, "a truncated gap must not leave the old question card")
     }
+
+    func testResolutionLineNamesTheActionWhenKnown() {
+        XCTAssertEqual(SessionStore.resolutionLine(.rejected, title: "Run git push"), "Denied: Run git push")
+        XCTAssertEqual(SessionStore.resolutionLine(.accepted, title: "Edit README.md"), "Allowed: Edit README.md")
+        XCTAssertEqual(SessionStore.resolutionLine(.expired, title: nil), "Approval expired")
+    }
 }
