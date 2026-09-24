@@ -197,9 +197,11 @@ final class SessionStoreDecisionTests: XCTestCase {
 
     /// Builds a store already bound to "sess_1" with a pending question card, backed by a
     /// fake client whose next `send` result is under the test's control.
-    private func makeStoreWithPendingQuestion() async throws -> (SessionStore, FakeBridgeClient) {
+    private func makeStoreWithPendingQuestion(
+        defaults: UserDefaults? = nil
+    ) async throws -> (SessionStore, FakeBridgeClient) {
         let client = FakeBridgeClient()
-        let defaults = freshDefaults()
+        let defaults = defaults ?? freshDefaults()
         let store = SessionStore(client: client, defaults: defaults)
 
         let started = try decodeEvent("""
@@ -1197,5 +1199,156 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertTrue(store.transcript.contains { $0.text == "Session sess_new started" }, "the new host's events must be applied")
         XCTAssertEqual(store.syncState, .current)
         XCTAssertEqual(defaults.string(forKey: "dev.agentremote.watch.bridgeId"), "brg_b", "the new host's bridgeId must replace the old one")
+    }
+
+    /// A bridgeId change resets sessionId to nil and resyncs from a full replay (not a gap
+    /// page), so the same "bind to the later session in the page" rule from the gap case must
+    /// also apply here, or a page crossing a session boundary right after a bridge change would
+    /// get stuck on the first (superseded) session, same as the gap regression above.
+    func testBridgeIdChangeCrossingSessionBindsToLaterSession() async throws {
+        let defaults = freshDefaults()
+        defaults.set("brg_a", forKey: "dev.agentremote.watch.bridgeId")
+        let (store, client) = try await makeStoreWithPendingApproval(defaults: defaults)
+        XCTAssertEqual(store.sessionId, "sess_1")
+
+        let s1Started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "s1", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        let s1Event = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "s1", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:01.000Z", "type": "agent.message",
+            "payload": { "messageId": "m1", "role": "assistant", "text": "from s1", "final": true }
+        }
+        """)
+        let s2Started = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "s2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:02.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        let s2Event = try decodeEvent("""
+        {
+            "eventId": 4, "sessionId": "s2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:03.000Z", "type": "agent.message",
+            "payload": { "messageId": "m2", "role": "assistant", "text": "from s2", "final": true }
+        }
+        """)
+        await client.setEventsResults([
+            // Triggers the bridgeChanged reset + continue: cursor and view are discarded,
+            // sessionId becomes nil, and the loop re-requests a full replay from 0.
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+            // A full replay (not truncated) that still crosses a session boundary.
+            .success(EventsPage(
+                events: [s1Started, s1Event, s2Started, s2Event], lastEventId: 4, skipped: 0,
+                bridgeId: "brg_b"
+            )),
+            .success(EventsPage(events: [], lastEventId: 4, skipped: 0, bridgeId: "brg_b")),
+        ])
+        await client.gateEventsCall(4)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(store.sessionId, "s2", "the later session in the replay must win the binding")
+        XCTAssertTrue(store.transcript.contains { $0.text == "from s2" }, "the later session's own event must be applied, not dropped by the cross-session guard")
+        XCTAssertNotEqual(store.statusKind, .skippedEvents, "the later session must not be treated as a foreign session to ignore")
+    }
+
+    /// After a bridgeId-change resync, the next events() request must ask for whatever is
+    /// there now (wait 0), not a long-poll wait: the store is not yet known to be current
+    /// against the new bridge, same reasoning as the fresh-cursor "syncing" case. The store
+    /// starts from an already-.current poll, so the pre-reset wait would have been 20.
+    func testBridgeIdChangeUsesZeroWaitOnResync() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            // Call 1: settles knownBridgeId to brg_a and brings syncState to .current, so
+            // call 2 below is a genuine long-poll request (wait 20) before the change.
+            .success(EventsPage(events: [], lastEventId: 2, skipped: 0, bridgeId: "brg_a")),
+            // Call 2: a different bridgeId triggers the reset + continue path.
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+        ])
+        await client.gateEventsCall(4)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        let waits = await client.waits
+        // The gated call's wait is recorded before it blocks, so 4 calls have logged a wait
+        // by the time call 4 parks.
+        XCTAssertEqual(waits.count, 4)
+        XCTAssertEqual(waits[1], 20, "call 2 must be a genuine long-poll from an already-current store")
+        XCTAssertEqual(waits[2], 0, "the request right after a bridge-change resync must not long-poll")
+    }
+
+    /// The bridge-change reset path must clear a pending question card, same as a gap: the
+    /// card's answer may have arrived in the pruned/superseded state and can never be
+    /// resolved on this bridge.
+    func testBridgeIdChangeClearsPendingQuestion() async throws {
+        // A bridge only counts as changed once one is known; without this the first page
+        // would just record brg_b and the reset path would never run.
+        let defaults = freshDefaults()
+        defaults.set("brg_a", forKey: "dev.agentremote.watch.bridgeId")
+        let (store, client) = try await makeStoreWithPendingQuestion(defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+            .success(EventsPage(events: [], lastEventId: 900, skipped: 0, bridgeId: "brg_b")),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.pendingQuestion, "a bridge change must not leave the old question card")
+    }
+
+    /// The gap-discard path must also clear a pending question card, not just the session and
+    /// transcript: the events that would have resolved it were pruned and can never arrive.
+    func testTruncatedGapClearsPendingQuestion() async throws {
+        let defaults = freshDefaults()
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+        let questionRequested = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_1", "turnId": "turn_1", "text": "Continue?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """)
+        store.apply(questionRequested)
+        XCTAssertNotNil(store.pendingQuestion, "setup should leave a pending question card")
+
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0, firstEventId: 60, truncated: true)),
+            .success(EventsPage(events: [], lastEventId: 60, skipped: 0, firstEventId: 60)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertNil(store.pendingQuestion, "a truncated gap must not leave the old question card")
     }
 }

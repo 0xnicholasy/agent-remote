@@ -214,11 +214,17 @@ final class SessionStore {
                 let gap = response.truncated && lastSeenEventId > 0
                 if gap {
                     discardLocalView()
-                    // Binding to the first event in the page (apply()'s fallback) is wrong when
-                    // the page also crosses into a later session: bind to the last
-                    // session.started in the page instead, so its events aren't dropped by the
-                    // cross-session guard below. No session.started in the page leaves sessionId
-                    // nil and falls back to apply()'s bind-on-first-event behavior as before.
+                }
+                // Binding to the first event in the page (apply()'s fallback) is wrong when
+                // the page also crosses into a later session: bind to the last session.started
+                // in the page instead, so its events aren't dropped by the cross-session guard
+                // below. This applies whenever the page is applied with no existing session
+                // binding, not just after a gap: first launch, and the id-rollback and
+                // bridgeId-change restart paths above all reset the cursor and discard the view
+                // before falling through to a full replay here. No session.started in the page
+                // leaves sessionId nil and falls back to apply()'s bind-on-first-event behavior
+                // as before.
+                if sessionId == nil {
                     if let lastStart = response.events.last(where: {
                         if case .sessionStarted = $0.payload { true } else { false }
                     }) {
