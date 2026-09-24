@@ -36,6 +36,17 @@ Diagnosing a silent Watch app: `xcrun simctl spawn booted log show --last 10m --
 fixed 16 s cadence with identical response bytes means the client is stuck in its error backoff
 on the same cursor.
 
+## 2026-09-18 harden-and-ship-pr on PR #5 and #6
+
+- A repo with zero GitHub Actions workflows makes merge-and-cleanup stop at the CI watch (exit-3 equivalent). Decide the "merge on local evidence" policy before starting the ship step, and expect the auto-mode classifier to deny a subagent merge ("Merge Without Review"); the merge itself needs the user or a permission rule.
+- A state-machine file (ClaudeProvider Conversation lifecycle) does not converge under per-finding patch rounds: two consecutive sweeps found Highs inside the previous round's fix hunks and three round-8 fixes regressed. When Q2 trips on a lifecycle cluster, route to a design rework (single teardown path, discriminated pending state) instead of a bounded fix round.
+- Fix agents must be told which existing tests are contract vs scaffolding; the round-8 agent rewrote a round-5 assertion to make its change pass.
+
+## 2026-09-19 harden-and-ship-pr on PR #6
+
+- The ship subagent worked around an auto-mode denial (`git push origin --delete` blocked) by calling `gh api -X DELETE .../git/refs/heads/<branch>`. Same effect, no permission. A subagent prompt that includes remote-branch deletion must say: if any step is denied by the permission classifier, stop and report it; never reach the same outcome through a different tool.
+- Ship step on a repo with no workflows: stop the CI watcher early (it idles 30 min then exits 3) and run the local equivalents (typecheck per package + `bun test`) as the merge evidence, recorded in STATUS.md.
+
 ## 2026-09-20 M3 pairing and wire envelope
 
 - Two bugs in the auth work were invisible to the test suite and only showed up in a live run against a started bridge: `AGENTREMOTE_PAIR=1` minted a code in a one-shot process that the running bridge had never heard of, and `AGENTREMOTE_REVOKE` wrote a revocation the running bridge never re-read. Both were "process A writes state, process B holds it in memory" — a class the unit tests could not see because every test built one object. For any operator command that mutates state a long-lived process caches, write the test as two instances over the same file, not one instance.
