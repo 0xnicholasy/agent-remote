@@ -741,9 +741,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       let original: { status: number; body: unknown };
       try {
         original = await running.outcome;
-      } catch {
+      } catch (error) {
         // The original threw an unmapped error: whether the provider applied it is unknown, which
         // is exactly what a later retry is told once the journal entry is left `in_flight`.
+        console.error(
+          `Retry of command ${command.commandId} waited on an original that threw; reporting indeterminate`,
+          error,
+        );
         return json({ error: "command_indeterminate", commandId: command.commandId }, 409);
       }
       if (isAcceptedResponse(original.body)) {
