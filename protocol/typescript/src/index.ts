@@ -82,7 +82,12 @@ export interface ApprovalRequest {
   spokenSummary?: string;
 }
 
-export type ApprovalDecision = "accepted" | "rejected" | "expired";
+/**
+ * accepted/rejected: the user decided. expired: the TTL passed before a decision. cancelled:
+ * the session was cancelled or the provider tore down before a decision. superseded: the agent
+ * withdrew the request before a decision.
+ */
+export type ApprovalDecision = "accepted" | "rejected" | "expired" | "cancelled" | "superseded";
 
 // ---------------------------------------------------------------------------
 // Event payloads
@@ -179,11 +184,20 @@ export interface QuestionRequestedPayload {
   allowFreeText: boolean;
   /** Short plain sentence the bridge composes for text-to-speech. */
   spokenSummary?: string;
+  /** TTL after which the question is treated as expired, same format as ApprovalBinding.expiresAt. */
+  expiresAt?: IsoTimestamp;
 }
+
+/**
+ * answered: the user answered. expired: the TTL passed. cancelled: the session was cancelled or
+ * the provider tore down. superseded: the agent withdrew the question.
+ */
+export type QuestionOutcome = "answered" | "expired" | "cancelled" | "superseded";
 
 export interface QuestionAnsweredPayload {
   questionId: string;
   answer: string;
+  outcome?: QuestionOutcome;
 }
 
 export interface ErrorPayload {

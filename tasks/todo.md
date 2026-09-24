@@ -1,6 +1,6 @@
 # Agent Remote task board
 
-Last updated: 2026-09-23
+Last updated: 2026-09-24
 
 Agent Remote lets a user steer short coding-agent interruptions from an Apple Watch while the Mac remains the authority. The first release targets one real provider and one paired Mac on the local network: tap answers, approve or deny, send reviewed dictation, hear short foreground replies, see current/syncing/disconnected state, and cancel. It controls only sessions created through its bridge, not arbitrary terminal sessions that were already running.
 
@@ -19,7 +19,7 @@ Agent Remote lets a user steer short coding-agent interruptions from an Apple Wa
   3. Done 2026-09-17 (PR #2): `approve()` / `reject()` / `answer()` keep the card until the bridge acknowledges; 409 (stale binding) clears it with a status line, any other failure keeps it for retry; buttons disabled while sending.
   4. Done 2026-09-17 (PR #3): mock refuses a new prompt while an approval or question is pending (409); cancel clears only that session's pending state.
   5. Speech on simulator unconfirmed; nav title overlaps card; approval title repeats the verb; mock reject path has no follow-up question; SessionStore has no client protocol seam so the 409-vs-retry path is untested; SessionStore not scoped to a session.
-- [ ] Security review of the first commits (2026-09-17). Cancel route session check landed in PR #1 on 2026-09-17. Bridge authentication landed 2026-09-20 in the M3 slice 1 work, which also closed two gaps found reviewing it: the cancel route was authenticated but not authorized, and the session/event reads ignored per-device project narrowing. Still open: the mock provider lets an approval or answer for one session touch state of another because bindings are not checked against the session id.
+- [ ] Security review of the first commits (2026-09-17). Cancel route session check landed in PR #1 on 2026-09-17. Bridge authentication landed 2026-09-20 in the M3 slice 1 work, which also closed two gaps found reviewing it: the cancel route was authenticated but not authorized, and the session/event reads ignored per-device project narrowing. The mock provider let a `question.answer` for one session touch another session's question state (not approvals, which were already checked); fixed 2026-09-24 in M3 slice 3b.
 - [ ] Add explicit root lint and typecheck entry points so documentation and CI can invoke the available package checks consistently.
 - [ ] Keep related-project research (claude-watch, agent-watcher, codex-apple-watch, iOS-vibebuddy, and mimi-remote) bounded to concrete reuse or contribution questions. It does not block the release path.
 
@@ -57,6 +57,11 @@ Dependencies: M2 protocol behavior and M1 connectivity findings.
 - [x] 2026-09-20 (slice 1): every command is validated against device, session, request identity, project, expiry, and allowed action. `commandId` is now bound to one device and one body digest; an approval past `expiresAt` is refused with 410 before it reaches a provider.
 - [x] 2026-09-20 (slice 2): replay protection and command identity are durable and bounded. Nonces, command identity/outcome, the event log and session-to-project bindings are append-only JSON Lines journals in the state dir, each with retention plus compaction. A retry of a command the previous process applied gets that command's recorded response; one the bridge died in the middle of is refused with `409 command_indeterminate` instead of being replayed. Contract in `docs/durability-v0.md`, reasoning in ADR 009.
 - [ ] Define interaction lifecycle, expiry, and cancel isolation across concurrent sessions. This is slice 3b, the next piece of work.
+  Slice 3b plan (2026-09-24, branch `feat/m3-slice-3b-interaction-lifecycle`):
+  - [x] 2026-09-24: Phase 1 implemented, pending review. Bridge `InteractionRegistry` (`bridge/src/state/interactions.ts`) derived from the event log; gate in `handleCommand` refuses wrong-session or non-pending decisions with `409 interaction_not_pending`; expiry check applies with auth off and to questions; per-session lock around gate + execute; mock `answerQuestion` checks the session id.
+  - [x] 2026-09-24: Phase 2 implemented, pending review. Wire change - `ApprovalDecision` gains `cancelled`/`superseded`, `question.answered` gains optional `outcome`, `question.requested` gains optional `expiresAt` (schema, TS, Swift); Claude and mock providers emit the right terminal state on cancel/abort/expiry; Watch removes the card on every terminal state.
+  - [x] 2026-09-24: Phase 3 implemented, pending review. Docs - `protocol-v0.md` interaction lifecycle section, `durability-v0.md`, ADR 010.
+  - Out of scope: Watch truncated-cursor UI, provider session restore, the four pr-10 auth findings.
 - [x] 2026-09-20 (slice 2): bridge-restart recovery is replay from the persisted event log. Event ids are never reused (not even for pruned events), `GET /v1/events` reports `firstEventId` and `truncated` so a cursor below the retained window is explicit rather than silently continued, and the response carries `bridgeId`. Retention: 24 hours and at most 2000 events. Six restart tests in `bridge/src/server.test.ts` plus unit tests in `bridge/src/state/state.test.ts`; 130 bridge tests pass.
 - [ ] Client-side recovery is still open: the Watch client does not read `truncated`/`firstEventId` yet, so a gap is detectable on the wire but not shown as a state. Provider sessions are not restored either - after a restart the conversation is readable but the session is gone.
 

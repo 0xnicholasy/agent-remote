@@ -107,3 +107,68 @@ private let approvalAcceptJSON = """
         _ = try JSONDecoder().decode(Command.self, from: Data(mismatched.utf8))
     }
 }
+
+@Test func roundTripsApprovalResolvedCancelledAndSuperseded() throws {
+    for decision in ["cancelled", "superseded"] {
+        let json = """
+        {
+          "eventId": 43,
+          "sessionId": "ses_01",
+          "provider": "mock",
+          "type": "approval.resolved",
+          "timestamp": "2026-09-14T10:16:00.000Z",
+          "payload": { "approvalId": "apr_01", "decision": "\(decision)" }
+        }
+        """
+        let event = try JSONDecoder().decode(AgentEvent.self, from: Data(json.utf8))
+        guard case .approvalResolved(let payload) = event.payload else {
+            Issue.record("expected an approval.resolved payload")
+            continue
+        }
+        #expect(payload.decision.rawValue == decision)
+
+        let encoded = try JSONEncoder().encode(event)
+        let again = try JSONDecoder().decode(AgentEvent.self, from: encoded)
+        #expect(again == event)
+    }
+}
+
+@Test func decodesQuestionAnsweredOutcomePresentAndAbsent() throws {
+    let withOutcomeJSON = """
+    {
+      "eventId": 44,
+      "sessionId": "ses_01",
+      "provider": "mock",
+      "type": "question.answered",
+      "timestamp": "2026-09-14T10:17:00.000Z",
+      "payload": { "questionId": "q_01", "answer": "", "outcome": "cancelled" }
+    }
+    """
+    let withOutcome = try JSONDecoder().decode(AgentEvent.self, from: Data(withOutcomeJSON.utf8))
+    guard case .questionAnswered(let withOutcomePayload) = withOutcome.payload else {
+        Issue.record("expected a question.answered payload")
+        return
+    }
+    #expect(withOutcomePayload.outcome == .cancelled)
+
+    let encoded = try JSONEncoder().encode(withOutcome)
+    let again = try JSONDecoder().decode(AgentEvent.self, from: encoded)
+    #expect(again == withOutcome)
+
+    let withoutOutcomeJSON = """
+    {
+      "eventId": 45,
+      "sessionId": "ses_01",
+      "provider": "mock",
+      "type": "question.answered",
+      "timestamp": "2026-09-14T10:17:30.000Z",
+      "payload": { "questionId": "q_01", "answer": "yes" }
+    }
+    """
+    let withoutOutcome = try JSONDecoder().decode(AgentEvent.self, from: Data(withoutOutcomeJSON.utf8))
+    guard case .questionAnswered(let withoutOutcomePayload) = withoutOutcome.payload else {
+        Issue.record("expected a question.answered payload")
+        return
+    }
+    #expect(withoutOutcomePayload.outcome == nil)
+}

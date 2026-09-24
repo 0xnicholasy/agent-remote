@@ -1435,6 +1435,394 @@ describe("pairing", () => {
   });
 });
 
+describe("interaction lifecycle", () => {
+  async function createSecondSession(): Promise<string> {
+    const response = await post({
+      commandId: "b0000000-0000-4000-8000-000000000001",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: new Date().toISOString(),
+      payload: { projectId: "prj_demo", provider: "mock" },
+    });
+    const body = (await response.json()) as CommandResponse;
+    if (body.sessionId === undefined) {
+      throw new Error("session.create did not report a session id");
+    }
+    return body.sessionId;
+  }
+
+  function promptCommandFor(sessionId: string, commandId: string): Command {
+    return {
+      commandId,
+      sessionId,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "run the tests and push" },
+    };
+  }
+
+  async function eventsFor(sessionId: string): Promise<AgentEvent[]> {
+    return (await eventsAfter(0)).filter((event) => event.sessionId === sessionId);
+  }
+
+  test("question.answer for session A with session B's questionId is refused, and B's question is still answerable", async () => {
+    const sessionB = await createSecondSession();
+    await post(promptCommandFor(bridge.session.id, "b0000000-0000-4000-8000-000000000002"));
+    await post(promptCommandFor(sessionB, "b0000000-0000-4000-8000-000000000003"));
+
+    await post({
+      commandId: "b0000000-0000-4000-8000-000000000004",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: pendingBinding(await eventsFor(bridge.session.id)) },
+    });
+    await post({
+      commandId: "b0000000-0000-4000-8000-000000000005",
+      sessionId: sessionB,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: pendingBinding(await eventsFor(sessionB)) },
+    });
+
+    const questionB = pendingQuestion(await eventsFor(sessionB));
+
+    const crossSession = await post({
+      commandId: "b0000000-0000-4000-8000-000000000006",
+      sessionId: bridge.session.id,
+      type: "question.answer",
+      timestamp: new Date().toISOString(),
+      payload: { questionId: questionB.questionId, optionId: "opt_yes" },
+    });
+    expect(crossSession.status).toBe(409);
+    expect(await crossSession.json()).toEqual({
+      error: "interaction_not_pending",
+      interactionId: questionB.questionId,
+      state: "not_found",
+    });
+
+    const stillAnswerable = await post({
+      commandId: "b0000000-0000-4000-8000-000000000007",
+      sessionId: sessionB,
+      type: "question.answer",
+      timestamp: new Date().toISOString(),
+      payload: { questionId: questionB.questionId, optionId: "opt_yes" },
+    });
+    expect(stillAnswerable.status).toBe(200);
+  });
+
+  test("approval.accept with another session's approvalId is refused, and that approval stays pending", async () => {
+    const sessionB = await createSecondSession();
+    await post(promptCommandFor(bridge.session.id, "b0000000-0000-4000-8000-000000000008"));
+    await post(promptCommandFor(sessionB, "b0000000-0000-4000-8000-000000000009"));
+
+    const bindingB = pendingBinding(await eventsFor(sessionB));
+
+    const crossSession = await post({
+      commandId: "b0000000-0000-4000-8000-00000000000a",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: bindingB },
+    });
+    expect(crossSession.status).toBe(409);
+    expect(await crossSession.json()).toEqual({
+      error: "interaction_not_pending",
+      interactionId: bindingB.approvalId,
+      state: "not_found",
+    });
+
+    const stillPending = await post({
+      commandId: "b0000000-0000-4000-8000-00000000000b",
+      sessionId: sessionB,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: bindingB },
+    });
+    expect(stillPending.status).toBe(200);
+  });
+
+  test("session.cancel on A leaves B's pending approval intact and refuses a later decision on A's own", async () => {
+    const sessionB = await createSecondSession();
+    await post(promptCommandFor(bridge.session.id, "b0000000-0000-4000-8000-00000000000c"));
+    await post(promptCommandFor(sessionB, "b0000000-0000-4000-8000-00000000000d"));
+
+    const bindingA = pendingBinding(await eventsFor(bridge.session.id));
+    const bindingB = pendingBinding(await eventsFor(sessionB));
+
+    const cancelResponse = await post({
+      commandId: "b0000000-0000-4000-8000-00000000000e",
+      sessionId: bridge.session.id,
+      type: "session.cancel",
+      timestamp: new Date().toISOString(),
+      payload: {},
+    });
+    expect(cancelResponse.status).toBe(200);
+
+    const decideB = await post({
+      commandId: "b0000000-0000-4000-8000-00000000000f",
+      sessionId: sessionB,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: bindingB },
+    });
+    expect(decideB.status).toBe(200);
+
+    const decideA = await post({
+      commandId: "b0000000-0000-4000-8000-000000000010",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: bindingA },
+    });
+    expect(decideA.status).toBe(409);
+    expect(await decideA.json()).toEqual({
+      error: "interaction_not_pending",
+      interactionId: bindingA.approvalId,
+      state: "cancelled",
+    });
+  });
+
+  test("a decision past its expiry is refused with 410 even when auth is off", async () => {
+    await post(promptCommand("b0000000-0000-4000-8000-000000000011"));
+    const binding = pendingBinding(await eventsAfter(0));
+    const expired = { ...binding, expiresAt: new Date(Date.now() - 1000).toISOString() };
+
+    const response = await post({
+      commandId: "b0000000-0000-4000-8000-000000000012",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: expired },
+    });
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+
+  test("two devices racing to decide the same approval: exactly one succeeds, the loser is told it is already resolved", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const deviceId2 = "dev_1111111111111111";
+    const deviceKey2 = Buffer.from("dd".repeat(32), "hex");
+    registry.register(
+      sampleDeviceRecord({ deviceId: deviceId2, deviceKeyHex: deviceKey2.toString("hex"), keyId: "key_second" }),
+    );
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const promptResponse = await authedBridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: {
+          commandId: "b0000000-0000-4000-8000-000000000013",
+          sessionId: authedBridge.session.id,
+          type: "prompt.send",
+          timestamp: FIXED_NOW.toISOString(),
+          payload: { text: "run the tests and push" },
+        } satisfies Command,
+      }),
+    );
+    expect(promptResponse.status).toBe(200);
+
+    const eventsResponse = await authedBridge.fetch(
+      signedRequest({ method: "GET", pathWithQuery: "/v1/events?after=0" }),
+    );
+    const binding = pendingBinding(((await eventsResponse.json()) as EventsResponse).events);
+
+    const decide = (deviceId: string, deviceKey: Buffer, commandId: string): Promise<Response> =>
+      authedBridge.fetch(
+        signedRequest({
+          method: "POST",
+          pathWithQuery: "/v1/commands",
+          deviceId,
+          deviceKey,
+          body: {
+            commandId,
+            sessionId: authedBridge.session.id,
+            type: "approval.accept",
+            timestamp: FIXED_NOW.toISOString(),
+            payload: { binding },
+          } satisfies Command,
+        }),
+      );
+
+    const [first, second] = await Promise.all([
+      decide(DEVICE_ID, DEVICE_KEY, "b0000000-0000-4000-8000-000000000014"),
+      decide(deviceId2, deviceKey2, "b0000000-0000-4000-8000-000000000015"),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([200, 409]);
+    const loser = first.status === 409 ? first : second;
+    expect(await loser.json()).toEqual({
+      error: "interaction_not_pending",
+      interactionId: binding.approvalId,
+      state: "resolved",
+    });
+  });
+
+  test("session.cancel reports the session's pending approval as cancelled before session.completed", async () => {
+    await post(promptCommand("b0000000-0000-4000-8000-000000000016"));
+    const binding = pendingBinding(await eventsAfter(0));
+
+    const cancelResponse = await post({
+      commandId: "b0000000-0000-4000-8000-000000000017",
+      sessionId: bridge.session.id,
+      type: "session.cancel",
+      timestamp: new Date().toISOString(),
+      payload: {},
+    });
+    expect(cancelResponse.status).toBe(200);
+
+    const events = await eventsAfter(0);
+    const approvalResolved = events.find(
+      (event) => event.type === "approval.resolved" && event.payload.approvalId === binding.approvalId,
+    );
+    const completed = events.find((event) => event.type === "session.completed");
+    expect(approvalResolved?.payload).toMatchObject({ approvalId: binding.approvalId, decision: "cancelled" });
+    expect(completed).toBeDefined();
+    // Reported before session.completed, or a card still on screen for this approval would
+    // never learn why it disappeared.
+    expect(events.indexOf(approvalResolved!)).toBeLessThan(events.indexOf(completed!));
+  });
+
+  test("session.cancel reports the session's pending question as cancelled before session.completed", async () => {
+    await post(promptCommand("b0000000-0000-4000-8000-000000000018"));
+    const binding = pendingBinding(await eventsAfter(0));
+    await post({
+      commandId: "b0000000-0000-4000-8000-000000000019",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding },
+    });
+    const question = pendingQuestion(await eventsAfter(0));
+
+    const cancelResponse = await post({
+      commandId: "b0000000-0000-4000-8000-00000000001a",
+      sessionId: bridge.session.id,
+      type: "session.cancel",
+      timestamp: new Date().toISOString(),
+      payload: {},
+    });
+    expect(cancelResponse.status).toBe(200);
+
+    const events = await eventsAfter(0);
+    const questionAnswered = events.find(
+      (event) => event.type === "question.answered" && event.payload.questionId === question.questionId,
+    );
+    const completed = events.find((event) => event.type === "session.completed");
+    expect(questionAnswered?.payload).toMatchObject({ questionId: question.questionId, answer: "", outcome: "cancelled" });
+    expect(completed).toBeDefined();
+    expect(events.indexOf(questionAnswered!)).toBeLessThan(events.indexOf(completed!));
+  });
+
+  test("question.answer past its expiresAt is refused with 410 even though the mock's own timer has not fired yet", async () => {
+    const registry = new DeviceRegistry();
+    // The bridge's own clock (used for the 410 check) is jumped forward between the approval
+    // decision and the question decision, with no real wait: the approval decision still sees an
+    // unexpired deadline, but by the time the question is answered its `expiresAt` reads as
+    // already past. `ttlMs: 5000` keeps the mock provider's own real-timer expiry (task 4) from
+    // firing during this synchronous test, isolating the server's own expiresAt-vs-`now()` check
+    // (task 2) from the provider's own timer.
+    let clockOffsetMs = 0;
+    const localBridge = createBridge({
+      registry,
+      authEnabled: false,
+      now: () => new Date(Date.now() + clockOffsetMs),
+      mockProviderOptions: { ttlMs: 5000 },
+    });
+    const localPost = (command: Command): Promise<Response> =>
+      localBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(command),
+        }),
+      );
+    const localEvents = async (): Promise<AgentEvent[]> => {
+      const response = await localBridge.fetch(new Request("http://bridge.local/v1/events?after=0"));
+      return ((await response.json()) as EventsResponse).events;
+    };
+
+    await localPost({
+      commandId: "b0000000-0000-4000-8000-000000000019",
+      sessionId: localBridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "run the tests and push" },
+    });
+    const binding = pendingBinding(await localEvents());
+    await localPost({
+      commandId: "b0000000-0000-4000-8000-00000000001a",
+      sessionId: localBridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding },
+    });
+    const question = pendingQuestion(await localEvents());
+
+    // No real wait: the bridge's own clock alone decides the question is past its deadline.
+    clockOffsetMs = 10_000;
+
+    const response = await localPost({
+      commandId: "b0000000-0000-4000-8000-00000000001b",
+      sessionId: localBridge.session.id,
+      type: "question.answer",
+      timestamp: new Date().toISOString(),
+      payload: { questionId: question.questionId, optionId: "opt_yes" },
+    });
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+
+  test("the mock provider's approval expiry timer emits expired, and a later decision is refused as stale", async () => {
+    const registry = new DeviceRegistry();
+    // A short ttlMs (not the 5-minute production default) lets this test observe the timer
+    // firing after a brief real delay instead of a long sleep.
+    const localBridge = createBridge({ registry, authEnabled: false, mockProviderOptions: { ttlMs: 20 } });
+    const localPost = (command: Command): Promise<Response> =>
+      localBridge.fetch(
+        new Request("http://bridge.local/v1/commands", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(command),
+        }),
+      );
+    const localEvents = async (): Promise<AgentEvent[]> => {
+      const response = await localBridge.fetch(new Request("http://bridge.local/v1/events?after=0"));
+      return ((await response.json()) as EventsResponse).events;
+    };
+
+    await localPost({
+      commandId: "b0000000-0000-4000-8000-00000000001c",
+      sessionId: localBridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "run the tests and push" },
+    });
+    const binding = pendingBinding(await localEvents());
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const resolvedEvents = (await localEvents()).filter((event) => event.type === "approval.resolved");
+    expect(resolvedEvents).toHaveLength(1);
+    expect(resolvedEvents[0]?.payload).toMatchObject({ approvalId: binding.approvalId, decision: "expired" });
+
+    const response = await localPost({
+      commandId: "b0000000-0000-4000-8000-00000000001d",
+      sessionId: localBridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding },
+    });
+    // The binding's own expiresAt is checked before the registry, so an expired approval is
+    // always 410, whether or not the provider's timer has already fired.
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+});
+
 describe("restart recovery", () => {
   let stateDir: string;
   let devicesFilePath: string;
@@ -1644,6 +2032,78 @@ describe("restart recovery", () => {
     // The restarted provider has no such session, so only the persisted session index can
     // authorize these events; without it the device would reconnect to an empty history.
     expect(page.events.some((event) => event.sessionId === createdSessionId)).toBe(true);
+  });
+
+  test("a decision on an approval already resolved before the restart is refused, not replayed", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a1010101-1010-4101-8101-101010101010", first.session.id));
+    const requested = (await eventsOf(first, 0)).events.find((event) => event.type === "approval.requested");
+    if (requested === undefined || requested.type !== "approval.requested") {
+      throw new Error("no approval.requested event was emitted");
+    }
+    const binding = requested.payload.binding;
+
+    const decideResponse = await postTo(first, {
+      commandId: "a1010101-1010-4101-8101-101010101011",
+      sessionId: first.session.id,
+      type: "approval.accept",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { binding },
+    });
+    expect(decideResponse.status).toBe(200);
+
+    // A fresh commandId, not a retry: this exercises the interaction registry (rebuilt from the
+    // event log at startup), not the command journal's own idempotency check.
+    const second = restart();
+    const retryResponse = await postTo(second, {
+      commandId: "a1010101-1010-4101-8101-101010101012",
+      sessionId: second.session.id,
+      type: "approval.accept",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { binding },
+    });
+    expect(retryResponse.status).toBe(409);
+    expect(await retryResponse.json()).toEqual({
+      error: "interaction_not_pending",
+      interactionId: binding.approvalId,
+      state: "resolved",
+    });
+  });
+
+  test("an approval requested after a restart is decidable even though the previous boot resolved one", async () => {
+    const first = restart();
+    await postTo(first, commandBody("a1010101-1010-4101-8101-101010101020", first.session.id));
+    const firstRequested = (await eventsOf(first, 0)).events.find((event) => event.type === "approval.requested");
+    if (firstRequested === undefined || firstRequested.type !== "approval.requested") {
+      throw new Error("no approval.requested event was emitted");
+    }
+    const firstDecision = await postTo(first, {
+      commandId: "a1010101-1010-4101-8101-101010101021",
+      sessionId: first.session.id,
+      type: "approval.accept",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { binding: firstRequested.payload.binding },
+    });
+    expect(firstDecision.status).toBe(200);
+
+    // The new boot's provider issues approval ids from scratch. They must not collide with the
+    // resolved record the registry rebuilt from the previous boot's log, or the gate refuses a
+    // live approval.
+    const second = restart();
+    await postTo(second, commandBody("a1010101-1010-4101-8101-101010101022", second.session.id));
+    const secondRequested = (await eventsOf(second, 0)).events.filter((event) => event.type === "approval.requested").at(-1);
+    if (secondRequested === undefined || secondRequested.type !== "approval.requested") {
+      throw new Error("no approval.requested event was emitted after the restart");
+    }
+    expect(secondRequested.payload.binding.approvalId).not.toBe(firstRequested.payload.binding.approvalId);
+    const secondDecision = await postTo(second, {
+      commandId: "a1010101-1010-4101-8101-101010101023",
+      sessionId: second.session.id,
+      type: "approval.accept",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { binding: secondRequested.payload.binding },
+    });
+    expect(secondDecision.status).toBe(200);
   });
 });
 

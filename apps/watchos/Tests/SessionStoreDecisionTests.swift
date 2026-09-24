@@ -410,6 +410,24 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNil(store.pendingApproval)
     }
 
+    /// A cancelled decision is a terminal outcome for the pending approval just like accepted,
+    /// rejected or expired: apply() must remove the card so approve()/reject() cannot be called
+    /// again against a binding the bridge already resolved.
+    func testApprovalResolvedCancelledClearsPendingApproval() async throws {
+        let (store, _) = try await makeStoreWithPendingApproval()
+
+        let resolved = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "cancelled" }
+        }
+        """)
+        store.apply(resolved)
+
+        XCTAssertNil(store.pendingApproval)
+    }
+
     /// Regression for the round-2 critical finding: createSession()'s response can land after
     /// reconnect() has already bumped pollGeneration and cleared sessionId. The stale create
     /// must not rebind sessionId to a session the new generation knows nothing about.

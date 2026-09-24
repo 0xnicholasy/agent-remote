@@ -74,7 +74,8 @@ Lifecycle events are `session.started`, `session.completed`, `turn.started` and
 for a watch face), `agent.message` (the assistant's visible reply text, distinct from
 `agent.thinking`), `file.read`, `file.modified`, `command.started`, `command.output` (a chunk
 of stdout or stderr) and `command.completed`. Interaction events are `approval.requested`,
-`approval.resolved` (accepted, rejected or expired), `question.requested` and
+`approval.resolved` (`ApprovalDecision`: `accepted`, `rejected`, `expired`, `cancelled` or
+`superseded` — see [Interaction lifecycle](#interaction-lifecycle)), `question.requested` and
 `question.answered`. The remaining two are `error` for recoverable or fatal failures and
 `usage.updated` for token or cost counters.
 
@@ -116,6 +117,21 @@ interface QuestionRequestedPayload {
   options: QuestionOption[];
   allowFreeText: boolean;
   spokenSummary?: string; // short plain sentence for text-to-speech
+  expiresAt?: string;     // optional TTL, ISO 8601 UTC; see Interaction lifecycle
+}
+```
+
+### `question.answered` payload
+
+`answer` is required and stays an empty string when the question was not answered (expiry,
+cancel or supersede). `outcome` is optional so an older client that ignores it keeps reading
+`answer` as before.
+
+```ts
+interface QuestionAnsweredPayload {
+  questionId: string;
+  answer: string;
+  outcome?: "answered" | "expired" | "cancelled" | "superseded";
 }
 ```
 
@@ -267,12 +283,55 @@ user saw, rather than a different action sharing an id.
 
 Questions have the same lifecycle requirement even though their current payload has a smaller
 binding: an answer must apply only to the currently pending question in that session and turn.
+
+## Interaction lifecycle
+
+An approval or a question is one interaction. Every interaction starts `pending` and moves to
+exactly one terminal state; a terminal state never moves again.
+
+| State | Reached when |
+| --- | --- |
+| `resolved` | A device accepted, rejected or answered it. |
+| `expired` | Its `expiresAt` TTL passed. Only a provider emits this, when its own timer fires. |
+| `cancelled` | `session.cancel` ran, or the provider tore the session down. |
+| `superseded` | The agent or SDK withdrew the request before a decision. |
+
+The bridge derives an `InteractionRegistry` from the event log rather than tracking interaction
+state only inside a provider: it observes every emitted event after that event is durably
+appended, and rebuilds itself from the log on bridge startup. Provider-side checks (the same
+binding, session and turn checks the provider adapter already made) stay in place as defense in
+depth; the registry is what makes the gate below authoritative rather than best-effort.
+
+A decision command is gated before it reaches the provider. Checks run in this order and the
+first match wins:
+
+| Order | Response | Condition |
+| --- | --- | --- |
+| 1 | `410 {"error": "decision_expired"}` | `approval.accept`/`approval.reject` whose binding `expiresAt` has passed. It reads only the caller's own binding, so it runs first and discloses nothing. An expired approval is always 410, whether or not the provider's timer has already emitted `expired`. |
+| 2 | `409 {"error": "interaction_not_pending", "interactionId": <id>, "state": "not_found"}` | The id is unknown to the registry, or bound to a different session. Both cases get the same body, so a caller cannot tell "exists in another session" from "never existed". |
+| 3 | `409 {"error": "interaction_not_pending", "interactionId": <id>, "state": <state>}` | The interaction is this session's and terminal. `state` is that terminal state. |
+| 4 | `410 {"error": "decision_expired"}` | `question.answer` whose question's recorded `expiresAt` has passed. |
+
+All four are enforced whether or not `AGENTREMOTE_AUTH` is on. Refusing an unknown id is safe
+because every provider event passes through the registry, the cap never evicts a pending record,
+and provider sessions do not survive a restart. Interaction ids are random (`apr_<uuid>`,
+`qst_<uuid>`), so a new boot never reissues an id the rebuilt registry already holds.
+
+None of these refusals create a command journal entry: a rejected decision was never
+applied, so it is not a retryable command identity.
+
 For approvals and questions, the first valid terminal decision from concurrent clients wins;
-later decisions receive an already-resolved or stale result and have no provider-side effect.
-Cancelling one session affects only that session and invalidates its pending interactions.
-Expiry must be observable, normally through `approval.resolved` or an equivalent terminal
-event, so every client can remove stale UI. The current mock behavior is not evidence that all
-of these cross-session and concurrent-client invariants are implemented.
+a second device deciding the same interaction gets `409 interaction_not_pending` with
+`state: "resolved"`, not a stale-but-successful response. Cancelling one session affects only
+that session and terminates only its own pending interactions as `cancelled`. Expiry must be
+observable, normally through `approval.resolved` or `question.answered` carrying the matching
+terminal state, so every client can remove stale UI without polling.
+
+Commands for one session — decision commands, `prompt.send`, `session.cancel`, and the
+`POST /v1/sessions/:id/cancel` route — run one at a time per session, so the gate check and the
+provider call it guards cannot race within that session. Different sessions do not block each
+other. `commandId` deduplication is unaffected by this and is checked outside the per-session
+lock.
 
 ## Validation and authenticated envelopes
 
@@ -305,7 +364,9 @@ by making the field optional for that one type.
 
 The unsupported approval mappings above need explicit protocol representation before adapters
 may expose them. The recovery model, bridge identity, stale-cursor response, bounded log
-retention, durable command-outcome window and authenticated envelope format are now settled
-(see [durability-v0.md](durability-v0.md) and [pairing-v0.md](pairing-v0.md)). Compaction of
-long `command.output` streams, partial replay, pending-interaction restart policy, conversation
-reconstruction rules and runtime schema validation on the Swift side remain open.
+retention, durable command-outcome window, authenticated envelope format and interaction
+lifecycle are now settled (see [durability-v0.md](durability-v0.md),
+[pairing-v0.md](pairing-v0.md) and [ADR 010](adr/010-interaction-lifecycle.md)). Compaction of
+long `command.output` streams, partial replay, conversation reconstruction rules and runtime
+schema validation on the Swift side remain open. Whether a pending interaction can be resolved
+at all after a restart still depends on provider session restore, which is not implemented.
