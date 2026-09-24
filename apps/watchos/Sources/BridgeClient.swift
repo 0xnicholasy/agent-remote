@@ -118,6 +118,11 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case decisionExpired
     case commandIdConflict
     case rateLimited
+    /// The bridge stopped while this command was running and cannot say whether it took effect.
+    case commandIndeterminate
+    /// The approval or question is no longer waiting for an answer (already decided, expired,
+    /// cancelled or superseded).
+    case interactionNotPending
 
     var description: String {
         switch self {
@@ -134,6 +139,8 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .decisionExpired: "That approval or question already expired."
         case .commandIdConflict: "That command was already sent with different contents."
         case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
+        case .commandIndeterminate: "The bridge cannot tell whether that command took effect."
+        case .interactionNotPending: "That request is no longer waiting for an answer."
         }
     }
 
@@ -151,6 +158,8 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "decision_expired": .decisionExpired
         case "command_id_conflict": .commandIdConflict
         case "rate_limited": .rateLimited
+        case "command_indeterminate": .commandIndeterminate
+        case "interaction_not_pending": .interactionNotPending
         default: .http(status: status, message: message)
         }
     }
@@ -167,8 +176,17 @@ protocol BridgeClientProtocol: Sendable {
     func pair(code: String, deviceName: String) async throws
     func isPaired() async -> Bool
     func events(after: Int, wait: Int) async throws -> EventsPage
+    /// `commandId` is the idempotency key: resending the same payload with the same id gets the
+    /// bridge's recorded outcome instead of running the command again.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse
+}
+
+extension BridgeClientProtocol {
+    @discardableResult
+    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
+        try await send(payload, sessionId: sessionId, commandId: UUID().uuidString)
+    }
 }
 
 /// Talks to the Mac Agent Bridge over the HTTP long-poll baseline. One instance per app.
@@ -272,9 +290,9 @@ actor BridgeClient: BridgeClientProtocol {
 
     /// Submits one command, minting a fresh idempotency key for it.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse {
         let command = Command(
-            commandId: UUID().uuidString,
+            commandId: commandId,
             sessionId: sessionId,
             timestamp: BridgeClient.timestamp(),
             payload: payload

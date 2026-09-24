@@ -12,6 +12,7 @@ actor FakeBridgeClient: BridgeClientProtocol {
     struct RecordedSend {
         let payload: CommandPayload
         let sessionId: String
+        let commandId: String
     }
 
     private var sendResult: SendResult = .success(CommandResponse())
@@ -115,8 +116,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
         }
     }
 
-    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
-        sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId))
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse {
+        sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId, commandId: commandId))
         sendCallCount += 1
         let currentCall = sendCallCount
         if sendGateAtCall == currentCall {
@@ -272,6 +273,117 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertNil(store.pendingApproval)
         XCTAssertFalse(store.isSending)
+    }
+
+    func testExpiredDecisionClearsCardAndSaysExpired() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+
+        await store.approve()
+
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .expired)
+        XCTAssertEqual(store.statusLine, "Decision expired before it reached the bridge")
+        XCTAssertEqual(store.statusKind, .requestInvalid)
+    }
+
+    func testIndeterminateOutcomeIsShownNotGuessed() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.commandIndeterminate))
+
+        await store.approve()
+
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .indeterminate)
+        XCTAssertEqual(store.statusLine, "Outcome unknown; check at the desk")
+    }
+
+    func testInteractionNotPendingIsNoLongerValid() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(BridgeError.interactionNotPending))
+
+        await store.answer(optionId: "yes")
+
+        XCTAssertNil(store.pendingQuestion)
+        XCTAssertEqual(store.actionOutcome, .noLongerValid)
+        XCTAssertEqual(store.statusKind, .requestInvalid)
+    }
+
+    /// An offline send keeps the card, and repeating the same choice reuses the command id so a
+    /// send that did land gets its recorded outcome instead of a second execution.
+    func testOfflineKeepsCardAndSameChoiceRetriesWithSameCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+
+        await store.approve()
+
+        XCTAssertNotNil(store.pendingApproval, "offline must keep the card for a retry")
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .offline)
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId, "a retry of the same choice must reuse the command id")
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+    }
+
+    /// A different choice after an offline send is a different command, so it must not reuse
+    /// the id (the bridge would refuse it as a conflict).
+    func testOfflineThenDifferentChoiceUsesNewCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+
+        await store.approve()
+        await store.reject()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
+    }
+
+    /// A send that got a verdict must not leave its id behind for reuse: the next identical
+    /// payload is a new command.
+    func testFailedSendDoesNotReuseCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+
+        await store.approve()
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .failed)
+    }
+
+    /// The outcome belongs to the card it was sent for; a newer card starts with none.
+    func testOutcomeIsScopedToItsCard() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.networkConnectionLost)))
+        await store.approve()
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .offline)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest2",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Edit README.md"
+            }
+        }
+        """))
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2")
+        XCTAssertNil(store.outcome(forCard: "appr_2"))
     }
 
     /// Regression for E-003: after reconnect() drops the old binding, a session.started for a

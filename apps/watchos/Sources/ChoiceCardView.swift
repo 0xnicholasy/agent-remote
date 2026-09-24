@@ -43,11 +43,20 @@ struct ChoiceCardView: View {
                         .buttonStyle(.bordered)
                 }
             }
+            if let outcome = store.outcome(forCard: cardId) {
+                Text(outcome.label)
+                    .font(.caption2)
+                    .foregroundStyle(outcome == .sending ? Color.secondary : Color.orange)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(8)
         .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
         .disabled(store.isSending)
+    }
+
+    private var cardId: String {
+        approval?.binding.approvalId ?? question?.questionId ?? ""
     }
 
     private var prompt: String {
