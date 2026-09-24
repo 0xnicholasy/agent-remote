@@ -59,15 +59,15 @@ what was run and what it printed. New behaviour in the bridge or the protocol pa
 test in the same style as the existing ones, sized to the behaviour rather than to a coverage
 target.
 
-Run the checks that exist for the area you changed: `bun test` at the repository root, each
-TypeScript package's `typecheck` script when its code changes, and `swift test` from
+Run the checks that exist for the area you changed: `bun run check` at the repository root
+(`bun run typecheck` across every TypeScript workspace, then `bun test`), and `swift test` from
 `protocol/swift` when the Swift package changes. Watch changes need an Xcode build or test with
 a compatible installed watchOS destination, and networking/background claims require a physical
 Watch result. Record the exact checks and any unavailable toolchain or destination in the pull
 request.
 
-The root package currently has no lint or aggregate typecheck script. That is a tooling gap, not
-permission to claim those checks ran. Do not invent a command or substitute generated-project
+The repository has no linter configured yet. That is a tooling gap, not permission to claim a
+lint check ran. Do not invent a command or substitute generated-project
 existence for a build result.
 
 A change to an accepted decision in `docs/adr/` needs a new ADR rather than an edit to the old
