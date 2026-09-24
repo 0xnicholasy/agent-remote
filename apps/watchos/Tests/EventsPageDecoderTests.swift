@@ -33,5 +33,52 @@ final class EventsPageDecoderTests: XCTestCase {
         XCTAssertEqual(page.events.first?.eventId, 5)
         XCTAssertEqual(page.skipped, 1)
         XCTAssertEqual(page.lastEventId, 7)
+        XCTAssertFalse(page.truncated, "a bridge that predates the field must read as not truncated")
+        XCTAssertNil(page.bridgeId)
+    }
+
+    func testDecodesRecoveryFields() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "firstEventId": 4, "truncated": true, "bridgeId": "brg_1a2b3c4d" }
+        """
+        let page = try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder())
+
+        XCTAssertEqual(page.firstEventId, 4)
+        XCTAssertTrue(page.truncated)
+        XCTAssertEqual(page.bridgeId, "brg_1a2b3c4d")
+    }
+
+    func testThrowsOnWrongTypedTruncated() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "truncated": "true" }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
+
+    func testThrowsOnWrongTypedFirstEventId() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "firstEventId": "12" }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
+
+    func testThrowsOnWrongTypedBridgeId() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "bridgeId": 42 }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
+
+    /// An explicit JSON `null` (as opposed to the field being absent) must read the same as a
+    /// bridge that predates these fields, not throw -- `!(raw is NSNull)` covers both cases.
+    func testExplicitNullRecoveryFieldsDecodeAsAbsent() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "firstEventId": null, "truncated": null, "bridgeId": null }
+        """
+        let page = try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder())
+
+        XCTAssertNil(page.firstEventId)
+        XCTAssertFalse(page.truncated)
+        XCTAssertNil(page.bridgeId)
     }
 }

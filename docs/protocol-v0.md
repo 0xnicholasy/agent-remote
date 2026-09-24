@@ -250,7 +250,8 @@ interface EventsResponse {
 `truncated` is the stale-cursor answer: events between the cursor and this page were dropped by
 retention and can never be fetched again, so the client resyncs from the page it was given
 rather than treating it as a continuation. An empty list with `truncated: false` genuinely means
-current. Command outcomes recover with the same guarantee: a retry of a `commandId` the previous
+current. The Watch's handling of these fields, and the current / syncing / disconnected state it
+shows, is in [durability-v0.md](durability-v0.md#client-recovery). Command outcomes recover with the same guarantee: a retry of a `commandId` the previous
 process applied gets that command's recorded response, and one the bridge died in the middle of
 is refused with `409 command_indeterminate` rather than replayed. The contract is
 [durability-v0.md](durability-v0.md) and the reasoning is

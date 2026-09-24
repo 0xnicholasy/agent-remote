@@ -23,6 +23,21 @@ enum StatusKind: Equatable {
     case authFailed
 }
 
+/// Whether what the Watch shows matches the bridge (docs/durability-v0.md, "Client recovery").
+/// `current` only after a page has been applied, so the Watch never claims to be up to date
+/// on the strength of a cursor it has not checked against the bridge.
+enum SyncState: Equatable {
+    case current, syncing, disconnected
+
+    var label: String {
+        switch self {
+        case .current: "Current"
+        case .syncing: "Syncing"
+        case .disconnected: "Disconnected"
+        }
+    }
+}
+
 enum TurnState: String {
     case idle, thinking, running, waiting, completed, error
 
@@ -45,6 +60,7 @@ enum TurnState: String {
 final class SessionStore {
     private static let hostKey = "dev.agentremote.watch.host"
     private static let cursorKey = "dev.agentremote.watch.lastSeenEventId"
+    private static let bridgeIdKey = "dev.agentremote.watch.bridgeId"
     private static let projectId = "prj_demo"
     private static let provider = "mock"
 
@@ -54,7 +70,8 @@ final class SessionStore {
     private(set) var turnState: TurnState = .idle
     private(set) var sessionId: String?
     private(set) var lastSeenEventId: Int
-    private(set) var connected = false
+    private(set) var syncState: SyncState = .disconnected
+    var connected: Bool { syncState != .disconnected }
     private(set) var statusLine = "Not connected"
     private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
@@ -62,10 +79,13 @@ final class SessionStore {
     private(set) var pairingError: String?
 
     var hostText: String {
-        didSet { UserDefaults.standard.set(hostText, forKey: SessionStore.hostKey) }
+        didSet { defaults.set(hostText, forKey: SessionStore.hostKey) }
     }
 
     let speaker: Speaker
+    /// Where the host, cursor and bridge id persist. Injectable so each test gets its own suite
+    /// instead of sharing standard defaults with every other test's still-running poll loop.
+    @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let client: any BridgeClientProtocol
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
@@ -73,14 +93,18 @@ final class SessionStore {
     @ObservationIgnored private var pollGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
+    /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
+    /// meaningful against the bridge that issued it.
+    @ObservationIgnored private var knownBridgeId: String?
 
     /// `client` is injectable so tests can substitute a fake in place of a real `BridgeClient`.
-    init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker()) {
-        let defaults = UserDefaults.standard
+    init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker(), defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let stored = defaults.string(forKey: SessionStore.hostKey)
         let url = stored.flatMap(BridgeClient.parseBaseURL) ?? BridgeClient.defaultBaseURL
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
+        knownBridgeId = defaults.string(forKey: SessionStore.bridgeIdKey)
         self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
     }
@@ -118,16 +142,18 @@ final class SessionStore {
         pollTask?.cancel()
         pollTask = nil
         pollGeneration += 1
+        // Before the await below: the old host's "Current" must not stay on screen while the
+        // cursor and session it described are being discarded.
+        syncState = .syncing
         if let url = BridgeClient.parseBaseURL(hostText) {
             await client.setBaseURL(url)
         }
         resetCursor()
+        setKnownBridgeId(nil)
         // A new host means a different bridge and session space: drop the old binding and
         // its state, or every event from the new bridge's session would be silently
         // dropped by the cross-session guard in apply() until relaunch.
-        resetSessionState()
-        transcript.removeAll()
-        turnState = .idle
+        discardLocalView()
         start()
     }
 
@@ -142,29 +168,34 @@ final class SessionStore {
 
     private func pollLoop(generation: Int) async {
         var backoff: Double = 1
+        if generation == pollGeneration { syncState = .syncing }
         while !Task.isCancelled {
             do {
-                let response = try await client.events(after: lastSeenEventId, wait: 20)
+                // Until a page has been applied the Watch is not known to be current, so ask
+                // for whatever is there now instead of parking in a long poll that would keep
+                // "Syncing" on screen for the full wait when nothing is new.
+                let wait = syncState == .current ? 20 : 0
+                let response = try await client.events(after: lastSeenEventId, wait: wait)
                 // The old task's request can complete successfully after reconnect() moved on
                 // to a new generation; drop it so it cannot re-bind sessionId to a stale bridge.
                 if Task.isCancelled || generation != pollGeneration { return }
-                connected = true
                 backoff = 1
-                // A restarted bridge numbers events from one again, so a cursor from the
-                // previous run would silently skip the whole new log.
-                if response.lastEventId < lastSeenEventId {
+                // A different bridgeId means a different bridge, or the same one with its state
+                // wiped: the cursor, session and transcript all belong to a log that no longer
+                // exists. Event ids are never reused within one bridge's state, so the id
+                // rollback check only matters for a bridge that does not report a bridgeId.
+                let bridgeChanged = response.bridgeId != nil
+                    && knownBridgeId != nil
+                    && response.bridgeId != knownBridgeId
+                if bridgeChanged || response.lastEventId < lastSeenEventId {
                     resetCursor()
-                    // The bridge restarted under the same host: the old sessionId (and any
-                    // pending card bound to it) has no live session behind it anymore, or it
-                    // would be stuck forever behind the cross-session guard in apply().
-                    resetSessionState()
-                    // The dead session's transcript belongs to a session this bridge no longer
-                    // knows about, or it would persist on screen alongside whatever starts next.
-                    transcript.removeAll()
-                    // Mirrors reconnect(): no live session remains behind the old turn, so a
-                    // stale .waiting/.thinking pill must not linger on screen after the reset.
-                    turnState = .idle
+                    setKnownBridgeId(response.bridgeId)
+                    discardLocalView()
+                    syncState = .syncing
                     continue
+                }
+                if let bridgeId = response.bridgeId, bridgeId != knownBridgeId {
+                    setKnownBridgeId(bridgeId)
                 }
                 // Set before applying events, or this would unconditionally clobber a more
                 // specific status (e.g. "Ignored session") that apply() sets while handling
@@ -176,15 +207,58 @@ final class SessionStore {
                     statusLine = "Connected"
                     statusKind = .connected
                 }
+                // The events between the cursor and this page were pruned by retention, so
+                // anything built from them (a pending card, the session binding) may be stale
+                // and can never be corrected by a later page. Rebuild from this page instead.
+                // A fresh cursor has shown nothing yet, so there is nothing to discard or report.
+                let gap = response.truncated && lastSeenEventId > 0
+                if gap {
+                    discardLocalView()
+                }
+                // Binding to the first event in the page (apply()'s fallback) is wrong when
+                // the page also crosses into a later session: bind to the last session.started
+                // in the page instead, so its events aren't dropped by the cross-session guard
+                // below. This applies whenever the page is applied with no existing session
+                // binding, not just after a gap: first launch, and the id-rollback and
+                // bridgeId-change restart paths above all reset the cursor and discard the view
+                // before falling through to a full replay here. No session.started in the page
+                // leaves sessionId nil and falls back to apply()'s bind-on-first-event behavior
+                // as before.
+                if sessionId == nil {
+                    if let lastStart = response.events.last(where: {
+                        if case .sessionStarted = $0.payload { true } else { false }
+                    }) {
+                        sessionId = lastStart.sessionId
+                    }
+                }
                 for event in response.events {
                     apply(event)
                 }
+                // Inserted after applying, or a session.started in the page would clear it.
+                if gap {
+                    if let first = response.firstEventId, first > 0 {
+                        transcript.insert(TranscriptItem(
+                            id: "gap-\(first)",
+                            role: .system,
+                            text: "Earlier events expired on the bridge; showing from event \(first)"
+                        ), at: 0)
+                    } else {
+                        transcript.insert(TranscriptItem(
+                            id: "gap-\(response.lastEventId)",
+                            role: .system,
+                            text: "Earlier events expired on the bridge"
+                        ), at: 0)
+                    }
+                }
                 // Advances past skipped (undecodable) events too, not just the decoded ones.
                 lastSeenEventId = max(lastSeenEventId, response.lastEventId)
-                UserDefaults.standard.set(lastSeenEventId, forKey: SessionStore.cursorKey)
+                defaults.set(lastSeenEventId, forKey: SessionStore.cursorKey)
+                // The bridge returns every event after the cursor in one page, so once it is
+                // applied the Watch matches the bridge as of this response.
+                syncState = .current
             } catch {
                 if Task.isCancelled || generation != pollGeneration { return }
-                connected = false
+                syncState = .disconnected
                 // A revoked/unpaired/rejected credential will never succeed on retry: hammering
                 // the bridge forever would just hide the real problem from the user, so stop the
                 // loop here instead of backing off and trying again.
@@ -202,6 +276,21 @@ final class SessionStore {
         }
     }
 
+    /// Drops everything the Watch built from events it can no longer trust: the session
+    /// binding, any pending card, the transcript and the turn pill. Shared by the bridge-change
+    /// and truncated-cursor paths in pollLoop().
+    private func discardLocalView() {
+        resetSessionState()
+        transcript.removeAll()
+        turnState = .idle
+        lastQuestion = nil
+    }
+
+    private func setKnownBridgeId(_ bridgeId: String?) {
+        knownBridgeId = bridgeId
+        defaults.set(bridgeId, forKey: SessionStore.bridgeIdKey)
+    }
+
     /// Distinguishes a terminal authentication failure -- no retry will ever fix a revoked,
     /// unpaired, or rejected device credential -- from a transient network/timeout error that
     /// the existing backoff-and-retry loop should keep handling unchanged.
@@ -216,7 +305,7 @@ final class SessionStore {
 
     private func resetCursor() {
         lastSeenEventId = 0
-        UserDefaults.standard.set(0, forKey: SessionStore.cursorKey)
+        defaults.set(0, forKey: SessionStore.cursorKey)
     }
 
     // MARK: - Event application

@@ -23,7 +23,10 @@ struct ConversationView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 2) {
-                                statePill
+                                HStack(spacing: 4) {
+                                    statePill
+                                    syncLabel
+                                }
                                 if !store.connected
                                     || [.skippedEvents, .requestInvalid, .error].contains(store.statusKind) {
                                     Text(store.statusLine)
@@ -77,6 +80,22 @@ struct ConversationView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(pillColor.opacity(0.3), in: Capsule())
+    }
+
+    /// Always shown, so "up to date" is something the Watch states rather than something the
+    /// user infers from the absence of an error.
+    private var syncLabel: some View {
+        Text(store.syncState.label)
+            .font(.caption2)
+            .foregroundStyle(syncColor)
+    }
+
+    private var syncColor: Color {
+        switch store.syncState {
+        case .current: .green
+        case .syncing: .yellow
+        case .disconnected: .red
+        }
     }
 
     private var pillColor: Color {

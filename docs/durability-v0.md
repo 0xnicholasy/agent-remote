@@ -169,11 +169,34 @@ records first. The full contract, including the state machine and the gate in fr
 commands, is [protocol-v0.md#interaction-lifecycle](protocol-v0.md#interaction-lifecycle) and the
 reasoning is [ADR 010](adr/010-interaction-lifecycle.md).
 
+## Client recovery
+
+The Watch persists its cursor together with the `bridgeId` that issued it, and shows one of three
+sync states next to the turn pill:
+
+- **Syncing** from the start of a poll loop until a page has been applied. While syncing it polls
+  with `wait=0`, so it never sits in a long poll claiming to catch up when nothing is new.
+- **Current** once a page is applied. The bridge returns every event after the cursor in one page,
+  so an applied page means the Watch matches the bridge as of that response. Only then does the
+  client long-poll (`wait=20`).
+- **Disconnected** after any failed poll, until the next page is applied.
+
+Two conditions make the Watch discard what it built instead of continuing:
+
+- **A different `bridgeId`.** The cursor, the session binding, any pending card and the transcript
+  belong to a log that no longer exists (another bridge, or this one with its state dir wiped).
+  The Watch resets its cursor to 0 and syncs from scratch. Changing the host in Settings forgets
+  the stored `bridgeId` first, so a deliberate switch is not reported as a reset. For a bridge that
+  sends no `bridgeId`, the older check (`lastEventId` below the cursor) still applies.
+- **`truncated: true` on a cursor above 0.** Events between the cursor and the page were pruned, so
+  a pending card or session binding may have been resolved in events the Watch can never see. It
+  drops the transcript, card and binding, applies the page, and puts one transcript line first:
+  "Earlier events expired on the bridge; showing from event N". A cursor of 0 has shown nothing,
+  so a first launch against a pruned log reports no gap.
+
 ## What this does not cover
 
 - Provider sessions themselves are not restored. After a restart the conversation is readable but
   the session is gone; resuming a provider session is M4 work. A pending interaction from before
   a restart has no provider session left to resolve it against, even though the registry itself
   recovers the interaction's last known state from the log.
-- The watch client does not yet read `truncated` or `firstEventId`; it will need to surface the
-  gap as an explicit state rather than silently continuing.
