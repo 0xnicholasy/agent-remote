@@ -157,11 +157,23 @@ rather than shown.
   events for a session it never announced through `session.started` or `session.create` produces
   unstamped events, which a project-narrowed device does not see.
 
+## Interaction lifecycle
+
+Interaction (approval and question) lifecycle, expiry and cancel isolation across concurrent
+sessions are covered as of M3 slice 3b. The `InteractionRegistry`
+(`bridge/src/state/interactions.ts`) is derived state, not a fifth journal: it observes every
+event after that event is durably appended to `events.jsonl` and rebuilds itself by replaying the
+log on bridge startup, so it needs no persistence of its own and stays consistent with whatever
+the event log already guarantees. It is capped at 5000 records, evicting the oldest terminal
+records first. The full contract, including the state machine and the gate in front of decision
+commands, is [protocol-v0.md#interaction-lifecycle](protocol-v0.md#interaction-lifecycle) and the
+reasoning is [ADR 010](adr/010-interaction-lifecycle.md).
+
 ## What this does not cover
 
 - Provider sessions themselves are not restored. After a restart the conversation is readable but
-  the session is gone; resuming a provider session is M4 work.
-- Interaction lifecycle, expiry and cancel isolation across concurrent sessions are still open
-  (the next M3 item).
+  the session is gone; resuming a provider session is M4 work. A pending interaction from before
+  a restart has no provider session left to resolve it against, even though the registry itself
+  recovers the interaction's last known state from the log.
 - The watch client does not yet read `truncated` or `firstEventId`; it will need to surface the
   gap as an explicit state rather than silently continuing.

@@ -40,3 +40,7 @@ on the same cursor.
 
 - Two bugs in the auth work were invisible to the test suite and only showed up in a live run against a started bridge: `AGENTREMOTE_PAIR=1` minted a code in a one-shot process that the running bridge had never heard of, and `AGENTREMOTE_REVOKE` wrote a revocation the running bridge never re-read. Both were "process A writes state, process B holds it in memory" — a class the unit tests could not see because every test built one object. For any operator command that mutates state a long-lived process caches, write the test as two instances over the same file, not one instance.
 - A signed wire format needs one fixed vector asserted as a literal on BOTH sides. Recomputing the expected value inside the assertion tests nothing; the TypeScript and Swift implementations agreed only because a shared vector proved it.
+
+## 2026-09-24 M3 slice 3b interaction lifecycle
+
+- State rebuilt from a durable log must never be keyed by an id a provider mints from a per-process counter. The interaction registry rebuilt `apr_N` records from the previous boot, the new boot reissued `apr_N`, and the gate refused a live approval after every restart. Every unit test passed because none rebuilt the registry across a real restart. Rule: an id that outlives the process (logged, journaled, or rebuilt) is random (`randomUUID`), and each rebuilt-from-log structure gets one test that restarts, creates new state, and acts on it.
