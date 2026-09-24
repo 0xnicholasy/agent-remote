@@ -95,8 +95,11 @@ public enum ApprovalKind: String, Codable, Sendable {
     case other
 }
 
+/// accepted/rejected: the user decided. expired: the TTL passed before a decision. cancelled:
+/// the session was cancelled or the provider tore down before a decision. superseded: the agent
+/// withdrew the request before a decision.
 public enum ApprovalDecision: String, Codable, Sendable {
-    case accepted, rejected, expired
+    case accepted, rejected, expired, cancelled, superseded
 }
 
 // MARK: - Event payloads
@@ -202,11 +205,21 @@ public struct QuestionRequestedPayload: Codable, Hashable, Sendable {
     public var allowFreeText: Bool
     /// Short plain sentence the bridge composes for text-to-speech.
     public var spokenSummary: String?
+    /// TTL after which the question is treated as expired, same format as
+    /// `ApprovalBinding.expiresAt`.
+    public var expiresAt: String?
+}
+
+/// answered: the user answered. expired: the TTL passed. cancelled: the session was cancelled or
+/// the provider tore down. superseded: the agent withdrew the question.
+public enum QuestionOutcome: String, Codable, Sendable {
+    case answered, expired, cancelled, superseded
 }
 
 public struct QuestionAnsweredPayload: Codable, Hashable, Sendable {
     public var questionId: String
     public var answer: String
+    public var outcome: QuestionOutcome?
 }
 
 public struct ErrorPayload: Codable, Hashable, Sendable {

@@ -619,10 +619,13 @@
         },
         "decision": {
           "type": "string",
+          "description": "accepted/rejected: the user decided. expired: the TTL passed before a decision. cancelled: the session was cancelled or the provider tore down before a decision. superseded: the agent withdrew the request before a decision.",
           "enum": [
             "accepted",
             "rejected",
-            "expired"
+            "expired",
+            "cancelled",
+            "superseded"
           ]
         },
         "reason": {
@@ -677,6 +680,11 @@
         "spokenSummary": {
           "type": "string",
           "description": "Short plain sentence the bridge composes for text-to-speech."
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "TTL after which the question is treated as expired, in the same format as approval.requested's binding.expiresAt."
         }
       },
       "required": [
@@ -697,6 +705,16 @@
         },
         "answer": {
           "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "description": "answered: the user answered. expired: the TTL passed. cancelled: the session was cancelled or the provider tore down. superseded: the agent withdrew the question.",
+          "enum": [
+            "answered",
+            "expired",
+            "cancelled",
+            "superseded"
+          ]
         }
       },
       "required": [

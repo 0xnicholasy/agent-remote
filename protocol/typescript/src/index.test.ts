@@ -80,4 +80,72 @@ describe("protocol samples validate against the JSON Schemas", () => {
     const broken = { ...approvalRequested, projectId: "" };
     expect(validateEvent(broken)).toBe(false);
   });
+
+  test("approval.resolved events with the cancelled and superseded decisions validate", () => {
+    for (const decision of ["cancelled", "superseded"] as const) {
+      const approvalResolved: AgentEventEnvelope<"approval.resolved"> = {
+        eventId: 43,
+        sessionId: "ses_01",
+        provider: "mock",
+        type: "approval.resolved",
+        timestamp: "2026-09-14T10:16:00.000Z",
+        payload: { approvalId: "apr_01", decision },
+      };
+      expect(validateEvent(approvalResolved)).toBe(true);
+      expect(validateEvent.errors ?? []).toEqual([]);
+    }
+  });
+
+  test("question.answered events validate with an outcome and without one", () => {
+    const withOutcome: AgentEventEnvelope<"question.answered"> = {
+      eventId: 44,
+      sessionId: "ses_01",
+      provider: "mock",
+      type: "question.answered",
+      timestamp: "2026-09-14T10:17:00.000Z",
+      payload: { questionId: "q_01", answer: "", outcome: "cancelled" },
+    };
+    expect(validateEvent(withOutcome)).toBe(true);
+    expect(validateEvent.errors ?? []).toEqual([]);
+
+    const withoutOutcome: AgentEventEnvelope<"question.answered"> = {
+      ...withOutcome,
+      payload: { questionId: "q_01", answer: "yes" },
+    };
+    expect(validateEvent(withoutOutcome)).toBe(true);
+    expect(validateEvent.errors ?? []).toEqual([]);
+  });
+
+  test("question.requested events validate with and without expiresAt", () => {
+    const questionRequested: AgentEventEnvelope<"question.requested"> = {
+      eventId: 45,
+      sessionId: "ses_01",
+      provider: "mock",
+      type: "question.requested",
+      timestamp: "2026-09-14T10:18:00.000Z",
+      payload: {
+        questionId: "q_02",
+        turnId: "trn_01",
+        text: "Continue?",
+        options: [{ id: "yes", label: "Yes" }],
+        allowFreeText: true,
+        expiresAt: "2026-09-14T10:23:00.000Z",
+      },
+    };
+    expect(validateEvent(questionRequested)).toBe(true);
+    expect(validateEvent.errors ?? []).toEqual([]);
+
+    const withoutExpiresAt: AgentEventEnvelope<"question.requested"> = {
+      ...questionRequested,
+      payload: {
+        questionId: "q_02",
+        turnId: "trn_01",
+        text: "Continue?",
+        options: [{ id: "yes", label: "Yes" }],
+        allowFreeText: true,
+      },
+    };
+    expect(validateEvent(withoutExpiresAt)).toBe(true);
+    expect(validateEvent.errors ?? []).toEqual([]);
+  });
 });
