@@ -55,3 +55,7 @@ on the same cursor.
 ## 2026-09-24 M3 slice 3b interaction lifecycle
 
 - State rebuilt from a durable log must never be keyed by an id a provider mints from a per-process counter. The interaction registry rebuilt `apr_N` records from the previous boot, the new boot reissued `apr_N`, and the gate refused a live approval after every restart. Every unit test passed because none rebuilt the registry across a real restart. Rule: an id that outlives the process (logged, journaled, or rebuilt) is random (`randomUUID`), and each rebuilt-from-log structure gets one test that restarts, creates new state, and acts on it.
+
+## 2026-09-24 M3 slice 4 client recovery
+
+- One green run of the Watch suite was luck. `SessionStore` tests never stop their poll loops, and every loop kept writing its cursor to `UserDefaults.standard`, so the next test's store started from another test's cursor; failures moved between runs. Rule: any persisted state a long-lived loop writes is injected (`SessionStore(defaults:)`, one suite per test), and a new Watch test file is run at least three times before its result counts.
