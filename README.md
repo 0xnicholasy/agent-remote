@@ -78,7 +78,7 @@ started.
 
 ```sh
 bun install
-bun test
+bun run check   # typecheck every TypeScript workspace, then bun test
 bun run dev
 ```
 
