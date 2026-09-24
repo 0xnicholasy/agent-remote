@@ -54,4 +54,18 @@ final class EventsPageDecoderTests: XCTestCase {
         """
         XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
     }
+
+    func testThrowsOnWrongTypedFirstEventId() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "firstEventId": "12" }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
+
+    func testThrowsOnWrongTypedBridgeId() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "bridgeId": 42 }
+        """
+        XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
+    }
 }

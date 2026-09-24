@@ -218,7 +218,7 @@ final class SessionStore {
                 }
                 // Inserted after applying, or a session.started in the page would clear it.
                 if gap {
-                    if let first = response.firstEventId {
+                    if let first = response.firstEventId, first > 0 {
                         transcript.insert(TranscriptItem(
                             id: "gap-\(first)",
                             role: .system,

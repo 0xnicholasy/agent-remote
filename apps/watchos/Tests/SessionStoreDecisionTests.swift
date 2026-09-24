@@ -960,6 +960,27 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.transcript.first?.text.contains { $0.isNumber } ?? true, "the fallback gap line must not name an event id")
     }
 
+    /// A truncated page's `firstEventId` can be 0 after an empty-journal restart (bridge event
+    /// ids start at 1, so 0 never named a real event); it must fall back to the same
+    /// "expired on the bridge" line as a missing `firstEventId`, not report "event 0".
+    func testTruncatedPageWithZeroFirstEventIdUsesLastEventIdGapLine() async throws {
+        let defaults = freshDefaults()
+        defaults.set(10, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 50, skipped: 0, firstEventId: 0, truncated: true)),
+            .success(EventsPage(events: [], lastEventId: 50, skipped: 0)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertTrue(store.transcript.contains { $0.text == "Earlier events expired on the bridge" })
+        XCTAssertFalse(store.transcript.contains { $0.text.contains("event 0") })
+    }
+
     /// Regression for C-1: `discardLocalView()` must clear `lastQuestion`, or a `question.answered`
     /// on the far side of a gap whose answer id collides with a discarded question's option id
     /// would render the OLD question's label instead of falling back to the raw answer.
@@ -1070,5 +1091,32 @@ final class SessionStoreDecisionTests: XCTestCase {
         await store.reconnect()
         XCTAssertEqual(store.syncState, .syncing, "the old host's Current must not outlive reconnect()")
         XCTAssertTrue(store.connected, "syncing counts as connected by design")
+    }
+
+    /// A poll that fails must not strand the store as disconnected forever: once the initial
+    /// backoff elapses and the bridge answers again, the store recovers to current.
+    func testSyncStateReturnsToCurrentAfterBridgeAnswersAgain() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setEventsResults([
+            .failure(URLError(.cannotConnectToHost)),
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(store.syncState, .disconnected)
+
+        // The retry waits out the 1s initial backoff; poll rather than sleep a fixed
+        // amount so a slow runner does not fail the test. Call 3 is gated, which parks
+        // the loop once the recovery page is applied.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.syncState != .current && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(store.syncState, .current)
+        XCTAssertTrue(store.connected)
     }
 }
