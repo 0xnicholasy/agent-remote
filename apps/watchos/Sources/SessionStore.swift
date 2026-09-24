@@ -212,7 +212,19 @@ final class SessionStore {
                 // and can never be corrected by a later page. Rebuild from this page instead.
                 // A fresh cursor has shown nothing yet, so there is nothing to discard or report.
                 let gap = response.truncated && lastSeenEventId > 0
-                if gap { discardLocalView() }
+                if gap {
+                    discardLocalView()
+                    // Binding to the first event in the page (apply()'s fallback) is wrong when
+                    // the page also crosses into a later session: bind to the last
+                    // session.started in the page instead, so its events aren't dropped by the
+                    // cross-session guard below. No session.started in the page leaves sessionId
+                    // nil and falls back to apply()'s bind-on-first-event behavior as before.
+                    if let lastStart = response.events.last(where: {
+                        if case .sessionStarted = $0.payload { true } else { false }
+                    }) {
+                        sessionId = lastStart.sessionId
+                    }
+                }
                 for event in response.events {
                     apply(event)
                 }

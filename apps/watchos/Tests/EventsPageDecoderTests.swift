@@ -68,4 +68,17 @@ final class EventsPageDecoderTests: XCTestCase {
         """
         XCTAssertThrowsError(try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder()))
     }
+
+    /// An explicit JSON `null` (as opposed to the field being absent) must read the same as a
+    /// bridge that predates these fields, not throw -- `!(raw is NSNull)` covers both cases.
+    func testExplicitNullRecoveryFieldsDecodeAsAbsent() throws {
+        let json = """
+        { "lastEventId": 9, "events": [], "firstEventId": null, "truncated": null, "bridgeId": null }
+        """
+        let page = try EventsPageDecoder.decode(Data(json.utf8), using: JSONDecoder())
+
+        XCTAssertNil(page.firstEventId)
+        XCTAssertFalse(page.truncated)
+        XCTAssertNil(page.bridgeId)
+    }
 }

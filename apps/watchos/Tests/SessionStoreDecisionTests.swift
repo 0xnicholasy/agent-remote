@@ -1119,4 +1119,83 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.syncState, .current)
         XCTAssertTrue(store.connected)
     }
+
+    /// A truncated page that also crosses into a later session must bind to that later
+    /// session, not the first (now-superseded) event in the page: apply()'s bind-on-first-event
+    /// fallback would otherwise leave the store on the old session and drop the new session's
+    /// events under the cross-session guard.
+    func testTruncatedPageCrossingSessionBindsToLaterSession() async throws {
+        let defaults = freshDefaults()
+        defaults.set(10, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let oldSessionEvent = try decodeEvent("""
+        {
+            "eventId": 41, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "agent.message",
+            "payload": { "messageId": "m1", "role": "assistant", "text": "from sess_1", "final": true }
+        }
+        """)
+        let newSessionStarted = try decodeEvent("""
+        {
+            "eventId": 42, "sessionId": "sess_2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:01.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        let newSessionEvent = try decodeEvent("""
+        {
+            "eventId": 43, "sessionId": "sess_2", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:02.000Z", "type": "agent.message",
+            "payload": { "messageId": "m2", "role": "assistant", "text": "from sess_2", "final": true }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(
+                events: [oldSessionEvent, newSessionStarted, newSessionEvent], lastEventId: 43, skipped: 0,
+                firstEventId: 40, truncated: true
+            )),
+            .success(EventsPage(events: [], lastEventId: 43, skipped: 0, firstEventId: 40)),
+        ])
+        await client.gateEventsCall(3)
+
+        store.start()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(store.sessionId, "sess_2", "the page's later session must win the binding")
+        XCTAssertTrue(store.transcript.contains { $0.text == "from sess_2" }, "the later session's own event must be applied, not dropped by the cross-session guard")
+        XCTAssertNotEqual(store.statusKind, .skippedEvents, "the later session must not be treated as a foreign session to ignore")
+        XCTAssertTrue(store.transcript.contains { $0.text == "Earlier events expired on the bridge; showing from event 40" })
+    }
+
+    /// reconnect() drops the old host's cursor and bridgeId before polling the new host, so the
+    /// new host's first page is applied as a plain continuation -- no gap line -- even though the
+    /// store still remembered a bridgeId from the old host.
+    func testReconnectAppliesNewHostFirstPageWithoutGapLine() async throws {
+        let defaults = freshDefaults()
+        defaults.set("brg_a", forKey: "dev.agentremote.watch.bridgeId")
+        defaults.set(5, forKey: "dev.agentremote.watch.lastSeenEventId")
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let newHostEvent = try decodeEvent("""
+        {
+            "eventId": 6, "sessionId": "sess_new", "provider": "mock",
+            "timestamp": "2026-09-18T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        await client.setEventsResults([
+            .success(EventsPage(events: [newHostEvent], lastEventId: 6, skipped: 0, bridgeId: "brg_b")),
+        ])
+
+        await store.reconnect()
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(store.transcript.contains { $0.id.hasPrefix("gap-") }, "a fresh cursor against the new host must not report a gap")
+        XCTAssertTrue(store.transcript.contains { $0.text == "Session sess_new started" }, "the new host's events must be applied")
+        XCTAssertEqual(store.syncState, .current)
+        XCTAssertEqual(defaults.string(forKey: "dev.agentremote.watch.bridgeId"), "brg_b", "the new host's bridgeId must replace the old one")
+    }
 }
