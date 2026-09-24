@@ -15,9 +15,13 @@ private struct SessionTimeout: Error, CustomStringConvertible {
 /// continue on into decoding with an unusable body.
 private struct BridgeRequestFailed: Error, CustomStringConvertible {
     var context: String
-    var statusCode: Int
+    /// Nil when the response was not HTTP at all.
+    var statusCode: Int?
     var body: String
-    var description: String { "\(context) failed with status \(statusCode): \(body)" }
+    var description: String {
+        guard let statusCode else { return "\(context): response was not an HTTPURLResponse" }
+        return "\(context) failed with status \(statusCode): \(body)"
+    }
 }
 
 @MainActor
@@ -43,7 +47,9 @@ final class CoreScreensUITests: XCTestCase {
     func testCoreScreens() async throws {
         try pairIfNeeded()
         let before = try await sessionIds()
-        reveal(button("Create session"))
+        // pairIfNeeded() ends scrolled down to the pairing row, and reveal() only scrolls down,
+        // so start Settings again from the top where Create session sits.
+        relaunchToSettings()
         button("Create session").tap()
         let sessionId = try await waitForSession(notIn: before)
         app.swipeDown()
@@ -67,7 +73,11 @@ final class CoreScreensUITests: XCTestCase {
         shot("3-after-deny")
 
         app.swipeUp()
-        XCTAssertTrue(button("Cancel turn").waitForExistence(timeout: 10), "expected Settings to render")
+        XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render")
+        // Cancel turn sits lower on the page; on a small Watch it starts off screen.
+        let cancel = button("Cancel turn")
+        reveal(cancel)
+        XCTAssertTrue(cancel.exists && cancel.isHittable, "expected Cancel turn on Settings")
         shot("4-settings")
     }
 
@@ -149,7 +159,7 @@ final class CoreScreensUITests: XCTestCase {
     private static func requireSuccess(_ response: URLResponse, data: Data, context: String) throws {
         guard let http = response as? HTTPURLResponse else {
             XCTFail("\(context): response was not an HTTPURLResponse")
-            return
+            throw BridgeRequestFailed(context: context, statusCode: nil, body: "")
         }
         guard (200..<300).contains(http.statusCode) else {
             let body = String(decoding: data.prefix(500), as: UTF8.self)
