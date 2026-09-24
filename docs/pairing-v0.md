@@ -133,14 +133,16 @@ The bridge rejects on the first failure, and every rejection below is
 2. Device known, else `unauthenticated`.
 3. Device not revoked, else `403 {"error":"device_revoked"}`.
 4. Timestamp parses and is within 120 seconds of the bridge clock in either direction, else
-   `stale_request`.
+   `stale_request`. The bridge clock here never runs backwards: it is the later of the current time
+   and the latest time the nonce cache has acted on (docs/durability-v0.md, "Replay protection").
 5. Nonce not seen before from this device, else `replayed_request`. The bridge keeps seen nonces
-   for 300 seconds (longer than the skew window in both directions), bounded at 10,000 entries per
-   device; the oldest are dropped first.
+   for 300 seconds (longer than the skew window in both directions).
 6. Signature matches, compared in constant time, else `unauthenticated`.
+7. The device holds fewer than 10,000 unexpired nonces, else `429 {"error":"rate_limited"}`. A
+   nonce still inside its validity window is never evicted to make room.
 
-A nonce is only recorded once the signature verifies, so an unsigned flood cannot evict real
-entries.
+A nonce is only recorded once the signature verifies, so an unsigned flood cannot fill a device's
+nonce set.
 
 ### Test vector
 

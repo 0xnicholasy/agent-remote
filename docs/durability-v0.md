@@ -47,30 +47,41 @@ reported and swallowed, because the in-memory state is unaffected and every reco
 file it was appended to.
 
 Two bounds keep the files finite. Retention drops records past their window, and a size cap drops
-the oldest beyond it: 2000 events, 5000 command ids, 10,000 nonces per device. Each journal
+the oldest beyond it: 2000 events and 5000 command ids. Nonces are the exception: at 10,000 per
+device a new request is refused rather than an old nonce dropped (see "Replay protection"). Each journal
 rewrites itself to its live set on load and again after a fixed number of appends. This is the
 "unbounded across a long run" gap slice 1 left open; the size caps matter because retention alone
 is a time bound, and an authenticated device can mint command ids as fast as it can sign.
 
 ## Replay protection
 
-The per-device nonce cache is unchanged in behavior — 300 second TTL, 10,000 entries per device,
-oldest evicted first — but it now writes through to `nonces.jsonl` and rehydrates from it on
-startup, dropping anything already expired. A request replayed across a bridge restart is still
-refused with `401 replayed_request`.
+The per-device nonce cache keeps its 300 second TTL and its 10,000-entry cap per device, writes
+through to `nonces.jsonl`, and rehydrates from it on startup, dropping anything already expired. A
+request replayed across a bridge restart is still refused with `401 replayed_request`.
 
-**Known limits.** Two replay edges are intentionally left open here and tracked as follow-up
-work, not fixed in this change:
+Two replay edges the first durable version left open are closed:
 
-- **Nonce capacity eviction.** When a device's nonce set hits `MAX_NONCES_PER_DEVICE`
-  (`bridge/src/auth/verify.ts`), the oldest recorded nonce is evicted even if it is still inside
-  its 300 second validity window, so that specific nonce becomes replayable. Reaching the cap
-  requires the attacker to already hold the device key, since a nonce is only recorded after its
-  signature verifies.
-- **Clock rollback.** Nonce expiry and pruning trust the bridge's wall clock. If the host clock
-  jumps forward and then back, nonces can be pruned early and replayed within what should still be
-  their TTL. This requires control of the host, and the envelope's timestamp skew check trusts the
-  same wall clock, so this is not closed by switching the nonce cache alone to a monotonic clock.
+- **A full device is refused, not evicted.** When a device already holds 10,000 unexpired nonces,
+  a new request that otherwise verifies is refused with `429 {"error":"rate_limited"}` and nothing
+  is recorded. Evicting the oldest nonce instead would make that exact envelope replayable inside
+  its validity window. Room comes back as entries expire. Only a holder of the device key can fill
+  the set, because a nonce is recorded only after its signature verifies.
+- **The clock never runs backwards for replay protection.** The cache keeps a watermark: the latest
+  bridge time it has acted on. Nonce expiry, pruning and the envelope's timestamp freshness check
+  all use `max(now, watermark)`. If the host clock jumps ahead, prunes a nonce, and is then set
+  back, the pruned envelope's timestamp is judged against the watermark and is `stale_request`.
+  The watermark is derived from the nonce records on load, and every compaction writes it as a
+  `{"watermarkMs": ...}` line, so it survives a restart after every nonce has expired.
+
+  The cost: while the host clock is behind the watermark by more than the 120 second skew
+  window, correctly timed requests are refused as `stale_request` until real time catches up. A
+  host clock that was set far into the future and then corrected locks devices out for that long.
+  Deleting `nonces.jsonl` while the bridge is stopped resets the watermark, and with it the
+  replay protection for nonces recorded in the last 300 seconds.
+
+At startup the bridge opens every journal for append once. A state file it cannot write (wrong
+owner, read-only, a directory in its place) stops startup with that file's path in the error,
+rather than surfacing later as failed requests.
 
 ## Command identity
 
@@ -79,7 +90,7 @@ and the issuing device alongside it. That record is now durable, and it carries 
 
 | Status | Meaning | A retry gets |
 | --- | --- | --- |
-| `in_flight` | Executing in this process right now | `200` with `accepted: false, duplicate: true` |
+| `in_flight` | Executing in this process right now | Waits for the original, then gets its outcome (`duplicate: true` when it was accepted) |
 | `completed` | The provider applied it | `200` with the recorded response and `duplicate: true` |
 | `abandoned` | The provider refused it before applying anything (a mapped 4xx) | Executed again |
 | `indeterminate` | Execution started, then the process died | `409 command_indeterminate` |
