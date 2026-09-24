@@ -161,7 +161,7 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 410, code: "decision_expired", message: ""), .decisionExpired)
         XCTAssertEqual(BridgeError.from(status: 409, code: "command_id_conflict", message: ""), .commandIdConflict)
         XCTAssertEqual(BridgeError.from(status: 429, code: "rate_limited", message: ""), .rateLimited)
-        // R2S1-01/03: the user-facing copy must not promise a wait the poll loop's ~15s
+        // The user-facing copy must not promise a wait the poll loop's ~15s
         // backoff (SessionStore) does not actually do -- no "minutes" language here.
         XCTAssertEqual(
             BridgeError.rateLimited.description,
