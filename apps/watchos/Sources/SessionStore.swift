@@ -627,6 +627,15 @@ final class SessionStore {
     }
 
     func sendPrompt(_ text: String) async {
+        // The bridge rejects any prompt.send while a turn is already running (409). Refusing
+        // here, before turnState/currentTurnId/awaitingLocalTurnStart are touched, keeps those
+        // untouched too -- a rejected send must not hide the Stop button while the turn it
+        // guards is still running.
+        guard !canCancelTurn else {
+            statusLine = "Turn in progress. Stop it or wait."
+            statusKind = .error
+            return
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         var target = sessionId
@@ -890,19 +899,51 @@ final class SessionStore {
         sessionId != nil && [.thinking, .running, .waiting].contains(turnState)
     }
 
+    /// Where dictated text will go: the pending question it answers, or a new prompt.
+    enum DictationDestination: Equatable {
+        case newPrompt
+        case answer(questionId: String, text: String)
+
+        /// The label shown on the review screen. Mirrors what `dictationDestination` produced
+        /// as a `String` before this type existed.
+        var label: String {
+            switch self {
+            case .newPrompt: "New prompt"
+            case .answer(_, let text): "Answer to: \(text)"
+            }
+        }
+    }
+
     /// Where dictated text will go, shown on the review screen before it is sent: the pending
     /// question it answers, or a new prompt. Mirrors the routing in `submitDictation`.
-    var dictationDestination: String {
-        if let question = pendingQuestion { return "Answer to: \(question.text)" }
-        return "New prompt"
+    var dictationDestination: DictationDestination {
+        if let question = pendingQuestion { return .answer(questionId: question.questionId, text: question.text) }
+        return .newPrompt
     }
 
     /// Routes free text to the pending question when there is one, and to a new prompt otherwise.
-    func submitDictation(_ text: String) async {
-        if pendingQuestion != nil {
+    /// `expecting` is the destination the user reviewed and confirmed; it is compared against the
+    /// live `dictationDestination` synchronously, before any await, so a destination that changed
+    /// underneath the review screen (a new question, or the pending one being superseded) cannot
+    /// silently redirect this send. Returns whether the text was sent anywhere.
+    @discardableResult
+    func submitDictation(_ text: String, expecting: DictationDestination) async -> Bool {
+        guard expecting == dictationDestination else {
+            statusLine = "Not sent: the question changed. Review again."
+            statusKind = .error
+            return false
+        }
+        switch expecting {
+        case .answer:
             await answer(text: text)
-        } else {
+            return true
+        case .newPrompt:
+            // sendPrompt() applies the R-010 guard itself (and sets statusLine/statusKind when
+            // it refuses); captured here only so this call can report whether the text actually
+            // went anywhere.
+            let refused = canCancelTurn
             await sendPrompt(text)
+            return !refused
         }
     }
 

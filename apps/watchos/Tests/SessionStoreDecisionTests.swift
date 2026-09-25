@@ -767,11 +767,115 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// The dictation review screen names where the text goes, matching submitDictation's routing.
     func testDictationDestinationFollowsPendingQuestion() async throws {
         let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
-        XCTAssertEqual(idle.dictationDestination, "New prompt")
+        XCTAssertEqual(idle.dictationDestination, .newPrompt)
+        XCTAssertEqual(idle.dictationDestination.label, "New prompt")
 
         let (store, _) = try await makeStoreWithPendingQuestion()
         let question = try XCTUnwrap(store.pendingQuestion)
-        XCTAssertEqual(store.dictationDestination, "Answer to: \(question.text)")
+        XCTAssertEqual(store.dictationDestination, .answer(questionId: question.questionId, text: question.text))
+        XCTAssertEqual(store.dictationDestination.label, "Answer to: \(question.text)")
+    }
+
+    /// R-010: sendPrompt() must refuse while a turn is already running rather than clobbering the
+    /// live turn's id/state -- the bridge rejects prompt.send with a 409 in this window, and
+    /// clearing currentTurnId first would hide the Stop button for a turn that is still going.
+    func testSendPromptRefusesWhileTurnIsRunning() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertEqual(store.turnState, .running)
+
+        await store.sendPrompt("x")
+
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a running turn must refuse the send rather than reach the bridge")
+        XCTAssertEqual(store.currentTurnId, 2, "the live turn's id must be untouched")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(2)), "the Stop button must still target the running turn")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-009: a review screen captured while a question was pending must not silently redirect
+    /// its send to a new prompt once that question is answered or replaced from elsewhere.
+    func testSubmitDictationRefusesWhenExpectedQuestionNoLongerPending() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        let expecting = SessionStore.DictationDestination.answer(questionId: question.questionId, text: question.text)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "question.answered",
+            "payload": { "questionId": "q_1", "answer": "yes" }
+        }
+        """))
+        XCTAssertNil(store.pendingQuestion, "setup should leave the question no longer pending")
+
+        let sent = await store.submitDictation("x", expecting: expecting)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a mismatched destination must send nothing")
+        XCTAssertEqual(store.statusLine, "Not sent: the question changed. Review again.")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-009: the positive paths -- a confirmed destination that still matches live state routes
+    /// exactly where it says it will.
+    func testSubmitDictationRoutesToMatchingDestination() async throws {
+        let (questionStore, questionClient) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(questionStore.pendingQuestion)
+        await questionClient.setSendResult(.success(CommandResponse(accepted: true)))
+
+        let answered = await questionStore.submitDictation(
+            "yes please",
+            expecting: .answer(questionId: question.questionId, text: question.text)
+        )
+
+        XCTAssertTrue(answered)
+        let questionCalls = await questionClient.sentCalls
+        XCTAssertEqual(questionCalls.count, 1, "expecting .answer must route through answer(text:)")
+
+        let promptClient = FakeBridgeClient()
+        let promptStore = SessionStore(client: promptClient, defaults: freshDefaults())
+        promptStore.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        let sent = await promptStore.submitDictation("go", expecting: .newPrompt)
+
+        XCTAssertTrue(sent)
+        let promptCalls = await promptClient.sentCalls
+        XCTAssertEqual(promptCalls.count, 1, "expecting .newPrompt with no turn active must route through sendPrompt")
+        if case .promptSend(let payload) = promptCalls.first?.payload {
+            XCTAssertEqual(payload.text, "go")
+        } else {
+            XCTFail("expected a promptSend command")
+        }
     }
 
     /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,

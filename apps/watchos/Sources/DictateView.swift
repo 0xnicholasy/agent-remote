@@ -8,11 +8,14 @@ struct DictateView: View {
     @Environment(SessionStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    /// Captured once, the first time the sheet appears, so the review screen keeps naming the
+    /// destination the user actually reviewed even if the store's live state moves on.
+    @State private var destination: SessionStore.DictationDestination?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
-                Text(store.dictationDestination)
+                Text(destination?.label ?? store.dictationDestination.label)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -23,19 +26,46 @@ struct DictateView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityIdentifier("dictation-review")
                 }
+                if destinationChanged {
+                    Text("Question changed")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Button("Review again") { destination = store.dictationDestination }
+                } else if isNewPromptBlockedByRunningTurn {
+                    Text("Turn in progress. Stop it or wait.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Button("Send") {
+                    guard let destination else { return }
                     let outgoing = trimmed
                     text = ""
                     dismiss()
-                    Task { await store.submitDictation(outgoing) }
+                    Task { await store.submitDictation(outgoing, expecting: destination) }
                 }
-                .disabled(trimmed.isEmpty || store.isSending)
+                .disabled(sendDisabled)
             }
             .padding(.horizontal, 4)
+        }
+        .onAppear {
+            if destination == nil { destination = store.dictationDestination }
         }
     }
 
     private var trimmed: String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var destinationChanged: Bool {
+        guard let destination else { return false }
+        return store.dictationDestination != destination
+    }
+
+    private var isNewPromptBlockedByRunningTurn: Bool {
+        destination == .newPrompt && store.canCancelTurn
+    }
+
+    private var sendDisabled: Bool {
+        trimmed.isEmpty || store.isSending || destination == nil || destinationChanged || isNewPromptBlockedByRunningTurn
     }
 }
