@@ -498,6 +498,205 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertTrue(store.canCancelTurn, "a turn waiting on an approval can be stopped")
     }
 
+    /// R-005: every TurnState case, not just `.waiting`, must be exercised so a regression that
+    /// flips any single case's expected value fails this test. `.thinking`/`.running`/`.waiting`
+    /// are cancellable; `.idle`/`.completed`/`.error` are not; no session is never cancellable.
+    func testCanCancelTurnCoversEveryTurnState() async throws {
+        let noSession = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertFalse(noSession.canCancelTurn, "no session: nothing to stop")
+
+        let sessionStarted = """
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """
+
+        func makeStore() throws -> SessionStore {
+            let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+            store.apply(try decodeEvent(sessionStarted))
+            return store
+        }
+
+        let idle = try makeStore()
+        XCTAssertEqual(idle.turnState, .idle)
+        XCTAssertFalse(idle.canCancelTurn, "idle: no turn in progress")
+
+        let thinking = try makeStore()
+        thinking.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(thinking.turnState, .thinking)
+        XCTAssertTrue(thinking.canCancelTurn, "thinking: a turn is in progress")
+
+        let running = try makeStore()
+        running.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(running.turnState, .running)
+        XCTAssertTrue(running.canCancelTurn, "running: a turn is in progress")
+
+        let waiting = try makeStore()
+        waiting.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_1", "turnId": "turn_1", "text": "Continue?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """))
+        XCTAssertEqual(waiting.turnState, .waiting)
+        XCTAssertTrue(waiting.canCancelTurn, "waiting: a turn is in progress")
+
+        let completed = try makeStore()
+        completed.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(completed.turnState, .completed)
+        XCTAssertNotNil(completed.sessionId, "turn.completed does not reset the session binding")
+        XCTAssertFalse(completed.canCancelTurn, "completed: no turn in progress")
+
+        let errored = try makeStore()
+        errored.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "recoverable boom", "fatal": false }
+        }
+        """))
+        XCTAssertEqual(errored.turnState, .error)
+        XCTAssertNotNil(errored.sessionId, "a recoverable error does not reset the session binding")
+        XCTAssertFalse(errored.canCancelTurn, "error: no turn in progress")
+    }
+
+    /// R-001: sendPrompt() sets turnState optimistically before the new turn's id is known, so it
+    /// must also clear currentTurnId rather than leaving the previous turn's id in place -- a
+    /// Stop-turn dialog opened in that window must be able to bind to the next turn.started
+    /// instead of staying pinned to a turn that already completed.
+    func testSendPromptClearsCurrentTurnIdUntilNextTurnStarted() async throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+
+        XCTAssertFalse(store.awaitingLocalTurnStart)
+        await store.sendPrompt("go again")
+        XCTAssertNil(store.currentTurnId, "the new turn's id is not known yet; must not still read the finished turn's id")
+        XCTAssertTrue(store.awaitingLocalTurnStart, "sendPrompt must mark the id-less turn as this Watch's own")
+        XCTAssertEqual(store.stopTurnTarget, .pendingLocal)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 5, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:03.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_2" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 5, "the freshly started turn's id must now be current")
+        XCTAssertFalse(store.awaitingLocalTurnStart, "turnStarted answers the local send; the flag must not stick")
+    }
+
+    /// R-001: a failed prompt send must not leave the Watch believing its own turn is still on
+    /// the way, or a later unrelated turnStarted would be adopted by a Stop dialog.
+    func testSendPromptFailureClearsAwaitingLocalTurnStart() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.sendPrompt("go")
+        XCTAssertFalse(store.awaitingLocalTurnStart)
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+    }
+
+    /// R-001: a Stop dialog opened for the Watch's own just-sent turn binds to the next
+    /// turnStarted; one opened for a turn whose turnStarted was never seen (joined mid-turn)
+    /// must not, so a lost completion cannot make it cancel an unrelated later turn.
+    func testStopTurnTargetAdoptsOnlyPendingLocalTurn() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let started = #"{ "projectId": "prj_demo", "resumed": false }"#
+        let command = #"{ "executionId": "exec_1", "command": "ls" }"#
+
+        // .unknown: a running turn whose turnStarted was never seen.
+        let orphan = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        orphan.apply(try event(1, "session.started", started))
+        orphan.apply(try event(2, "command.started", command))
+        let unknown = orphan.stopTurnTarget
+        XCTAssertEqual(unknown, .unknown)
+        XCTAssertTrue(orphan.isStopTargetCurrent(unknown), "the unseen turn is still the one running")
+        orphan.apply(try event(9, "turn.started", #"{ "turnId": "turn_9" }"#))
+        let afterUnrelated = orphan.adoptingStartedTurn(unknown)
+        XCTAssertEqual(afterUnrelated, .unknown, "an unseen turn must never be rebound to a later turn's id")
+        XCTAssertFalse(orphan.isStopTargetCurrent(afterUnrelated), "confirm must not cancel the unrelated turn")
+
+        // .pendingLocal: the turn this Watch just sent.
+        let local = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        local.apply(try event(1, "session.started", started))
+        await local.sendPrompt("go")
+        let pending = local.stopTurnTarget
+        XCTAssertEqual(pending, .pendingLocal)
+        XCTAssertTrue(local.isStopTargetCurrent(pending))
+        local.apply(try event(4, "turn.started", #"{ "turnId": "turn_4" }"#))
+        XCTAssertFalse(local.isStopTargetCurrent(pending), "an unadopted pending target is stale once the id is known")
+        let adopted = local.adoptingStartedTurn(pending)
+        XCTAssertEqual(adopted, .turn(4))
+        XCTAssertTrue(local.isStopTargetCurrent(adopted))
+
+        // .turn(id): only that id may be cancelled, and it is never rebound.
+        local.apply(try event(5, "turn.completed", #"{ "turnId": "turn_4" }"#))
+        local.apply(try event(6, "turn.started", #"{ "turnId": "turn_6" }"#))
+        XCTAssertEqual(local.adoptingStartedTurn(adopted), .turn(4))
+        XCTAssertFalse(local.isStopTargetCurrent(adopted), "a dialog for turn 4 must not cancel turn 6")
+        XCTAssertTrue(local.isStopTargetCurrent(.turn(6)))
+    }
+
     /// The dictation review screen names where the text goes, matching submitDictation's routing.
     func testDictationDestinationFollowsPendingQuestion() async throws {
         let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())

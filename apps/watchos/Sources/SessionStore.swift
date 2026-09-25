@@ -178,6 +178,15 @@ final class SessionStore {
     private(set) var pendingApproval: ApprovalRequest?
     private(set) var pendingQuestion: QuestionRequestedPayload?
     private(set) var turnState: TurnState = .idle
+    /// The event id of the most recent turnStarted, so a caller that captured it before showing
+    /// UI (e.g. a confirmation dialog) can tell whether the turn it was shown for is still the
+    /// one running when the user acts, or a stop/start happened underneath it.
+    private(set) var currentTurnId: Int?
+    /// True between sendPrompt() and the turnStarted that answers it. Separates "this turn's id
+    /// is not known yet because it was just sent from here" from "a turn is running whose
+    /// turnStarted was never seen" (e.g. a gap replay that starts mid-turn): both leave
+    /// currentTurnId nil, but only the first may later be bound to the next turnStarted's id.
+    private(set) var awaitingLocalTurnStart = false
     private(set) var sessionId: String?
     private(set) var lastSeenEventId: Int
     private(set) var syncState: SyncState = .disconnected
@@ -295,6 +304,8 @@ final class SessionStore {
         sessionId = nil
         pendingApproval = nil
         pendingQuestion = nil
+        currentTurnId = nil
+        awaitingLocalTurnStart = false
         if !preservingUnconfirmedSend {
             unconfirmedSend = nil
             unconfirmedCancel = nil
@@ -478,6 +489,8 @@ final class SessionStore {
             pendingApproval = nil
             pendingQuestion = nil
             turnState = .idle
+            currentTurnId = nil
+            awaitingLocalTurnStart = false
             append(.system, "Session \(event.sessionId) started", id: event.eventId)
             return
         }
@@ -491,6 +504,8 @@ final class SessionStore {
             break
         case .turnStarted(let payload):
             turnState = .thinking
+            currentTurnId = event.eventId
+            awaitingLocalTurnStart = false
             if let prompt = payload.prompt, !prompt.isEmpty {
                 append(.user, prompt, id: event.eventId)
             }
@@ -534,6 +549,7 @@ final class SessionStore {
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
             turnState = .completed
+            awaitingLocalTurnStart = false
         case .sessionCompleted(let payload):
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
@@ -544,6 +560,7 @@ final class SessionStore {
             resetSessionState()
         case .error(let payload):
             turnState = .error
+            awaitingLocalTurnStart = false
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
             // in-flight events for it are still applied.
@@ -600,6 +617,11 @@ final class SessionStore {
         if target == nil { target = await createSession() }
         guard let target else { return }
         turnState = .thinking
+        // The real turn id is not known until turnStarted arrives; clearing it here (rather
+        // than leaving the previous turn's id) stops a Stop-turn dialog opened in this window
+        // from being guarded against the wrong, stale id when that event lands.
+        currentTurnId = nil
+        awaitingLocalTurnStart = true
         do {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
         } catch {
@@ -810,6 +832,43 @@ final class SessionStore {
         }
     }
 
+    /// Which turn a Stop-turn confirmation was opened for. Captured when the dialog opens and
+    /// checked when the user confirms, so a confirm never reaches a different turn.
+    enum StopTurnTarget: Equatable {
+        /// A turn whose turnStarted was seen.
+        case turn(Int)
+        /// The turn sendPrompt() just asked for; its id is not known yet.
+        case pendingLocal
+        /// A running turn whose turnStarted was never seen (e.g. joined mid-turn by a replay).
+        case unknown
+    }
+
+    var stopTurnTarget: StopTurnTarget {
+        if let currentTurnId { return .turn(currentTurnId) }
+        return awaitingLocalTurnStart ? .pendingLocal : .unknown
+    }
+
+    /// Binds a `.pendingLocal` target to the turn id that has since arrived. Only the turn this
+    /// Watch just sent may be adopted; an `.unknown` target is never rebound, because the next
+    /// turnStarted after an unseen turn belongs to an unrelated, later turn.
+    func adoptingStartedTurn(_ target: StopTurnTarget) -> StopTurnTarget {
+        if target == .pendingLocal, let currentTurnId { return .turn(currentTurnId) }
+        return target
+    }
+
+    /// Whether confirming a Stop opened for `target` would still cancel that same turn.
+    func isStopTargetCurrent(_ target: StopTurnTarget) -> Bool {
+        guard canCancelTurn else { return false }
+        switch target {
+        case .turn(let id):
+            return currentTurnId == id
+        case .pendingLocal:
+            return currentTurnId == nil && awaitingLocalTurnStart
+        case .unknown:
+            return currentTurnId == nil && !awaitingLocalTurnStart
+        }
+    }
+
     /// Whether a turn is in progress that Cancel would stop, so the conversation page can offer
     /// it where the user is already looking instead of only in Settings.
     var canCancelTurn: Bool {
@@ -838,6 +897,7 @@ final class SessionStore {
 
     private func report(_ error: any Error) {
         turnState = .error
+        awaitingLocalTurnStart = false
         statusLine = "\(error)"
         statusKind = .error
     }

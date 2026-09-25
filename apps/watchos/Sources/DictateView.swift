@@ -24,7 +24,7 @@ struct DictateView: View {
                         .accessibilityIdentifier("dictation-review")
                 }
                 Button("Send") {
-                    let outgoing = text
+                    let outgoing = trimmed
                     text = ""
                     dismiss()
                     Task { await store.submitDictation(outgoing) }
