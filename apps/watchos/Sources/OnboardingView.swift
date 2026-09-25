@@ -126,6 +126,8 @@ struct OnboardingView: View {
                         isConnecting = true
                         await store.reconnect()
                         isConnecting = false
+                        // Back during a slow reconnect wins; do not jump forward over it (C4-002).
+                        guard step == .hostAddress else { return }
                         step = .pairingCode
                     }
                 }
