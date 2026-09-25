@@ -953,6 +953,25 @@ final class SessionStoreDecisionTests: XCTestCase {
         }
     }
 
+    /// R-018: submitDictation's .answer case must not report success when the underlying
+    /// decide() send fails -- DictateView only clears the dictated text and dismisses when
+    /// submitDictation returns true, so a failed answer send must return false and keep the
+    /// card, not silently look like it succeeded.
+    func testSubmitDictationAnswerReturnsFalseWhenSendFails() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+
+        let sent = await store.submitDictation(
+            "Sure",
+            expecting: .answer(questionId: question.questionId, text: question.text)
+        )
+
+        XCTAssertFalse(sent, "a failed answer send must not be reported as sent")
+        XCTAssertNotNil(store.pendingQuestion, "the card must stay so the answer can be retried")
+        XCTAssertEqual(store.outcome(forCard: question.questionId), .offline)
+    }
+
     /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,
     /// the outcome is rateLimited, and the same choice retries with the same command id.
     func testRateLimitedKeepsCardAndRetriesWithSameCommandId() async throws {
@@ -1192,19 +1211,23 @@ final class SessionStoreDecisionTests: XCTestCase {
     }
 
     /// R-005/R-009 (ACCEPTED contract): a retryable cancel failure sets an error status and
-    /// turnState (report(error)'s side effect). A later successful retry reuses the failed
-    /// cancel's command id and clears `unconfirmedCancel` -- proven here by a further failure
-    /// minting a fresh command id instead of replaying the old one -- but it does NOT itself
-    /// clear the error status/turnState (R-005 is accepted, not fixed: a clearing flag was tried
-    /// and removed because it could wipe an unrelated live error). The stale error survives at
-    /// most one poll round trip: the next successful poll page unconditionally rewrites
-    /// statusLine/statusKind regardless of what set them.
+    /// status (report(error)'s side effect). Per R-019, a failed cancel is a recoverable error
+    /// while a turn is still tracked as cancelable, so it must not overwrite turnState (and
+    /// hide the Stop-turn button) -- turnState stays whatever it was (here `.waiting`, from the
+    /// pending approval in setup). A later successful retry reuses the failed cancel's command
+    /// id and clears `unconfirmedCancel` -- proven here by a further failure minting a fresh
+    /// command id instead of replaying the old one -- but it does NOT itself clear the error
+    /// status (R-005 is accepted, not fixed: a clearing flag was tried and removed because it
+    /// could wipe an unrelated live error). The stale error survives at most one poll round
+    /// trip: the next successful poll page unconditionally rewrites statusLine/statusKind
+    /// regardless of what set them.
     func testCancelRetrySucceedsButErrorStatusClearsOnlyOnNextPollPage() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()
         await client.setSendResult(.failure(URLError(.timedOut)))
 
         await store.cancel()
-        XCTAssertEqual(store.turnState, .error, "setup: the failed cancel must have written the error turnState")
+        XCTAssertEqual(store.turnState, .waiting, "R-019: a recoverable cancel failure must not clear the in-progress turnState")
+        XCTAssertTrue(store.canCancelTurn, "R-019: the Stop-turn button must stay available after a recoverable cancel failure")
         XCTAssertEqual(store.statusKind, .error, "setup: the failed cancel must have written the error status")
         let failedCommandId = (await client.sentCalls).last!.commandId
 
@@ -1214,7 +1237,7 @@ final class SessionStoreDecisionTests: XCTestCase {
         let callsAfterRetry = await client.sentCalls
         XCTAssertEqual(callsAfterRetry.count, 2)
         XCTAssertEqual(callsAfterRetry[1].commandId, failedCommandId, "a successful retry must reuse the failed cancel's command id")
-        XCTAssertEqual(store.turnState, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error turnState")
+        XCTAssertEqual(store.turnState, .waiting, "a successful retry keeps the in-progress turnState")
         XCTAssertEqual(store.statusKind, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error status")
 
         // A further failure must mint a fresh command id, proving the successful retry cleared
@@ -2179,6 +2202,35 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertEqual(store.sessionId, "sess_1")
         XCTAssertNotNil(store.pendingApproval, "a recoverable error must not clear an unrelated pending card")
+    }
+
+    /// Regression for R-019: a failed decide() send (e.g. a network hiccup rejecting reject())
+    /// reports a recoverable, non-fatal error through `report()`. That must not hide the
+    /// Stop-turn button or lose track of the running turn's id -- the server-side turn may
+    /// still be running even though this send failed.
+    func testFailedDecideSendKeepsStopTurnAvailableForSameTurn() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+
+        let turnStarted = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """)
+        store.apply(turnStarted)
+        XCTAssertTrue(store.canCancelTurn, "setup should leave a running, cancelable turn")
+        XCTAssertEqual(store.currentTurnId, 3)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.reject()
+
+        XCTAssertEqual(store.statusKind, .error)
+        XCTAssertTrue(
+            store.canCancelTurn,
+            "a recoverable decide() failure must not hide the Stop-turn button for a turn that may still be running"
+        )
+        XCTAssertEqual(store.currentTurnId, 3, "the turn being tracked must not change on a recoverable error")
     }
 
     /// Regression for R-020: reject()'s 409 branch was never exercised; mirrors the existing

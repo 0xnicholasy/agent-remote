@@ -39,9 +39,16 @@ struct DictateView: View {
                 Button("Send") {
                     guard let destination else { return }
                     let outgoing = trimmed
-                    text = ""
-                    dismiss()
-                    Task { await store.submitDictation(outgoing, expecting: destination) }
+                    Task {
+                        // Only clear the text and dismiss once submitDictation confirms the
+                        // send succeeded (R-018): a failed or refused submit must leave the
+                        // dictated text in place so the user can retry instead of losing it.
+                        let sent = await store.submitDictation(outgoing, expecting: destination)
+                        if sent {
+                            text = ""
+                            dismiss()
+                        }
+                    }
                 }
                 .disabled(sendDisabled)
             }

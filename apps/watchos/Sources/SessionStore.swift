@@ -573,15 +573,18 @@ final class SessionStore {
             // instead of leaving it stuck on screen with a no-op approve()/answer().
             resetSessionState()
         case .error(let payload):
-            turnState = .error
-            currentTurnId = nil
-            awaitingLocalTurnStart = false
-            localResolvedTurnId = nil
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
-            // in-flight events for it are still applied.
+            // in-flight events for it are still applied. Turn tracking (currentTurnId) and
+            // turnState must only be cleared/overwritten here when there is no turn currently
+            // tracked as cancelable -- otherwise a recoverable error report (failed decide,
+            // cancel, or a network hiccup) would hide the Stop-turn button while the
+            // server-side turn may still be running.
             if payload.fatal {
+                turnState = .error
                 resetSessionState()
+            } else if !canCancelTurn {
+                turnState = .error
             }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
@@ -701,24 +704,29 @@ final class SessionStore {
         )
     }
 
-    func answer(text: String) async {
-        guard let question = pendingQuestion, let target = sessionId else { return }
-        await decide(
+    @discardableResult
+    func answer(text: String) async -> Bool {
+        guard let question = pendingQuestion, let target = sessionId else { return false }
+        return await decide(
             .questionAnswer(QuestionAnswerPayload(questionId: question.questionId, text: text)),
             sessionId: target,
             card: .question(question.questionId)
         )
     }
 
-    /// Sends a decision for a pending card and records its outcome.
+    /// Sends a decision for a pending card and records its outcome. Returns whether the
+    /// decision actually reached the bridge (the send did not throw) -- callers that clear
+    /// UI state such as dictated text on success must gate that on this result, not on the
+    /// call merely returning.
     ///
     /// A send that fails without reaching a verdict (no connection, lost response, rate limit,
     /// or any other indeterminate failure) keeps the card and remembers the command id.
     /// Repeating the same choice reuses that id, so if the first send did land the bridge
     /// returns its recorded outcome instead of refusing the retry as no longer pending, or
     /// double-applying it. A different choice gets a fresh id.
-    private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async {
-        guard !isSending else { return }
+    @discardableResult
+    private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async -> Bool {
+        guard !isSending else { return false }
         isSending = true
         defer { isSending = false }
         // Bumped by reconnect(); if it moves while the send is in flight, this call's response
@@ -737,18 +745,23 @@ final class SessionStore {
         setOutcome(.sending, for: card)
         do {
             try await client.send(payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp)
-            guard generation == pollGeneration else { return }
+            // The send itself succeeded (accepted by the bridge) regardless of what the guards
+            // below do with local UI state, so every path out of this do block reports success.
+            guard generation == pollGeneration else { return true }
             unconfirmedSend = nil
             // If the resolution event already removed the card, its transcript line shows the
             // outcome and a "Sent" banner would only linger under it.
             guard isCurrent(card) else {
                 if actionOutcomeCardId == card.id { clearOutcome() }
-                return
+                return true
             }
             setOutcome(.acknowledged, for: card)
             clearCard(card)
+            return true
         } catch {
-            guard generation == pollGeneration else { return }
+            // Every path below reports failure: the send did not land a confirmed decision, so
+            // callers must not treat this as delivered (e.g. clearing dictated text).
+            guard generation == pollGeneration else { return false }
             unconfirmedSend = nil
             let outcome = ActionOutcome.classify(error)
             switch outcome {
@@ -759,7 +772,7 @@ final class SessionStore {
                 // would treat as a distinct command).
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 unconfirmedSend = UnconfirmedSend(
                     payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
@@ -772,7 +785,7 @@ final class SessionStore {
                 // button -- must stay. Only the outcome slot changes.
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 setOutcome(.reviewAtDesk, for: card)
             case let terminal:
@@ -784,13 +797,14 @@ final class SessionStore {
                 // call wrote at the top if it's still ours, or it would linger forever.
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 setOutcome(terminal, for: card)
                 clearCard(card)
                 statusLine = terminal.statusText ?? statusLine
                 statusKind = terminal == .authRequired ? .authFailed : .requestInvalid
             }
+            return false
         }
     }
 
@@ -942,8 +956,7 @@ final class SessionStore {
         }
         switch expecting {
         case .answer:
-            await answer(text: text)
-            return true
+            return await answer(text: text)
         case .newPrompt:
             // sendPrompt() applies the R-010 guard itself and reports whether the text was
             // actually sent, including when session creation fails first.
@@ -956,7 +969,13 @@ final class SessionStore {
     }
 
     private func report(_ error: any Error) {
-        turnState = .error
+        // A failed decide()/cancel() send, or any other recoverable local/network error, must
+        // not hide the Stop-turn button while the server-side turn may still be running: only
+        // overwrite turnState into .error when there is no turn currently tracked as
+        // cancelable.
+        if !canCancelTurn {
+            turnState = .error
+        }
         statusLine = "\(error)"
         statusKind = .error
     }
