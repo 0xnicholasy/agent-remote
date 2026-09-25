@@ -649,10 +649,9 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.stopTurnTarget, .unknown)
     }
 
-    /// R-001: a Stop dialog opened for the Watch's own just-sent turn binds to the next
-    /// turnStarted; one opened for a turn whose turnStarted was never seen (joined mid-turn)
-    /// must not, so a lost completion cannot make it cancel an unrelated later turn.
-    func testStopTurnTargetAdoptsOnlyPendingLocalTurn() async throws {
+    /// R-007: `.pendingLocal` must stay current through the very turnStarted that resolves it,
+    /// with no view onChange needed to rebind it -- and must not follow a later, unrelated turn.
+    func testStopTurnTargetPendingLocalStaysCurrentAcrossItsOwnTurnStarted() async throws {
         func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
             try decodeEvent("""
             {
@@ -662,39 +661,73 @@ final class SessionStoreDecisionTests: XCTestCase {
             """)
         }
         let started = #"{ "projectId": "prj_demo", "resumed": false }"#
-        let command = #"{ "executionId": "exec_1", "command": "ls" }"#
 
-        // .unknown: a running turn whose turnStarted was never seen.
-        let orphan = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
-        orphan.apply(try event(1, "session.started", started))
-        orphan.apply(try event(2, "command.started", command))
-        let unknown = orphan.stopTurnTarget
-        XCTAssertEqual(unknown, .unknown)
-        XCTAssertTrue(orphan.isStopTargetCurrent(unknown), "the unseen turn is still the one running")
-        orphan.apply(try event(9, "turn.started", #"{ "turnId": "turn_9" }"#))
-        let afterUnrelated = orphan.adoptingStartedTurn(unknown)
-        XCTAssertEqual(afterUnrelated, .unknown, "an unseen turn must never be rebound to a later turn's id")
-        XCTAssertFalse(orphan.isStopTargetCurrent(afterUnrelated), "confirm must not cancel the unrelated turn")
-
-        // .pendingLocal: the turn this Watch just sent.
         let local = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
         local.apply(try event(1, "session.started", started))
         await local.sendPrompt("go")
         let pending = local.stopTurnTarget
         XCTAssertEqual(pending, .pendingLocal)
         XCTAssertTrue(local.isStopTargetCurrent(pending))
-        local.apply(try event(4, "turn.started", #"{ "turnId": "turn_4" }"#))
-        XCTAssertFalse(local.isStopTargetCurrent(pending), "an unadopted pending target is stale once the id is known")
-        let adopted = local.adoptingStartedTurn(pending)
-        XCTAssertEqual(adopted, .turn(4))
-        XCTAssertTrue(local.isStopTargetCurrent(adopted))
 
-        // .turn(id): only that id may be cancelled, and it is never rebound.
+        local.apply(try event(4, "turn.started", #"{ "turnId": "turn_4" }"#))
+        XCTAssertTrue(local.isStopTargetCurrent(pending), "pendingLocal stays current once its own turn's id resolves")
+
+        // A later, unrelated turn must not be treated as still current for that target.
         local.apply(try event(5, "turn.completed", #"{ "turnId": "turn_4" }"#))
         local.apply(try event(6, "turn.started", #"{ "turnId": "turn_6" }"#))
-        XCTAssertEqual(local.adoptingStartedTurn(adopted), .turn(4))
-        XCTAssertFalse(local.isStopTargetCurrent(adopted), "a dialog for turn 4 must not cancel turn 6")
+        XCTAssertFalse(local.isStopTargetCurrent(pending), "a dialog for the first local turn must not cancel a later one")
         XCTAssertTrue(local.isStopTargetCurrent(.turn(6)))
+    }
+
+    /// R-007: a reconnect page can apply a turn's completed and a new turn's started in one
+    /// synchronous loop (the same path SessionStore.apply() takes for every event in a page), so
+    /// `.turn(id)` must read as stale from store state alone once that loop has run, with no
+    /// intermediate render pass to observe canCancelTurn's true -> false -> true swing.
+    func testStopTurnTargetTurnIsStaleAfterCompletedThenStartedInOnePass() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        store.apply(try event(2, "turn.started", #"{ "turnId": "turn_5" }"#))
+        let target = store.stopTurnTarget
+        XCTAssertEqual(target, .turn(2))
+        XCTAssertTrue(store.isStopTargetCurrent(target))
+
+        // Same batch a reconnect gap-replay page would apply: completed(2) then started(3), back
+        // to back with no render pass between them.
+        store.apply(try event(3, "turn.completed", #"{ "turnId": "turn_5" }"#))
+        store.apply(try event(4, "turn.started", #"{ "turnId": "turn_6" }"#))
+
+        XCTAssertFalse(store.isStopTargetCurrent(target), "turn 2's dialog must not read as current once a new turn has started")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(4)), "the new turn is the one now running")
+    }
+
+    /// R-007: `.unknown` (a turn joined mid-run, whose turnStarted was never seen) must not be
+    /// treated as current once an unrelated turn.started lands.
+    func testStopTurnTargetUnknownIsStaleAfterUnrelatedTurnStarted() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let orphan = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        orphan.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        orphan.apply(try event(2, "command.started", #"{ "executionId": "exec_1", "command": "ls" }"#))
+        let unknown = orphan.stopTurnTarget
+        XCTAssertEqual(unknown, .unknown)
+        XCTAssertTrue(orphan.isStopTargetCurrent(unknown), "the unseen turn is still the one running")
+
+        orphan.apply(try event(9, "turn.started", #"{ "turnId": "turn_9" }"#))
+        XCTAssertFalse(orphan.isStopTargetCurrent(unknown), "confirm must not cancel the unrelated turn")
     }
 
     /// The dictation review screen names where the text goes, matching submitDictation's routing.

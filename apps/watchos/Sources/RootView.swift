@@ -89,18 +89,13 @@ struct ConversationView: View {
             }
             // A turn that finishes (or is superseded) while the dialog is open leaves it asking
             // about a turn the user can no longer act on; dismiss it rather than let a stale
-            // confirm reach the guard above as a silent no-op.
-            .onChange(of: store.canCancelTurn) { _, canCancel in
-                if !canCancel { confirmingStop = false }
-            }
-            // A dialog opened between sendPrompt() and its turnStarted captured `.pendingLocal`;
-            // once that id arrives, bind to it so the pending Stop still cancels the turn the user
-            // just sent. The store only adopts from `.pendingLocal`, never from `.unknown` or an
-            // already-bound id, so an unrelated later turn is never picked up.
-            .onChange(of: store.currentTurnId) { _, _ in
-                if confirmingStop {
-                    confirmingStopTarget = store.adoptingStartedTurn(confirmingStopTarget)
-                }
+            // confirm reach the guard above as a silent no-op. Driven off the target's final
+            // current-ness rather than `canCancelTurn` alone: a reconnect page can apply this
+            // turn's completed and a new turn's started in one synchronous loop, so
+            // `canCancelTurn` goes true -> false -> true within a single render pass and would
+            // never trigger a plain onChange, while the end-of-batch Bool here still flips.
+            .onChange(of: confirmingStop && !store.isStopTargetCurrent(confirmingStopTarget)) { _, stale in
+                if stale { confirmingStop = false }
             }
         }
     }

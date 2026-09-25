@@ -187,6 +187,13 @@ final class SessionStore {
     /// turnStarted was never seen" (e.g. a gap replay that starts mid-turn): both leave
     /// currentTurnId nil, but only the first may later be bound to the next turnStarted's id.
     private(set) var awaitingLocalTurnStart = false
+    /// The id turnStarted bound `awaitingLocalTurnStart` to, kept so `.pendingLocal` stays
+    /// current through the very turnStarted that resolves it: applying a reconnect page can
+    /// run turnStarted's write to `currentTurnId` and a later turn's own start in one
+    /// synchronous loop, so a view's onChange never fires in between and must not be relied on
+    /// to rebind. Cleared on session reset and on the next sendPrompt(), so it never outlives
+    /// the turn it names.
+    @ObservationIgnored private var localResolvedTurnId: Int?
     private(set) var sessionId: String?
     private(set) var lastSeenEventId: Int
     private(set) var syncState: SyncState = .disconnected
@@ -306,6 +313,7 @@ final class SessionStore {
         pendingQuestion = nil
         currentTurnId = nil
         awaitingLocalTurnStart = false
+        localResolvedTurnId = nil
         if !preservingUnconfirmedSend {
             unconfirmedSend = nil
             unconfirmedCancel = nil
@@ -491,6 +499,7 @@ final class SessionStore {
             turnState = .idle
             currentTurnId = nil
             awaitingLocalTurnStart = false
+            localResolvedTurnId = nil
             append(.system, "Session \(event.sessionId) started", id: event.eventId)
             return
         }
@@ -505,6 +514,9 @@ final class SessionStore {
         case .turnStarted(let payload):
             turnState = .thinking
             currentTurnId = event.eventId
+            if awaitingLocalTurnStart {
+                localResolvedTurnId = event.eventId
+            }
             awaitingLocalTurnStart = false
             if let prompt = payload.prompt, !prompt.isEmpty {
                 append(.user, prompt, id: event.eventId)
@@ -622,6 +634,7 @@ final class SessionStore {
         // from being guarded against the wrong, stale id when that event lands.
         currentTurnId = nil
         awaitingLocalTurnStart = true
+        localResolvedTurnId = nil
         do {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
         } catch {
@@ -848,22 +861,20 @@ final class SessionStore {
         return awaitingLocalTurnStart ? .pendingLocal : .unknown
     }
 
-    /// Binds a `.pendingLocal` target to the turn id that has since arrived. Only the turn this
-    /// Watch just sent may be adopted; an `.unknown` target is never rebound, because the next
-    /// turnStarted after an unseen turn belongs to an unrelated, later turn.
-    func adoptingStartedTurn(_ target: StopTurnTarget) -> StopTurnTarget {
-        if target == .pendingLocal, let currentTurnId { return .turn(currentTurnId) }
-        return target
-    }
-
-    /// Whether confirming a Stop opened for `target` would still cancel that same turn.
+    /// Whether confirming a Stop opened for `target` would still cancel that same turn. Resolved
+    /// entirely from store state rather than a view's onChange, so it gives the right answer
+    /// even when a reconnect page applies several events (e.g. this turn's completed followed by
+    /// a new turn's started) in one synchronous loop, with no render pass in between to observe.
     func isStopTargetCurrent(_ target: StopTurnTarget) -> Bool {
         guard canCancelTurn else { return false }
         switch target {
         case .turn(let id):
             return currentTurnId == id
         case .pendingLocal:
-            return currentTurnId == nil && awaitingLocalTurnStart
+            // Still current either while the id is still unknown, or once it has resolved to
+            // this turn's own turnStarted -- but not once a later, unrelated turn has started.
+            return awaitingLocalTurnStart
+                || (localResolvedTurnId != nil && currentTurnId == localResolvedTurnId)
         case .unknown:
             return currentTurnId == nil && !awaitingLocalTurnStart
         }
