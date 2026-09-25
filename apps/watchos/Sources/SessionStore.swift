@@ -482,6 +482,9 @@ final class SessionStore {
             speaker.speak(payload.spokenSummary ?? payload.title)
         case .approvalResolved(let payload):
             pendingApproval = nil
+            // The transcript line below now carries the outcome, so a "Sent" banner left from
+            // this or an earlier send must not reappear under it.
+            clearOutcome()
             let title = lastApproval?.binding.approvalId == payload.approvalId ? lastApproval?.title : nil
             append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
         case .questionRequested(let payload):
@@ -491,6 +494,7 @@ final class SessionStore {
             speaker.speak(payload.spokenSummary ?? payload.text)
         case .questionAnswered(let payload):
             pendingQuestion = nil
+            clearOutcome()
             let label = lastQuestion?.options.first { $0.id == payload.answer }?.label
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
@@ -633,6 +637,12 @@ final class SessionStore {
             try await client.send(payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp)
             guard generation == pollGeneration else { return }
             unconfirmedSend = nil
+            // If the resolution event already removed the card, its transcript line shows the
+            // outcome and a "Sent" banner would only linger under it.
+            guard isCurrent(card) else {
+                if actionOutcomeCardId == card.id { clearOutcome() }
+                return
+            }
             setOutcome(.acknowledged, for: card)
             clearCard(card)
         } catch {
@@ -668,6 +678,11 @@ final class SessionStore {
     /// for it.
     func outcome(forCard id: String) -> ActionOutcome? {
         actionOutcomeCardId == id ? actionOutcome : nil
+    }
+
+    private func clearOutcome() {
+        actionOutcome = nil
+        actionOutcomeCardId = nil
     }
 
     private func setOutcome(_ outcome: ActionOutcome, for card: DecisionCard) {

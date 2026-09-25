@@ -331,6 +331,67 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.actionOutcome, .acknowledged)
     }
 
+    /// E-27: once the bridge reports the approval resolved, its transcript line carries the
+    /// outcome, so the "Sent" banner must not stay under it.
+    func testResolutionEventClearsSentOutcome() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "accepted" }
+        }
+        """))
+
+        XCTAssertNil(store.actionOutcome, "a resolved approval must not leave a stale Sent banner")
+    }
+
+    /// E-27: when the resolution event lands before the send's own response, the late response
+    /// must not bring the "Sent" banner back.
+    func testLateAcknowledgementAfterResolutionDoesNotShowSent() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.gateSendCall(1)
+        let sending = Task { await store.approve() }
+        try await Task.sleep(for: .milliseconds(50))
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_1", "decision": "accepted" }
+        }
+        """))
+        await client.openSendGate()
+        await sending.value
+
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertNil(store.actionOutcome)
+    }
+
+    /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,
+    /// the outcome is rateLimited, and the same choice retries with the same command id.
+    func testRateLimitedKeepsCardAndRetriesWithSameCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.rateLimited))
+
+        await store.reject()
+
+        XCTAssertNotNil(store.pendingApproval, "rate limiting must keep the card for a retry")
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .rateLimited)
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.reject()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertNil(store.pendingApproval)
+    }
+
     /// A different choice after an offline send is a different command, so it must not reuse
     /// the id (the bridge would refuse it as a conflict).
     func testOfflineThenDifferentChoiceUsesNewCommandId() async throws {
