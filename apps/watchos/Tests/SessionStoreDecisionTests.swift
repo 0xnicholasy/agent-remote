@@ -815,6 +815,45 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, .error)
     }
 
+    /// R-010: submitDictation() must apply the same running-turn refusal as sendPrompt() when the
+    /// reviewed destination is .newPrompt and a turn is live underneath it.
+    func testSubmitDictationNewPromptRefusedWhileTurnRunning() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertEqual(store.turnState, .running)
+
+        let sent = await store.submitDictation("x", expecting: .newPrompt)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a running turn must refuse the send rather than reach the bridge")
+        XCTAssertEqual(store.currentTurnId, 2, "the live turn's id must be untouched")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(2)), "the Stop button must still target the running turn")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
     /// R-009: a review screen captured while a question was pending must not silently redirect
     /// its send to a new prompt once that question is answered or replaced from elsewhere.
     func testSubmitDictationRefusesWhenExpectedQuestionNoLongerPending() async throws {
