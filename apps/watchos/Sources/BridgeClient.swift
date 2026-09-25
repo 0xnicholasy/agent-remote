@@ -126,6 +126,9 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     /// The bridge answered a command with a success status but a body the Watch could not read,
     /// so the command may have taken effect without the Watch knowing its result.
     case commandResponseUnreadable
+    /// The approval's `approval.requested` did not show the exact action text (M4 desk-only
+    /// gate); the bridge refuses `approval.accept` for it regardless of what the Watch sends.
+    case reviewAtDesk
 
     var description: String {
         switch self {
@@ -145,6 +148,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
         case .commandIndeterminate: "The bridge cannot tell whether that command took effect."
         case .interactionNotPending: "That request is no longer waiting for an answer."
+        case .reviewAtDesk: "Review this action at the Mac before allowing it."
         }
     }
 
@@ -164,6 +168,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "rate_limited": .rateLimited
         case "command_indeterminate": .commandIndeterminate
         case "interaction_not_pending": .interactionNotPending
+        case "review_at_desk": .reviewAtDesk
         default: .http(status: status, message: message)
         }
     }

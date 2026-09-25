@@ -796,6 +796,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         if (record.state !== "pending") {
           return json({ error: "interaction_not_pending", interactionId, state: record.state }, 409);
         }
+        // Desk-only gate (M4): an approval whose approval.requested did not show the exact
+        // action text must never be accepted from the Watch. Checked before `commands.begin`, so
+        // a refused accept leaves no journal entry and never reaches the provider. Reject is
+        // unaffected — declining an action the user cannot verify is always safe.
+        if (command.type === "approval.accept" && record.deskOnly === true) {
+          return json({ error: "review_at_desk", interactionId }, 403);
+        }
       }
 
       // question.answer carries no binding of its own, so its deadline is whatever the registry

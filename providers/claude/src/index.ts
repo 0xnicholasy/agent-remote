@@ -28,6 +28,7 @@ import {
   type ProviderHost,
   type QuestionAnswerPayload,
   type QuestionOutcome,
+  type TitleFidelity,
   type Session,
   type SessionCompletedPayload,
   type SessionState,
@@ -1125,23 +1126,18 @@ export class ClaudeProvider implements AgentProvider {
       };
     }
 
-    // `callOptions.title`, when the SDK supplies one, is used verbatim and is never run through
-    // `truncateActionText`, so it never needs the truncation marker below.
-    let actionText: string;
-    let truncationNote = "";
-    if (callOptions.title !== undefined) {
-      actionText = callOptions.title;
-    } else {
-      const derived = deriveActionText(toolName, input);
-      actionText = derived.text;
-      // Truncation marker: the digest/title above are computed over the truncated text, but the
-      // full, untruncated input is what actually executes on approval. Surfacing the cut in
-      // `detail` (never in `title`/the digest) lets an approver see the card is not the whole
-      // action.
-      if (derived.truncated) {
-        truncationNote = ` … (+${derived.fullLength - derived.text.length} more chars)`;
-      }
-    }
+    // `title` is always the exact action text (never the SDK's own summary), so the digest and
+    // the card both bind the user's decision to what actually executes. The SDK's own
+    // `callOptions.title`, when supplied, is spoken context only and never appears in `title` or
+    // the digest.
+    const derived = deriveActionText(toolName, input);
+    const actionText = derived.text;
+    const titleFidelity: TitleFidelity = derived.truncated ? "truncated" : "exact";
+    // Truncation marker: the digest/title above are computed over the truncated text, but the
+    // full, untruncated input is what actually executes on approval. Surfacing the cut in
+    // `detail` (never in `title`/the digest) lets an approver see the card is not the whole
+    // action.
+    const truncationNote = derived.truncated ? ` … (+${derived.fullLength - derived.text.length} more chars)` : "";
     const approvalId = `apr_${randomUUID()}`;
     const binding: ApprovalBinding = {
       approvalId,
@@ -1205,7 +1201,11 @@ export class ClaudeProvider implements AgentProvider {
             // exactly what they are binding their decision to.
             title: actionText,
             ...(detail === "" ? {} : { detail }),
+            // The SDK's own title, when supplied, is spoken context only: it is never the exact
+            // action text and must never be shown in place of `title` or fed to the digest.
             ...(callOptions.title === undefined ? {} : { spokenSummary: callOptions.title }),
+            titleFidelity,
+            ...(derived.truncated ? { fullLength: derived.fullLength } : {}),
           });
         });
         if (!emitted) {

@@ -285,6 +285,45 @@ user saw, rather than a different action sharing an id.
 Questions have the same lifecycle requirement even though their current payload has a smaller
 binding: an answer must apply only to the currently pending question in that session and turn.
 
+### Desk-only approvals
+
+The Watch must show the exact action before Allow can be offered; a spoken summary is not
+authorization context. `approval.requested`'s payload carries two optional fields alongside
+`title`:
+
+```ts
+type TitleFidelity = "exact" | "truncated" | "summary";
+
+interface ApprovalRequest {
+  // ...binding, kind, title, detail, spokenSummary as above
+  titleFidelity?: TitleFidelity;
+  fullLength?: number; // untruncated action length, set alongside "truncated"
+}
+```
+
+- `"exact"`: `title` is the full, unmodified action text (the same text `actionDigest` was
+  computed over).
+- `"truncated"`: `title` is that same exact text, cut to the provider's display limit.
+  `fullLength` carries the untruncated length so a client can show how much was hidden.
+- `"summary"`: `title` is not the exact action text (e.g. a provider-composed description).
+- **Absent is treated the same as `"summary"`: desk-only, fail closed.** A provider that cannot
+  produce exact action text, or an older event with no `titleFidelity` at all, must not be
+  treated as safe to allow from the wrist.
+
+`requiresDeskReview(payload)` (exported by both the TypeScript and Swift bindings) is
+`titleFidelity !== "exact"`. The bridge's `InteractionRegistry` records this per approval as
+`deskOnly`, derived from the logged `approval.requested` event (so it survives a rebuild rather
+than being stored independently), and the decision gate refuses `approval.accept` on a
+`deskOnly` interaction with `403 review_at_desk` (see the gate table below) before the provider
+is ever called. `approval.reject` is always allowed regardless of `deskOnly`, since declining an
+action the user cannot verify is always safe.
+
+The Watch enforces the same rule client-side: `ChoiceCardView` omits the Allow button entirely
+for a desk-only approval, showing only Deny and a caption ("Review at the Mac before allowing",
+with a "(N chars, M shown)" suffix when `fullLength` is present), and `SessionStore.approve()`
+refuses to send anything at all for one. This is defense in depth, not the source of truth: the
+bridge's gate is authoritative.
+
 ## Interaction lifecycle
 
 An approval or a question is one interaction. Every interaction starts `pending` and moves to
@@ -311,7 +350,8 @@ first match wins:
 | 1 | `410 {"error": "decision_expired"}` | `approval.accept`/`approval.reject` whose binding `expiresAt` has passed. It reads only the caller's own binding, so it runs first and discloses nothing. An expired approval is always 410, whether or not the provider's timer has already emitted `expired`. |
 | 2 | `409 {"error": "interaction_not_pending", "interactionId": <id>, "state": "not_found"}` | The id is unknown to the registry, or bound to a different session. Both cases get the same body, so a caller cannot tell "exists in another session" from "never existed". |
 | 3 | `409 {"error": "interaction_not_pending", "interactionId": <id>, "state": <state>}` | The interaction is this session's and terminal. `state` is that terminal state. |
-| 4 | `410 {"error": "decision_expired"}` | `question.answer` whose question's recorded `expiresAt` has passed. |
+| 4 | `403 {"error": "review_at_desk", "interactionId": <id>}` | `approval.accept` on an interaction the registry marked `deskOnly` (see "Desk-only approvals" below). `approval.reject` is unaffected. |
+| 5 | `410 {"error": "decision_expired"}` | `question.answer` whose question's recorded `expiresAt` has passed. |
 
 All four are enforced whether or not `AGENTREMOTE_AUTH` is on. Refusing an unknown id is safe
 because every provider event passes through the registry, the cap never evicts a pending record,

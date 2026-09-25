@@ -4,6 +4,7 @@ import addFormats from "ajv-formats";
 
 import eventSchema from "../../schema/agent-event.schema.json";
 import commandSchema from "../../schema/command.schema.json";
+import { requiresDeskReview } from "./index";
 import type { AgentEventEnvelope, ApprovalBinding, CommandEnvelope } from "./index";
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
@@ -42,6 +43,47 @@ const approvalAccept: CommandEnvelope<"approval.accept"> = {
   timestamp: "2026-09-14T10:15:30.000Z",
   payload: { binding },
 };
+
+// Fixed JSON vector shared with the Swift binding's AgentEventTests. Any change here must be
+// mirrored there so both sides are tested against the same bytes.
+const titleFidelityVector = {
+  eventId: 46,
+  sessionId: "ses_01",
+  provider: "mock",
+  type: "approval.requested",
+  timestamp: "2026-09-14T10:19:00.000Z",
+  payload: {
+    binding,
+    kind: "command",
+    title: "Run git push origin main",
+  },
+};
+
+describe("titleFidelity", () => {
+  test("titleFidelity 'exact' is valid", () => {
+    const event = {
+      ...titleFidelityVector,
+      payload: { ...titleFidelityVector.payload, titleFidelity: "exact" },
+    };
+    expect(validateEvent(event)).toBe(true);
+    expect(validateEvent.errors ?? []).toEqual([]);
+  });
+
+  test("titleFidelity 'bogus' is rejected by the schema", () => {
+    const event = {
+      ...titleFidelityVector,
+      payload: { ...titleFidelityVector.payload, titleFidelity: "bogus" },
+    };
+    expect(validateEvent(event)).toBe(false);
+  });
+
+  test("requiresDeskReview is fail closed", () => {
+    expect(requiresDeskReview({})).toBe(true);
+    expect(requiresDeskReview({ titleFidelity: "exact" })).toBe(false);
+    expect(requiresDeskReview({ titleFidelity: "truncated" })).toBe(true);
+    expect(requiresDeskReview({ titleFidelity: "summary" })).toBe(true);
+  });
+});
 
 describe("protocol samples validate against the JSON Schemas", () => {
   test("a sample approval.requested event is valid", () => {

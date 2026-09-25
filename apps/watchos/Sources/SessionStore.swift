@@ -91,6 +91,8 @@ enum ActionOutcome: Equatable {
         case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
         // Static device policy: the same command will be refused again until re-enrolled.
         case BridgeError.actionNotAllowed, BridgeError.projectNotAllowed: return .notAllowed
+        // Desk-only gate (M4): retrying approve() for this approval is refused again every time.
+        case BridgeError.reviewAtDesk: return .notAllowed
         case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
         default: return .failed
         }
@@ -598,6 +600,11 @@ final class SessionStore {
 
     func approve() async {
         guard let request = pendingApproval else { return }
+        // Desk-only gate (M4): the exact action was not shown, so nothing is sent. The bridge
+        // would refuse this with `review_at_desk` anyway; refusing here as well means a Watch
+        // that somehow rendered an Allow button for this card (it should not, per
+        // `ChoiceCardView`) still cannot use it to authorize an action it never displayed.
+        guard !request.requiresDeskReview else { return }
         await decide(
             .approvalAccept(ApprovalAcceptPayload(binding: request.binding)),
             sessionId: request.binding.sessionId,

@@ -601,6 +601,20 @@
         "spokenSummary": {
           "type": "string",
           "description": "Short plain sentence the bridge composes for text-to-speech, e.g. 'Claude wants to run npm test. Allow or deny?'"
+        },
+        "titleFidelity": {
+          "type": "string",
+          "description": "How closely title matches the exact action. 'exact': the full action text, unmodified. 'truncated': the exact action text cut to fit the display limit. 'summary': not the exact action text. Absent is treated as desk-only, the same as 'summary'.",
+          "enum": [
+            "exact",
+            "truncated",
+            "summary"
+          ]
+        },
+        "fullLength": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Length in characters of the untruncated action text, set alongside a 'truncated' titleFidelity."
         }
       },
       "required": [
