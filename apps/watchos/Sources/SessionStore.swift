@@ -561,7 +561,9 @@ final class SessionStore {
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
             turnState = .completed
+            currentTurnId = nil
             awaitingLocalTurnStart = false
+            localResolvedTurnId = nil
         case .sessionCompleted(let payload):
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
@@ -572,7 +574,9 @@ final class SessionStore {
             resetSessionState()
         case .error(let payload):
             turnState = .error
+            currentTurnId = nil
             awaitingLocalTurnStart = false
+            localResolvedTurnId = nil
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
             // in-flight events for it are still applied.

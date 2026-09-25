@@ -708,6 +708,40 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertTrue(store.isStopTargetCurrent(.turn(4)), "the new turn is the one now running")
     }
 
+    /// R-008: turn.completed must clear currentTurnId, not just awaitingLocalTurnStart. A partial
+    /// replay page can apply the next turn's questionRequested without ever seeing its
+    /// turnStarted; that must read as `.unknown`, never as the previous, already-finished turn's
+    /// id, or a Stop dialog opened for the old turn would stay valid and cancel the new one.
+    func testStopTurnTargetClearsAfterCompletedThenQuestionWithoutTurnStarted() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        store.apply(try event(5, "turn.started", #"{ "turnId": "turn_5" }"#))
+        XCTAssertEqual(store.stopTurnTarget, .turn(5))
+
+        store.apply(try event(6, "turn.completed", #"{ "turnId": "turn_5" }"#))
+        // The next turn's turnStarted is missing from this replay page; its questionRequested
+        // arrives directly.
+        store.apply(try event(7, "question.requested", """
+        {
+            "questionId": "q_1", "turnId": "turn_6", "text": "Continue?",
+            "options": [{ "id": "yes", "label": "Yes" }],
+            "allowFreeText": true
+        }
+        """))
+
+        XCTAssertNil(store.currentTurnId, "turn.completed must clear the finished turn's id")
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+        XCTAssertFalse(store.isStopTargetCurrent(.turn(5)), "a dialog opened for the finished turn must not cancel the new one")
+    }
+
     /// R-007: `.unknown` (a turn joined mid-run, whose turnStarted was never seen) must not be
     /// treated as current once an unrelated turn.started lands.
     func testStopTurnTargetUnknownIsStaleAfterUnrelatedTurnStarted() async throws {
