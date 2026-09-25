@@ -305,12 +305,8 @@ actor BridgeClient: BridgeClientProtocol {
         var request = try signedRequest(method: "POST", url: baseURL.appending(path: "/v1/commands"), body: body)
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         let (data, response) = try await urlSession.data(for: request)
-        let decoded = try decoder.decode(CommandResponse.self, from: data)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 200
-        if status >= 300 {
-            throw BridgeError.from(status: status, code: decoded.error, message: decoded.error ?? "unknown error")
-        }
-        return decoded
+        try Self.checkStatus(response, data: data)
+        return try decoder.decode(CommandResponse.self, from: data)
     }
 
     private func get(_ url: URL) async throws -> Data {

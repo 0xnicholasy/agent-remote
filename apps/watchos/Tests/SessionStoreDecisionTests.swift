@@ -331,6 +331,43 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.actionOutcome, .acknowledged)
     }
 
+    /// E-33: answer(optionId:) had no success-path test -- lock in that a successful send
+    /// clears the question card and records the acknowledged outcome.
+    func testAnswerOptionIdSuccessClearsCardAndAcknowledges() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+
+        await store.answer(optionId: "yes")
+
+        XCTAssertNil(store.pendingQuestion)
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.sessionId, "sess_1")
+    }
+
+    /// E-33: answer(text:) had no offline-retry test -- lock in that an offline free-text
+    /// answer keeps the card, and repeating the same text reuses the command id, same contract
+    /// as approve()/answer(optionId:).
+    func testAnswerTextOfflineRetryReusesCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+
+        await store.answer(text: "Sure")
+
+        XCTAssertNotNil(store.pendingQuestion, "offline must keep the card for a retry")
+        XCTAssertEqual(store.outcome(forCard: "q_1"), .offline)
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.answer(text: "Sure")
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId, "a retry of the same free-text answer must reuse the command id")
+        XCTAssertNil(store.pendingQuestion)
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+    }
+
     /// E-27: once the bridge reports the approval resolved, its transcript line carries the
     /// outcome, so the "Sent" banner must not stay under it.
     func testResolutionEventClearsSentOutcome() async throws {
@@ -370,6 +407,44 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertNil(store.pendingApproval)
         XCTAssertNil(store.actionOutcome)
+    }
+
+    /// Regression for E-32: an approval.resolved for an id that is not the outcome's card must
+    /// not wipe a still-current "Sent" banner belonging to a different card.
+    func testUnrelatedApprovalResolvedDoesNotClearOutcome() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "appr_99", "decision": "accepted" }
+        }
+        """))
+
+        XCTAssertEqual(store.actionOutcome, .acknowledged, "a resolution for an unrelated approval id must not clear this card's outcome")
+    }
+
+    /// Regression for E-32: same defect, question.answered side -- an unrelated question id
+    /// must not wipe a still-current "Sent" banner belonging to a different card.
+    func testUnrelatedQuestionAnsweredDoesNotClearOutcome() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.answer(optionId: "yes")
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "question.answered",
+            "payload": { "questionId": "q_99", "answer": "no" }
+        }
+        """))
+
+        XCTAssertEqual(store.actionOutcome, .acknowledged, "a resolution for an unrelated question id must not clear this card's outcome")
     }
 
     /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,
@@ -499,6 +574,44 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNil(store.outcome(forCard: "appr_2"))
     }
 
+    /// Regression for E-29: a terminal failure (409-class, expired, etc.) for a card superseded
+    /// by a newer approvalRequested while the send was in flight must not write its outcome
+    /// under the old card's id -- that id is never queried again once the card is gone, so the
+    /// write would just be a silent, unreachable leftover.
+    func testStaleTerminalOutcomeDoesNotWriteToSupersededCard() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerApprovalRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest2",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Edit README.md"
+            }
+        }
+        """)
+        store.apply(newerApprovalRequested)
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale terminal outcome")
+        XCTAssertNil(store.outcome(forCard: "appr_1"), "a terminal outcome for a superseded card must not be recorded under its own (unreachable) id")
+        XCTAssertNil(store.outcome(forCard: "appr_2"), "the superseded card's outcome must not leak onto the new card either")
+    }
+
     /// Regression for E-003: after reconnect() drops the old binding, a session.started for a
     /// different id must be applied instead of silently dropped by the cross-session guard.
     func testReconnectAllowsNewSessionToRebind() async throws {
@@ -519,6 +632,53 @@ final class SessionStoreDecisionTests: XCTestCase {
         store.apply(started)
 
         XCTAssertEqual(store.sessionId, "sess_2")
+    }
+
+    /// Regression for E-34: reconnect() to the same host (e.g. after a network blip) must not
+    /// mint a fresh command id for an offline send that is still waiting to be retried, or the
+    /// retry loses idempotency once the same card is replayed from the bridge.
+    func testReconnectSameHostPreservesUnconfirmedSendForRetry() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+
+        await store.approve()
+        XCTAssertNotNil(store.pendingApproval, "offline must keep the card for a retry")
+
+        await store.reconnect()
+        XCTAssertNil(store.pendingApproval, "reconnect() discards the local view until the replay lands")
+
+        // The replay after reconnect() re-delivers the same session and card.
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_1", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_1", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main"
+            }
+        }
+        """))
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId, "reconnect() to the same bridge must not mint a new command id for the retried choice")
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
     }
 
     /// Regression for E-004: once a session completes, a later session.started for a new id

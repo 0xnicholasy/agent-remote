@@ -461,6 +461,38 @@ final class BridgeClientAuthTests: XCTestCase {
         )
     }
 
+    /// Covers E-30: a proxy-level failure (a 502 with an HTML body, not the bridge's own JSON
+    /// error shape) must still classify on the HTTP status. Before the fix, `send()` decoded the
+    /// response body into `CommandResponse` before ever looking at the status code, so a non-JSON
+    /// body on a >=300 response threw a raw `DecodingError` instead of `BridgeError.http`, losing
+    /// the status entirely.
+    func testSendOnNonJSONErrorBodySurfacesTheHTTPStatus() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+
+        server.respondOnce(
+            statusLine: "HTTP/1.1 502 Bad Gateway",
+            body: "<html><body>502 Bad Gateway</body></html>",
+            onRequest: capture.record
+        )
+
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_bad_gateway",
+                timestamp: BridgeClient.timestamp()
+            )
+            XCTFail("expected the non-JSON 502 body to throw a status-based error")
+        } catch BridgeError.http(let status, _) {
+            XCTAssertEqual(status, 502)
+        } catch {
+            XCTFail("expected BridgeError.http(502, _), got \(error)")
+        }
+    }
+
     /// Investigates E-15: a `stale_request` (401) is rejected by `verifyEnvelope`
     /// (bridge/src/auth/verify.ts:341-343) purely on the `X-AgentRemote-Timestamp` *header*,
     /// checked before the command idempotency store is ever consulted (bridge/src/server.ts:714).

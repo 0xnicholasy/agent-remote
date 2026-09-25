@@ -197,6 +197,10 @@ final class SessionStore {
     /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
     /// meaningful against the bridge that issued it.
     @ObservationIgnored private var knownBridgeId: String?
+    /// The base URL the client is currently pointed at, tracked so reconnect() can tell whether
+    /// it is reconnecting to the same bridge (retry an offline send) or a different one (a new
+    /// bridge/pairing, where the old commandId must not be reused).
+    @ObservationIgnored private var connectedHostURL: URL
 
     /// `client` is injectable so tests can substitute a fake in place of a real `BridgeClient`.
     init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker(), defaults: UserDefaults = .standard) {
@@ -206,6 +210,7 @@ final class SessionStore {
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
         knownBridgeId = defaults.string(forKey: SessionStore.bridgeIdKey)
+        connectedHostURL = url
         self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
     }
@@ -246,26 +251,35 @@ final class SessionStore {
         // Before the await below: the old host's "Current" must not stay on screen while the
         // cursor and session it described are being discarded.
         syncState = .syncing
-        if let url = BridgeClient.parseBaseURL(hostText) {
-            await client.setBaseURL(url)
+        let newURL = BridgeClient.parseBaseURL(hostText)
+        // Same host means the same bridge/pairing: an offline send's commandId is still safe to
+        // reuse once the replayed card reappears, so keep it instead of minting a new one on
+        // retry. A different (or unparseable) host is a different bridge/session space, so the
+        // pending send is dropped along with everything else discardLocalView() clears below.
+        let sameBridge = newURL != nil && newURL == connectedHostURL
+        if let newURL {
+            await client.setBaseURL(newURL)
+            connectedHostURL = newURL
         }
         resetCursor()
         setKnownBridgeId(nil)
         // A new host means a different bridge and session space: drop the old binding and
         // its state, or every event from the new bridge's session would be silently
         // dropped by the cross-session guard in apply() until relaunch.
-        discardLocalView()
+        discardLocalView(preservingUnconfirmedSend: sameBridge)
         start()
     }
 
     /// Clears the session binding and its pending UI state. Shared by reconnect(), the terminal
     /// event branches in apply(), and the bridge-restart path in pollLoop() so a session that no
     /// longer has a live bridge behind it never leaves a stuck card or a dangling binding.
-    private func resetSessionState() {
+    private func resetSessionState(preservingUnconfirmedSend: Bool = false) {
         sessionId = nil
         pendingApproval = nil
         pendingQuestion = nil
-        unconfirmedSend = nil
+        if !preservingUnconfirmedSend {
+            unconfirmedSend = nil
+        }
         actionOutcome = nil
         actionOutcomeCardId = nil
     }
@@ -383,8 +397,8 @@ final class SessionStore {
     /// Drops everything the Watch built from events it can no longer trust: the session
     /// binding, any pending card, the transcript and the turn pill. Shared by the bridge-change
     /// and truncated-cursor paths in pollLoop().
-    private func discardLocalView() {
-        resetSessionState()
+    private func discardLocalView(preservingUnconfirmedSend: Bool = false) {
+        resetSessionState(preservingUnconfirmedSend: preservingUnconfirmedSend)
         transcript.removeAll()
         turnState = .idle
         lastQuestion = nil
@@ -483,8 +497,10 @@ final class SessionStore {
         case .approvalResolved(let payload):
             pendingApproval = nil
             // The transcript line below now carries the outcome, so a "Sent" banner left from
-            // this or an earlier send must not reappear under it.
-            clearOutcome()
+            // this or an earlier send must not reappear under it. Only when this resolution is
+            // for the card the outcome belongs to: an unrelated approval/question id resolving
+            // must not wipe a still-current card's outcome.
+            if actionOutcomeCardId == payload.approvalId { clearOutcome() }
             let title = lastApproval?.binding.approvalId == payload.approvalId ? lastApproval?.title : nil
             append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
         case .questionRequested(let payload):
@@ -494,7 +510,7 @@ final class SessionStore {
             speaker.speak(payload.spokenSummary ?? payload.text)
         case .questionAnswered(let payload):
             pendingQuestion = nil
-            clearOutcome()
+            if actionOutcomeCardId == payload.questionId { clearOutcome() }
             let label = lastQuestion?.options.first { $0.id == payload.answer }?.label
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
@@ -655,18 +671,27 @@ final class SessionStore {
                 // send may have reached the bridge even though its outcome did not reach the
                 // Watch, so a retry must reuse it rather than mint a fresh one (which the bridge
                 // would treat as a distinct command).
-                guard isCurrent(card) else { return }
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
                 unconfirmedSend = UnconfirmedSend(
                     payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
                 )
                 setOutcome(outcome, for: card)
                 if outcome == .failed { report(error) }
             case let terminal:
-                // Recorded even when a newer card has replaced this one, so the outcome is not
-                // silently lost; only the visible card/status line is guarded, so a newer card's
-                // status is never stomped by this stale send.
+                // A newer card can have replaced this one while the send was in flight (same
+                // guard the offline/failed/rateLimited branch above already applies). Bail out
+                // before touching the outcome slot or the status line: this stale send's outcome
+                // must not land on the new card's outcome slot (wrong id) or stomp whatever
+                // status the new card has already set. Still clear the .sending placeholder this
+                // call wrote at the top if it's still ours, or it would linger forever.
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
                 setOutcome(terminal, for: card)
-                guard isCurrent(card) else { return }
                 clearCard(card)
                 statusLine = terminal.statusText ?? statusLine
                 statusKind = terminal == .authRequired ? .authFailed : .requestInvalid
