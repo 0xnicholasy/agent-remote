@@ -231,8 +231,22 @@ export class DeviceRegistry {
    * rolls back on a failed persist, for the same reasons as `revoke` above: an operator command
    * (the CLI's `projects allow`/`projects deny`) writes devices.json directly, and a caller must
    * never observe a device as authorized for a project set that did not reach disk.
+   *
+   * The reload only protects *other* records from the whole-map rewrite; this device's array is
+   * overwritten wholesale with `projects`. A caller that derives `projects` from a `get()` made
+   * outside the lock races another writer and loses one of the two changes, so read-modify-write
+   * callers (add one project, remove one project) must use `updateAllowedProjects` instead.
    */
   setAllowedProjects(deviceId: string, projects: string[]): void {
+    this.updateAllowedProjects(deviceId, () => projects);
+  }
+
+  /**
+   * Read-modify-write on `allowedProjects` under the file lock: `update` receives the array as
+   * reloaded from disk inside the lock, and its result is stored deduped and sorted. Same
+   * unknown-device no-op and rollback-on-failed-persist contract as `setAllowedProjects`.
+   */
+  updateAllowedProjects(deviceId: string, update: (current: readonly string[]) => string[]): void {
     this.locked(() => {
       this.reloadIfChanged();
       const record = this.devices.get(deviceId);
@@ -240,7 +254,7 @@ export class DeviceRegistry {
         return;
       }
       const previousAllowedProjects = record.allowedProjects;
-      record.allowedProjects = [...new Set(projects)].sort();
+      record.allowedProjects = [...new Set(update(previousAllowedProjects))].sort();
       try {
         this.persist();
       } catch (cause) {

@@ -138,6 +138,37 @@ describe("DeviceRegistry", () => {
     expect(reader.get(record.deviceId)?.allowedProjects).toEqual(["prj_a", "prj_b"]);
   });
 
+  test("setAllowedProjects replaces the list wholesale, ignoring what was there", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ allowedProjects: ["prj_old"] });
+
+    const writer = DeviceRegistry.load(filePath);
+    writer.register(record);
+    writer.setAllowedProjects(record.deviceId, ["prj_new"]);
+
+    const reader = DeviceRegistry.load(filePath);
+    expect(reader.get(record.deviceId)?.allowedProjects).toEqual(["prj_new"]);
+  });
+
+  test("updateAllowedProjects from a registry holding a stale snapshot keeps a change another registry made in between", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ allowedProjects: ["prj_b", "prj_keep"] });
+
+    const a = DeviceRegistry.load(filePath);
+    a.register(record);
+    // B loads now and holds ["prj_b", "prj_keep"] in memory while A writes underneath it.
+    const b = DeviceRegistry.load(filePath);
+    expect(b.get(record.deviceId)?.allowedProjects).toEqual(["prj_b", "prj_keep"]);
+
+    a.updateAllowedProjects(record.deviceId, (current) => [...current, "prj_a"]);
+    b.updateAllowedProjects(record.deviceId, (current) => current.filter((id) => id !== "prj_b"));
+
+    const reader = DeviceRegistry.load(filePath);
+    expect(reader.get(record.deviceId)?.allowedProjects).toEqual(["prj_a", "prj_keep"]);
+  });
+
   test("atomic write leaves no temp file behind", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");

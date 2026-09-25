@@ -470,11 +470,7 @@ async function runProjectsAllow(args: string[], deps: CliDeps): Promise<number> 
 
   const ok = await applyVerified(
     deps,
-    (fresh) => {
-      const current = fresh.get(deviceId);
-      const base = current !== undefined ? current.allowedProjects : [];
-      fresh.setAllowedProjects(deviceId, [...base, projectId]);
-    },
+    (fresh) => fresh.updateAllowedProjects(deviceId, (current) => [...current, projectId]),
     (record) => record !== undefined && record.allowedProjects.includes(projectId),
     deviceId,
   );
@@ -518,14 +514,7 @@ async function runProjectsDeny(args: string[], deps: CliDeps): Promise<number> {
 
   const ok = await applyVerified(
     deps,
-    (fresh) => {
-      const current = fresh.get(deviceId);
-      const base = current !== undefined ? current.allowedProjects : [];
-      fresh.setAllowedProjects(
-        deviceId,
-        base.filter((id) => id !== projectId),
-      );
-    },
+    (fresh) => fresh.updateAllowedProjects(deviceId, (current) => current.filter((id) => id !== projectId)),
     (record) => record !== undefined && !record.allowedProjects.includes(projectId),
     deviceId,
   );
