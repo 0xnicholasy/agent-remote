@@ -631,6 +631,42 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.awaitingLocalTurnStart, "turnStarted answers the local send; the flag must not stick")
     }
 
+    /// R-016: a failed cancel reports through the shared report() path; that must not clear the
+    /// wait for a prompt this Watch already sent, or its turnStarted would no longer be claimed.
+    func testCancelFailureKeepsAwaitingLocalTurnStart() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        let sentPrompt = await store.sendPrompt("go")
+        XCTAssertTrue(sentPrompt)
+        XCTAssertTrue(store.awaitingLocalTurnStart)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.cancel()
+
+        XCTAssertTrue(store.awaitingLocalTurnStart, "a cancel failure must not end the wait for this Watch's own turn")
+    }
+
+    /// R-017: dictation with no session whose session creation fails sent nothing, so it must
+    /// report false rather than claiming the text went somewhere.
+    func testSubmitDictationReturnsFalseWhenSessionCreationFails() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+
+        let sent = await store.submitDictation("go", expecting: .newPrompt)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertFalse(calls.contains { if case .promptSend = $0.payload { true } else { false } }, "no prompt may be sent")
+    }
+
     /// R-001: a failed prompt send must not leave the Watch believing its own turn is still on
     /// the way, or a later unrelated turnStarted would be adopted by a Stop dialog.
     func testSendPromptFailureClearsAwaitingLocalTurnStart() async throws {

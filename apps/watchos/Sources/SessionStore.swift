@@ -626,7 +626,9 @@ final class SessionStore {
         }
     }
 
-    func sendPrompt(_ text: String) async {
+    /// Returns whether the prompt was sent (a refused, empty or failed send returns false).
+    @discardableResult
+    func sendPrompt(_ text: String) async -> Bool {
         // The bridge rejects any prompt.send while a turn is already running (409). Refusing
         // here, before turnState/currentTurnId/awaitingLocalTurnStart are touched, keeps those
         // untouched too -- a rejected send must not hide the Stop button while the turn it
@@ -634,13 +636,13 @@ final class SessionStore {
         guard !canCancelTurn else {
             statusLine = "Turn in progress. Stop it or wait."
             statusKind = .error
-            return
+            return false
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         var target = sessionId
         if target == nil { target = await createSession() }
-        guard let target else { return }
+        guard let target else { return false }
         turnState = .thinking
         // The real turn id is not known until turnStarted arrives; clearing it here (rather
         // than leaving the previous turn's id) stops a Stop-turn dialog opened in this window
@@ -650,8 +652,13 @@ final class SessionStore {
         localResolvedTurnId = nil
         do {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
+            return true
         } catch {
+            // Only this send's own failure ends the wait for its turn; report() is shared with
+            // decide() and cancel(), whose failures must not clear it.
+            awaitingLocalTurnStart = false
             report(error)
+            return false
         }
     }
 
@@ -938,12 +945,9 @@ final class SessionStore {
             await answer(text: text)
             return true
         case .newPrompt:
-            // sendPrompt() applies the R-010 guard itself (and sets statusLine/statusKind when
-            // it refuses); captured here only so this call can report whether the text actually
-            // went anywhere.
-            let refused = canCancelTurn
-            await sendPrompt(text)
-            return !refused
+            // sendPrompt() applies the R-010 guard itself and reports whether the text was
+            // actually sent, including when session creation fails first.
+            return await sendPrompt(text)
         }
     }
 
@@ -953,7 +957,6 @@ final class SessionStore {
 
     private func report(_ error: any Error) {
         turnState = .error
-        awaitingLocalTurnStart = false
         statusLine = "\(error)"
         statusKind = .error
     }
