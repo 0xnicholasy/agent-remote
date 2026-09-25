@@ -113,6 +113,8 @@ final class CoreScreensUITests: XCTestCase {
             XCTContext.runActivity(named: "already paired from a prior simulator run") { _ in }
             app.swipeUp()
             XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render for an already-paired launch")
+            relaunchToSettings()
+            XCTAssertFalse(app.buttons["onboarding-next-1"].exists, "a paired Watch must not show onboarding after relaunch")
             let pairLink = labeled("Pair Watch")
             reveal(pairLink)
             XCTAssertTrue(pairedIndicator.exists, "expected pairing to remain intact across relaunch")

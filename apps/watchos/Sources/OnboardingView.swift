@@ -12,17 +12,33 @@ struct OnboardingView: View {
     @State private var step: Step = .macSetup
     @State private var isConnecting = false
 
+    /// Same parser `reconnect()` feeds `hostText` through, so "valid" here means exactly what
+    /// "valid" means once the value is actually used to connect.
+    private var isHostValid: Bool {
+        BridgeClient.parseBaseURL(store.hostText) != nil
+    }
+
     var body: some View {
         NavigationStack {
             switch step {
             case .macSetup: macSetupStep
             case .hostAddress: hostAddressStep
+                .toolbar { backButton { step = .macSetup } }
             case .pairingCode:
                 // Reused as-is: a successful pair() flips store.paired and RootView swaps this
                 // whole view out for the TabView, so PairingView's own dismiss() has nothing
                 // left to dismiss.
                 PairingView()
+                    .toolbar { backButton { step = .hostAddress } }
             }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func backButton(action: @escaping () -> Void) -> some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("Back", action: action)
+                .accessibilityIdentifier("onboarding-back-\(step == .hostAddress ? 2 : 3)")
         }
     }
 
@@ -50,9 +66,16 @@ struct OnboardingView: View {
             Section {
                 TextField("192.168.1.20:8787", text: Bindable(store).hostText)
                     .accessibilityIdentifier("onboarding-host")
-                Text("Enter the address shown on your Mac.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if store.hostText.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Text("Enter the address shown on your Mac.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if !isHostValid {
+                    Text("That address doesn't look right.")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("onboarding-host-error")
+                }
             }
             Section {
                 Button("Next") {
@@ -63,7 +86,7 @@ struct OnboardingView: View {
                         step = .pairingCode
                     }
                 }
-                .disabled(isConnecting || store.hostText.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(isConnecting || !isHostValid)
                 .accessibilityIdentifier("onboarding-next-2")
                 if isConnecting {
                     ProgressView()

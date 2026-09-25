@@ -17,9 +17,29 @@ struct DeviceCredential: Sendable, Equatable {
 /// Storage seam for `DeviceCredential` so tests can substitute an in-memory store in place of
 /// the Keychain.
 protocol CredentialStore: Sendable {
-    func load() -> DeviceCredential?
+    func loadResult() -> CredentialLoadResult
     func save(_ credential: DeviceCredential) throws
     func clear() throws
+}
+
+/// The outcome of reading the stored credential. Kept distinct from a plain `DeviceCredential?`
+/// so a caller can tell "no credential exists yet" (`.notFound`, e.g. `errSecItemNotFound`)
+/// apart from "the read or decode failed" (`.error`) -- the former means genuinely unpaired,
+/// the latter must not be folded into "not paired" (see E-002: a transient Keychain read error
+/// must not misroute a paired user to onboarding or invite a re-pair over a valid credential).
+enum CredentialLoadResult: Sendable {
+    case found(DeviceCredential)
+    case notFound
+    case error(String)
+}
+
+extension CredentialStore {
+    /// Convenience for callers (tests included) that only need "is there a credential", not the
+    /// found/notFound/error distinction `loadResult()` provides.
+    func load() -> DeviceCredential? {
+        if case .found(let credential) = loadResult() { return credential }
+        return nil
+    }
 }
 
 /// Surfaces a Keychain write/delete failure instead of letting it be swallowed, so a caller
@@ -51,25 +71,30 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
         var baseURL: String
     }
 
-    func load() -> DeviceCredential? {
+    func loadResult() -> CredentialLoadResult {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        if status == errSecItemNotFound { return .notFound }
+        guard status == errSecSuccess, let data = result as? Data else {
+            return .error("Keychain read failed (OSStatus \(status)).")
+        }
         guard let wire = try? JSONDecoder().decode(Wire.self, from: data),
               let keyData = Data(hexEncoded: wire.deviceKeyHex),
               let url = URL(string: wire.baseURL)
-        else { return nil }
-        return DeviceCredential(
+        else {
+            return .error("Stored device credential could not be decoded.")
+        }
+        return .found(DeviceCredential(
             deviceId: wire.deviceId,
             keyId: wire.keyId,
             deviceKeyData: keyData,
             bridgeId: wire.bridgeId,
             baseURL: url
-        )
+        ))
     }
 
     func save(_ credential: DeviceCredential) throws {
@@ -121,7 +146,7 @@ final class InMemoryCredentialStore: CredentialStore, @unchecked Sendable {
         stored = initial
     }
 
-    func load() -> DeviceCredential? { stored }
+    func loadResult() -> CredentialLoadResult { stored.map(CredentialLoadResult.found) ?? .notFound }
     func save(_ credential: DeviceCredential) { stored = credential }
     func clear() { stored = nil }
 }

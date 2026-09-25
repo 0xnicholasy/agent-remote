@@ -184,6 +184,16 @@ protocol BridgeClientProtocol: Sendable {
     func setBaseURL(_ url: URL) async
     func pair(code: String, deviceName: String) async throws
     func isPaired() async -> Bool
+    /// Whether the last credential lookup behind `isPaired()` failed to read (a Keychain error),
+    /// as opposed to finding no credential. Defaults to `false` via the extension below so
+    /// existing conformers (test fakes) need no change; only `BridgeClient`, which owns the real
+    /// Keychain-backed lookup, overrides it.
+    func pairingCheckFailed() async -> Bool
+    /// Re-reads the stored credential from the Keychain, so a Retry after a transient read
+    /// error (E-002) can actually clear `pairingCheckFailed()` instead of replaying the same
+    /// cached failure forever. Defaults to a no-op via the extension below so existing
+    /// conformers (test fakes) need no change; only `BridgeClient` overrides it.
+    func reloadCredential() async
     func events(after: Int, wait: Int) async throws -> EventsPage
     /// `commandId` is the idempotency key: resending the same payload with the same id gets the
     /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
@@ -200,6 +210,9 @@ extension BridgeClientProtocol {
     func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
         try await send(payload, sessionId: sessionId, commandId: UUID().uuidString, timestamp: BridgeClient.timestamp())
     }
+
+    func pairingCheckFailed() async -> Bool { false }
+    func reloadCredential() async {}
 }
 
 /// Talks to the Mac Agent Bridge over the HTTP long-poll baseline. One instance per app.
@@ -212,11 +225,22 @@ actor BridgeClient: BridgeClientProtocol {
     private let encoder = JSONEncoder()
     private let credentialStore: any CredentialStore
     private var credential: DeviceCredential?
+    /// Set when the credential lookup at init failed to read (rather than finding nothing), so
+    /// `isPaired()` staying `false` is not mistaken for "genuinely unpaired" (E-002).
+    private var credentialLoadFailed = false
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
         self.credentialStore = credentialStore
-        self.credential = credentialStore.load()
+        switch credentialStore.loadResult() {
+        case .found(let credential):
+            self.credential = credential
+        case .notFound:
+            self.credential = nil
+        case .error:
+            self.credential = nil
+            self.credentialLoadFailed = true
+        }
         let configuration = URLSessionConfiguration.ephemeral
         // Long polls hold the connection open for up to 30 seconds, so the request
         // timeout has to sit comfortably above the bridge's own ceiling.
@@ -236,6 +260,28 @@ actor BridgeClient: BridgeClientProtocol {
 
     func isPaired() -> Bool {
         credential != nil
+    }
+
+    func pairingCheckFailed() -> Bool {
+        credentialLoadFailed
+    }
+
+    /// Re-reads the stored credential from the Keychain (E-002). Lets a Retry after a
+    /// transient read error actually clear `credentialLoadFailed` instead of replaying the
+    /// same cached failure forever; actor isolation keeps this write serialized with every
+    /// other read/write of `credential` and `credentialLoadFailed`.
+    func reloadCredential() {
+        switch credentialStore.loadResult() {
+        case .found(let credential):
+            self.credential = credential
+            self.credentialLoadFailed = false
+        case .notFound:
+            self.credential = nil
+            self.credentialLoadFailed = false
+        case .error:
+            self.credential = nil
+            self.credentialLoadFailed = true
+        }
     }
 
     /// `POST /v1/pair`: the only signed-off route. Derives the device key locally from the

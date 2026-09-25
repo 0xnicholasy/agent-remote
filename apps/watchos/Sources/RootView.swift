@@ -8,7 +8,15 @@ struct RootView: View {
         // the paired TabView) for an instant while refreshPairedState() is still in flight.
         if !store.pairingChecked {
             ProgressView()
-        } else if !store.paired {
+        } else if store.pairingCheckFailed && !store.everPaired {
+            // The credential lookup failed to read (a Keychain error), not "no credential" --
+            // never fold this into onboarding: on a first launch that would show the 3-step
+            // walkthrough for what may be a perfectly valid, unreadable pairing (E-002).
+            PairingCheckFailedView()
+        } else if !store.paired && !store.everPaired {
+            // Gated on `everPaired`, not the live `paired`, so a paired->unpaired transition
+            // mid-session (e.g. Settings "Connect" reconnecting to an unpaired host) keeps the
+            // user on the TabView/Settings instead of ejecting them into onboarding (E-001).
             OnboardingView()
         } else {
             TabView {
@@ -17,6 +25,32 @@ struct RootView: View {
             }
             .tabViewStyle(.verticalPage)
         }
+    }
+}
+
+/// Shown only on a first launch whose credential lookup failed to read (see `pairingCheckFailed`
+/// on `SessionStore`). Offers a retry instead of silently routing to onboarding.
+private struct PairingCheckFailedView: View {
+    @Environment(SessionStore.self) private var store
+    @State private var retrying = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("Could not check pairing")
+                .font(.footnote)
+            Text("The stored pairing could not be read. Try again.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Button("Retry") {
+                Task {
+                    retrying = true
+                    await store.refreshPairedState()
+                    retrying = false
+                }
+            }
+            .disabled(retrying)
+        }
+        .padding()
     }
 }
 

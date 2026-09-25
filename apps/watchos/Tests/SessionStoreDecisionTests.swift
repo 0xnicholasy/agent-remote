@@ -23,6 +23,14 @@ actor FakeBridgeClient: BridgeClientProtocol {
     /// Backs `isPaired()`; defaults to `true` to preserve the previous hardcoded behavior for
     /// every test that does not care about pairing state.
     private var pairedFlag = true
+    /// Backs `pairingCheckFailed()`; simulates a Keychain read failure distinct from
+    /// `pairedFlag == false` ("no credential").
+    private var pairingCheckFailedFlag = false
+    /// What `reloadCredential()` applies to `pairedFlag`/`pairingCheckFailedFlag` the next time
+    /// it is called, then clears. Left `nil` it is a no-op, matching the protocol's default
+    /// extension -- so a test can prove a retry path actually calls `reloadCredential()` rather
+    /// than just re-reading the same cached flags (E-002).
+    private var reloadOutcome: (paired: Bool, pairingCheckFailed: Bool)?
     /// One page per call, returned in order; the last one repeats once the list is exhausted.
     private var eventsResults: [Result<EventsPage, any Error & Sendable>] = []
     private(set) var sentCalls: [RecordedSend] = []
@@ -57,6 +65,16 @@ actor FakeBridgeClient: BridgeClientProtocol {
         pairedFlag = value
     }
 
+    /// Simulates a Keychain read failure (as opposed to `setPaired(false)`, "no credential").
+    func setPairingCheckFailed(_ value: Bool) {
+        pairingCheckFailedFlag = value
+    }
+
+    /// Arms the next `reloadCredential()` call to apply this outcome, then clear itself.
+    func setReloadOutcome(paired: Bool, pairingCheckFailed: Bool) {
+        reloadOutcome = (paired, pairingCheckFailed)
+    }
+
     /// Queues the pages/errors `events(after:wait:)` returns on successive calls.
     func setEventsResults(_ results: [Result<EventsPage, any Error & Sendable>]) {
         eventsResults = results
@@ -89,6 +107,13 @@ actor FakeBridgeClient: BridgeClientProtocol {
         try pairResult.get()
     }
     func isPaired() async -> Bool { pairedFlag }
+    func pairingCheckFailed() async -> Bool { pairingCheckFailedFlag }
+    func reloadCredential() async {
+        guard let outcome = reloadOutcome else { return }
+        pairedFlag = outcome.paired
+        pairingCheckFailedFlag = outcome.pairingCheckFailed
+        reloadOutcome = nil
+    }
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
         eventsCallCount += 1
@@ -2567,6 +2592,98 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
         XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
         XCTAssertTrue(store.pairingChecked, "pairingChecked must be true even when pair() fails")
+    }
+
+    /// Regression for E-001: RootView must gate onboarding on `everPaired`, not the live
+    /// `paired`, so an in-session paired->unpaired transition (e.g. Settings "Connect"
+    /// reconnecting to a host with no stored pairing) does not eject the user back to
+    /// onboarding. If RootView reverted to switching on `!store.paired` alone, this would fail
+    /// because `everPaired` would never exist / never stay true once `paired` flips false.
+    func testEverPairedStaysTrueAfterPairedFlipsFalseMidSession() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(true)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        await store.refreshPairedState()
+        XCTAssertTrue(store.paired, "setup should leave the store paired")
+        XCTAssertTrue(store.everPaired, "becoming paired must set everPaired")
+
+        // Simulate reconnecting (Settings "Connect") to a host with no stored pairing.
+        await client.setPaired(false)
+        await store.refreshPairedState()
+
+        XCTAssertFalse(store.paired, "the live paired state must still reflect the new lookup")
+        XCTAssertTrue(store.everPaired, "everPaired must not be cleared by a later unpaired lookup")
+    }
+
+    /// Regression for E-002: a Keychain read failure (distinct from "no credential") must not be
+    /// folded into "not paired". If refreshPairedState() reverted to `paired = await
+    /// client.isPaired()` with no `pairingCheckFailed` branch, this would fail because `paired`
+    /// would be forced to false and `pairingCheckFailed` would never exist / stay false.
+    func testPairingCheckFailureDoesNotReportUnpaired() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(false)
+        await client.setPairingCheckFailed(true)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        await store.refreshPairedState()
+
+        XCTAssertFalse(store.paired, "a read failure must not be reported as a positive paired state either")
+        XCTAssertTrue(store.pairingCheckFailed, "a Keychain read failure must be surfaced, not silently treated as unpaired")
+        XCTAssertTrue(store.pairingChecked, "the lookup still resolved, even though it failed")
+
+        // Now simulate the read recovering while the device was, in fact, still paired: the
+        // earlier failure must not have latched paired = false permanently.
+        await client.setPaired(true)
+        await client.setPairingCheckFailed(false)
+        await store.refreshPairedState()
+
+        XCTAssertTrue(store.paired, "a later successful lookup must still be able to report paired")
+        XCTAssertFalse(store.pairingCheckFailed, "a successful lookup must clear the failure flag")
+    }
+
+    /// Regression for E-002's recovery half: Retry (PairingCheckFailedView -> refreshPairedState())
+    /// must actually re-read the Keychain, not just re-check the same cached failure. The fake's
+    /// `pairedFlag`/`pairingCheckFailedFlag` only change here via `reloadCredential()` (armed by
+    /// `setReloadOutcome`), so this fails if refreshPairedState() does not call it on retry.
+    func testRetryAfterPairingCheckFailureReloadsCredential() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(false)
+        await client.setPairingCheckFailed(true)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        await store.refreshPairedState()
+        XCTAssertTrue(store.pairingCheckFailed, "setup should leave the store reporting a read failure")
+        XCTAssertFalse(store.paired)
+
+        // The transient error has cleared: arm reloadCredential() to report a found credential.
+        // pairedFlag/pairingCheckFailedFlag are NOT touched directly -- only a retry that calls
+        // reloadCredential() can pick this up.
+        await client.setReloadOutcome(paired: true, pairingCheckFailed: false)
+
+        await store.refreshPairedState()
+
+        XCTAssertFalse(store.pairingCheckFailed, "a retry must reload the credential and clear the failure")
+        XCTAssertTrue(store.paired, "a retry that finds the credential must report paired")
+    }
+
+    /// Same recovery path, but the reload finds no credential at all: the retry must route to
+    /// onboarding (paired stays false, pairingCheckFailed clears) rather than keep replaying the
+    /// old read-error state.
+    func testRetryAfterPairingCheckFailureRoutesToOnboardingWhenNotFound() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(false)
+        await client.setPairingCheckFailed(true)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        await store.refreshPairedState()
+        XCTAssertTrue(store.pairingCheckFailed)
+
+        await client.setReloadOutcome(paired: false, pairingCheckFailed: false)
+        await store.refreshPairedState()
+
+        XCTAssertFalse(store.paired, "a genuine notFound on reload must not be reported as paired")
+        XCTAssertFalse(store.pairingCheckFailed, "a resolved notFound must clear the failure flag so onboarding shows")
     }
 
     // MARK: - Recovery (M3 slice 4)

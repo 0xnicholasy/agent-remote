@@ -214,6 +214,17 @@ final class SessionStore {
     /// hold a plain ProgressView instead of flashing onboarding for an instant before the
     /// stored credential is known.
     private(set) var pairingChecked = false
+    /// True once `paired` has been true at any point since launch, and never cleared again.
+    /// RootView gates onboarding on this (rather than the live `paired`) so a paired->unpaired
+    /// transition mid-session -- e.g. Settings "Connect" reconnecting to a host with no stored
+    /// pairing -- keeps the user on the TabView (and Settings) instead of ejecting them into
+    /// onboarding (E-001).
+    private(set) var everPaired = false
+    /// True when the last credential lookup failed to read rather than finding none (a
+    /// Keychain error). Kept distinct from "not paired" so a transient read failure does not
+    /// misroute a paired user to onboarding, or invite them to re-pair over a credential that
+    /// may still be valid (E-002).
+    private(set) var pairingCheckFailed = false
 
     var hostText: String {
         didSet { defaults.set(hostText, forKey: SessionStore.hostKey) }
@@ -264,7 +275,13 @@ final class SessionStore {
     }
 
     func refreshPairedState() async {
-        paired = await client.isPaired()
+        // A prior check found the Keychain read itself failed (E-002), so the cached
+        // credential/error state is stale: reload before re-checking, or a Retry from
+        // PairingCheckFailedView could never clear pairingCheckFailed.
+        if pairingCheckFailed {
+            await client.reloadCredential()
+        }
+        await applyPairedLookup(await client.isPaired())
         pairingChecked = true
     }
 
@@ -275,12 +292,31 @@ final class SessionStore {
         do {
             try await client.pair(code: code, deviceName: deviceName)
             paired = true
+            everPaired = true
+            pairingCheckFailed = false
             pairingChecked = true
             start()
         } catch {
-            paired = await client.isPaired()
+            await applyPairedLookup(await client.isPaired())
             pairingChecked = true
             pairingError = "\(error)"
+        }
+    }
+
+    /// Applies the result of an `isPaired()` lookup, distinguishing "no credential" from "the
+    /// lookup failed to read" (E-002) via `pairingCheckFailed()`. Shared by `refreshPairedState()`
+    /// and `pair()`'s failure path so both apply the same rule: a read failure must not be
+    /// folded into "not paired" and leaves `paired`/`everPaired` untouched.
+    private func applyPairedLookup(_ isPaired: Bool) async {
+        if isPaired {
+            paired = true
+            everPaired = true
+            pairingCheckFailed = false
+        } else if await client.pairingCheckFailed() {
+            pairingCheckFailed = true
+        } else {
+            paired = false
+            pairingCheckFailed = false
         }
     }
 
