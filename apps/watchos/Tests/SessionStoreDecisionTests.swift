@@ -645,6 +645,46 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, statusKindAfterCompletion)
     }
 
+    /// R-011 (ACCEPTED, downgraded): a retried cancel's success can land after reconnect() has
+    /// already bumped pollGeneration for the *same* bridge (discardLocalView(preservingUnconfirmedSend:
+    /// true) keeps unconfirmedCancel across the reconnect). That stale-generation success must not
+    /// clear unconfirmedCancel for a session the new generation later rebinds to, or a later cancel
+    /// for that same session would mint a fresh command id instead of replaying the still-pending one.
+    func testCancelStaleSuccessAfterReconnectDoesNotClearUnconfirmedCancel() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+        await store.cancel()
+        let c1 = (await client.sentCalls).last!.commandId
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(2)
+
+        let retryTask = Task { await store.cancel() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        // Same host (hostText is unchanged), so reconnect() takes the sameBridge path and keeps
+        // unconfirmedCancel while still bumping pollGeneration.
+        await store.reconnect()
+
+        await client.openSendGate()
+        await retryTask.value
+
+        // Rebind to the same session under the new generation.
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 10, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:03.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        await client.setSendResult(.failure(URLError(.timedOut)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 3)
+        XCTAssertEqual(calls[2].commandId, c1, "a stale generation's cancel success must not clear unconfirmedCancel for a session the new generation rebinds to")
+    }
+
     /// R-005/R-009 (ACCEPTED contract): a retryable cancel failure sets an error status and
     /// turnState (report(error)'s side effect). A later successful retry reuses the failed
     /// cancel's command id and clears `unconfirmedCancel` -- proven here by a further failure
