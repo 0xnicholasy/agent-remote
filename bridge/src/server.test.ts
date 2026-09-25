@@ -30,6 +30,7 @@ import {
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { deriveDeviceKey, pairingProof } from "./auth/pairing";
 import { signRequest } from "./auth/verify";
+import { runCli, type CliDeps } from "./cli";
 
 let bridge: Bridge;
 
@@ -1779,6 +1780,63 @@ describe("pairing", () => {
     );
     expect(afterRevoke.status).toBe(403);
     expect(await afterRevoke.json()).toEqual({ error: "device_revoked" });
+  });
+
+  // Same shape as the revoke regression above, but for the CLI's `projects deny`: a separate
+  // process editing devices.json directly must be visible to a running bridge without a restart.
+  test("projects deny run via the CLI over the same devices file is enforced without a bridge restart", async () => {
+    const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_eeeeeeeeeeeeeeee";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await bridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+
+    const createCommand: Command = {
+      commandId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: "prj_demo", provider: "mock" },
+    };
+    const beforeDeny = await bridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createCommand, deviceId, deviceKey }),
+    );
+    expect(beforeDeny.status).toBe(200);
+
+    const cliDeps: CliDeps = {
+      stateDir,
+      now: () => FIXED_NOW,
+      stdout: () => {},
+      stderr: () => {},
+      sleep: () => Promise.resolve(),
+      health: () => Promise.resolve(null),
+      env: {},
+      cwd: process.cwd(),
+    };
+    const cliExitCode = await runCli(["projects", "deny", deviceId, "prj_demo"], cliDeps);
+    expect(cliExitCode).toBe(0);
+
+    const afterDeny = await bridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: { ...createCommand, commandId: "ffffffff-ffff-4fff-8fff-ffffffffffff" },
+        deviceId,
+        deviceKey,
+      }),
+    );
+    expect(afterDeny.status).toBe(403);
+    expect(await afterDeny.json()).toEqual({ error: "project_not_allowed" });
   });
 });
 

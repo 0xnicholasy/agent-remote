@@ -122,6 +122,21 @@ describe("DeviceRegistry", () => {
     expect(reader.get(record.deviceId)?.revokedAt).toBe(revokedAt.toISOString());
   });
 
+  test("setAllowedProjects persists a deduped, sorted list and is visible to a second registry over the same file", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord();
+
+    const writer = DeviceRegistry.load(filePath);
+    writer.register(record);
+    writer.setAllowedProjects(record.deviceId, ["prj_b", "prj_a", "prj_b"]);
+
+    expect(writer.get(record.deviceId)?.allowedProjects).toEqual(["prj_a", "prj_b"]);
+
+    const reader = DeviceRegistry.load(filePath);
+    expect(reader.get(record.deviceId)?.allowedProjects).toEqual(["prj_a", "prj_b"]);
+  });
+
   test("atomic write leaves no temp file behind", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");

@@ -189,6 +189,28 @@ export class DeviceRegistry {
   }
 
   /**
+   * Replaces `allowedProjects` with a deduped, sorted copy of `projects`. Reloads first and
+   * rolls back on a failed persist, for the same reasons as `revoke` above: an operator command
+   * (the CLI's `projects allow`/`projects deny`) writes devices.json directly, and a caller must
+   * never observe a device as authorized for a project set that did not reach disk.
+   */
+  setAllowedProjects(deviceId: string, projects: string[]): void {
+    this.reloadIfChanged();
+    const record = this.devices.get(deviceId);
+    if (record === undefined) {
+      return;
+    }
+    const previousAllowedProjects = record.allowedProjects;
+    record.allowedProjects = [...new Set(projects)].sort();
+    try {
+      this.persist();
+    } catch (cause) {
+      record.allowedProjects = previousAllowedProjects;
+      throw cause;
+    }
+  }
+
+  /**
    * Two-tier write policy for this class: security-relevant state (register/revoke, above) writes
    * synchronously and rethrows on failure, so a caller never observes a device as registered or
    * un-revoked whose record did not reach disk. `lastSeenAt` below is cosmetic only — it feeds no
