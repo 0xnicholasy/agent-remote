@@ -78,6 +78,9 @@ final class CoreScreensUITests: XCTestCase {
         let cancel = button("Cancel turn")
         reveal(cancel)
         XCTAssertTrue(cancel.exists && cancel.isHittable, "expected Cancel turn on Settings")
+        // R-015: the button is disabled only while a send is in flight; with nothing sending it
+        // must be tappable, so an inverted or stuck `.disabled` binding fails here.
+        XCTAssertTrue(cancel.isEnabled, "Cancel turn must be enabled when nothing is sending")
         shot("4-settings")
     }
 
