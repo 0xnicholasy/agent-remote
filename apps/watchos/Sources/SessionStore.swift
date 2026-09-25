@@ -239,6 +239,11 @@ final class SessionStore {
     /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
     /// tell its own results are stale even when it was not cancelled in time to observe it.
     @ObservationIgnored private var pollGeneration = 0
+    /// Bumped on every refreshPairedState()/pair() so a paired-state lookup from a superseded
+    /// generation cannot overwrite a newer one: SessionStore is @MainActor but reentrant across
+    /// awaits, so a concurrent reloadCredential()/pair()/second refreshPairedState() can start
+    /// and finish while an earlier one is still suspended on `await client...`.
+    @ObservationIgnored private var pairGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
     /// Kept so a resolved approval can say what was decided, not only how.
@@ -275,13 +280,23 @@ final class SessionStore {
     }
 
     func refreshPairedState() async {
+        pairGeneration += 1
+        let generation = pairGeneration
         // A prior check found the Keychain read itself failed (E-002), so the cached
         // credential/error state is stale: reload before re-checking, or a Retry from
-        // PairingCheckFailedView could never clear pairingCheckFailed.
+        // PairingCheckFailedView could never clear pairingCheckFailed. Either branch is a
+        // single atomic actor call (PairingLookup), so there is no window between two reads
+        // for a concurrent pair()/refreshPairedState() to interleave into.
+        let lookup: PairingLookup
         if pairingCheckFailed {
-            await client.reloadCredential()
+            lookup = await client.reloadCredential()
+        } else {
+            lookup = await client.pairingLookup()
         }
-        await applyPairedLookup(await client.isPaired())
+        // A concurrent refreshPairedState()/pair() started after this one and may have already
+        // applied a newer result; this stale lookup must not overwrite it.
+        guard generation == pairGeneration else { return }
+        applyPairedLookup(lookup)
         pairingChecked = true
     }
 
@@ -289,32 +304,38 @@ final class SessionStore {
     /// stores the device credential and subsequent requests are signed.
     func pair(code: String, deviceName: String) async {
         pairingError = nil
+        pairGeneration += 1
+        let generation = pairGeneration
         do {
             try await client.pair(code: code, deviceName: deviceName)
+            guard generation == pairGeneration else { return }
             paired = true
             everPaired = true
             pairingCheckFailed = false
             pairingChecked = true
             start()
         } catch {
-            await applyPairedLookup(await client.isPaired())
-            pairingChecked = true
+            let lookup = await client.pairingLookup()
             pairingError = "\(error)"
+            guard generation == pairGeneration else { return }
+            applyPairedLookup(lookup)
+            pairingChecked = true
         }
     }
 
-    /// Applies the result of an `isPaired()` lookup, distinguishing "no credential" from "the
-    /// lookup failed to read" (E-002) via `pairingCheckFailed()`. Shared by `refreshPairedState()`
-    /// and `pair()`'s failure path so both apply the same rule: a read failure must not be
-    /// folded into "not paired" and leaves `paired`/`everPaired` untouched.
-    private func applyPairedLookup(_ isPaired: Bool) async {
-        if isPaired {
+    /// Applies a `PairingLookup`, distinguishing "no credential" from "the lookup failed to
+    /// read" (E-002). Shared by `refreshPairedState()` and `pair()`'s failure path so both apply
+    /// the same rule: a read failure must not be folded into "not paired" and leaves
+    /// `paired`/`everPaired` untouched.
+    private func applyPairedLookup(_ lookup: PairingLookup) {
+        switch lookup {
+        case .paired:
             paired = true
             everPaired = true
             pairingCheckFailed = false
-        } else if await client.pairingCheckFailed() {
+        case .checkFailed:
             pairingCheckFailed = true
-        } else {
+        case .notPaired:
             paired = false
             pairingCheckFailed = false
         }

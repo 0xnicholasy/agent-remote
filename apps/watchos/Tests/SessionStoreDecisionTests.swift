@@ -20,16 +20,23 @@ actor FakeBridgeClient: BridgeClientProtocol {
     /// Controls what `pair(code:deviceName:)` does; defaults to succeeding silently like the
     /// existing no-op did, so tests that never touch pairing are unaffected.
     private var pairResult: Result<Void, any Error & Sendable> = .success(())
-    /// Backs `isPaired()`; defaults to `true` to preserve the previous hardcoded behavior for
-    /// every test that does not care about pairing state.
+    /// Backs `pairingLookup()`; defaults to `.paired` to preserve the previous hardcoded
+    /// behavior for every test that does not care about pairing state.
     private var pairedFlag = true
-    /// Backs `pairingCheckFailed()`; simulates a Keychain read failure distinct from
-    /// `pairedFlag == false` ("no credential").
+    /// Simulates a Keychain read failure distinct from `pairedFlag == false` ("no credential").
     private var pairingCheckFailedFlag = false
+    /// Bumped on every `pairingLookup()`/`reloadCredential()` call so a test can pin a stale
+    /// call's result and assert it does not win a race against a later call (R1-001).
+    private(set) var lookupCallCount = 0
+    /// When set, the `pairingLookup()`/`reloadCredential()` call at this 1-based count suspends
+    /// until `openPairingGate()` is called, so a test can simulate one lookup resolving after a
+    /// second, newer one has already applied its result.
+    private var pairingGateAtCall: Int?
+    private var pairingGateContinuation: CheckedContinuation<Void, Never>?
     /// What `reloadCredential()` applies to `pairedFlag`/`pairingCheckFailedFlag` the next time
-    /// it is called, then clears. Left `nil` it is a no-op, matching the protocol's default
-    /// extension -- so a test can prove a retry path actually calls `reloadCredential()` rather
-    /// than just re-reading the same cached flags (E-002).
+    /// it is called, then clears. Left `nil` it is a no-op -- so a test can prove a retry path
+    /// actually calls `reloadCredential()` rather than just re-reading the same cached flags
+    /// (E-002).
     private var reloadOutcome: (paired: Bool, pairingCheckFailed: Bool)?
     /// One page per call, returned in order; the last one repeats once the list is exhausted.
     private var eventsResults: [Result<EventsPage, any Error & Sendable>] = []
@@ -59,7 +66,7 @@ actor FakeBridgeClient: BridgeClientProtocol {
         pairResult = result
     }
 
-    /// Sets what `isPaired()` reports, so a test can simulate "the credential store never
+    /// Sets what `pairingLookup()` reports, so a test can simulate "the credential store never
     /// got a credential" after a failed pair attempt.
     func setPaired(_ value: Bool) {
         pairedFlag = value
@@ -73,6 +80,33 @@ actor FakeBridgeClient: BridgeClientProtocol {
     /// Arms the next `reloadCredential()` call to apply this outcome, then clear itself.
     func setReloadOutcome(paired: Bool, pairingCheckFailed: Bool) {
         reloadOutcome = (paired, pairingCheckFailed)
+    }
+
+    /// Arms the `pairingLookup()`/`reloadCredential()` call at `callNumber` (1-based) to block
+    /// until `openPairingGate()` runs.
+    func gatePairingCall(_ callNumber: Int) {
+        pairingGateAtCall = callNumber
+    }
+
+    func openPairingGate() {
+        pairingGateContinuation?.resume()
+        pairingGateContinuation = nil
+    }
+
+    private func currentLookup() -> PairingLookup {
+        if pairedFlag { return .paired }
+        if pairingCheckFailedFlag { return .checkFailed }
+        return .notPaired
+    }
+
+    /// Suspends this call if it is the one armed by `gatePairingCall`, so a test can hold it
+    /// open while a second, later call resolves and applies its result first.
+    private func waitForPairingGateIfArmed() async {
+        lookupCallCount += 1
+        guard pairingGateAtCall == lookupCallCount else { return }
+        await withCheckedContinuation { continuation in
+            pairingGateContinuation = continuation
+        }
     }
 
     /// Queues the pages/errors `events(after:wait:)` returns on successive calls.
@@ -106,13 +140,26 @@ actor FakeBridgeClient: BridgeClientProtocol {
     func pair(code: String, deviceName: String) async throws {
         try pairResult.get()
     }
-    func isPaired() async -> Bool { pairedFlag }
-    func pairingCheckFailed() async -> Bool { pairingCheckFailedFlag }
-    func reloadCredential() async {
-        guard let outcome = reloadOutcome else { return }
-        pairedFlag = outcome.paired
-        pairingCheckFailedFlag = outcome.pairingCheckFailed
-        reloadOutcome = nil
+    func pairingLookup() async -> PairingLookup {
+        // Snapshot before the gate suspends, so a call that started with an old paired state
+        // but is held open by the gate still delivers that old snapshot once released -- the
+        // same shape as a real actor call whose result was computed before a concurrent,
+        // faster call changed state and applied its own newer result first.
+        let snapshot = currentLookup()
+        await waitForPairingGateIfArmed()
+        return snapshot
+    }
+
+    @discardableResult
+    func reloadCredential() async -> PairingLookup {
+        if let outcome = reloadOutcome {
+            pairedFlag = outcome.paired
+            pairingCheckFailedFlag = outcome.pairingCheckFailed
+            reloadOutcome = nil
+        }
+        let snapshot = currentLookup()
+        await waitForPairingGateIfArmed()
+        return snapshot
     }
 
     func events(after: Int, wait: Int) async throws -> EventsPage {
@@ -2684,6 +2731,39 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertFalse(store.paired, "a genuine notFound on reload must not be reported as paired")
         XCTAssertFalse(store.pairingCheckFailed, "a resolved notFound must clear the failure flag so onboarding shows")
+    }
+
+    /// Regression for R1-001: SessionStore is @MainActor but reentrant across awaits, so a
+    /// refreshPairedState() whose lookup is still in flight can be overtaken by a second, newer
+    /// refreshPairedState() that starts and finishes first. The first call's lookup result --
+    /// computed before the second call changed state, but delivered after it -- must not
+    /// overwrite the newer result once it finally resolves. Without the generation guard, this
+    /// fails because the stale "paired" snapshot from call #1 clobbers the newer "not paired"
+    /// state that call #2 already applied.
+    func testStalePairingLookupDoesNotOverwriteNewerResult() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(true)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        // Gate the first refreshPairedState()'s lookup (call #1) so it suspends after snapshotting
+        // "paired" but before delivering it.
+        await client.gatePairingCall(1)
+        let firstTask = Task { await store.refreshPairedState() }
+        while await client.lookupCallCount < 1 {
+            await Task.yield()
+        }
+
+        // A second, newer refreshPairedState() runs to completion first and finds "not paired".
+        await client.setPaired(false)
+        await store.refreshPairedState()
+        XCTAssertFalse(store.paired, "the second, newer lookup must win")
+        XCTAssertTrue(store.pairingChecked)
+
+        // Release the first (stale) lookup; it delivers its old "paired" snapshot late.
+        await client.openPairingGate()
+        await firstTask.value
+
+        XCTAssertFalse(store.paired, "a stale lookup delivered after a newer one must not overwrite its result")
     }
 
     // MARK: - Recovery (M3 slice 4)
