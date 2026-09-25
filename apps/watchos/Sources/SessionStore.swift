@@ -758,10 +758,14 @@ final class SessionStore {
         let timestamp = retry?.timestamp ?? BridgeClient.timestamp()
         do {
             try await client.send(payload, sessionId: target, commandId: commandId, timestamp: timestamp)
-            guard generation == pollGeneration else { return }
+            // Mirrors decide()'s isCurrent(card) guard: the session this cancel was sent for may
+            // have completed (or been superseded) while the send was in flight, in which case its
+            // resetSessionState() already cleared unconfirmedCancel/status correctly and this
+            // stale reply must not resurrect or stomp any of it.
+            guard generation == pollGeneration, target == sessionId else { return }
             unconfirmedCancel = nil
         } catch {
-            guard generation == pollGeneration else { return }
+            guard generation == pollGeneration, target == sessionId else { return }
             switch ActionOutcome.classify(error) {
             case .offline, .failed, .rateLimited, .unconfirmed:
                 unconfirmedCancel = UnconfirmedSend(

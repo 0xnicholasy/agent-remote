@@ -613,6 +613,164 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotEqual(calls[0].commandId, calls[1].commandId, "a terminal cancel failure must not keep a retryable command id")
     }
 
+    /// R-006: session.completed can land (via apply(), synchronously resetting the session
+    /// binding and turnState) while a cancel send for the old session is still in flight. When
+    /// that send then fails, the stale reply must not resurrect unconfirmedCancel for a session
+    /// that no longer exists, nor stomp the just-set completed turnState via report(error).
+    func testCancelDoesNotStompCompletedSessionAfterConcurrentCompletion() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+        await client.gateSendCall(1)
+
+        let cancelTask = Task { await store.cancel() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "session.completed",
+            "payload": { "reason": "completed" }
+        }
+        """))
+        XCTAssertNil(store.sessionId)
+        XCTAssertEqual(store.turnState, .completed)
+        let statusLineAfterCompletion = store.statusLine
+        let statusKindAfterCompletion = store.statusKind
+
+        await client.openSendGate()
+        await cancelTask.value
+
+        XCTAssertEqual(store.turnState, .completed, "a stale in-flight cancel failure must not stomp the completed turn state")
+        XCTAssertEqual(store.statusLine, statusLineAfterCompletion)
+        XCTAssertEqual(store.statusKind, statusKindAfterCompletion)
+    }
+
+    /// R-005/R-009 (ACCEPTED contract): a retryable cancel failure sets an error status and
+    /// turnState (report(error)'s side effect). A later successful retry reuses the failed
+    /// cancel's command id and clears `unconfirmedCancel` -- proven here by a further failure
+    /// minting a fresh command id instead of replaying the old one -- but it does NOT itself
+    /// clear the error status/turnState (R-005 is accepted, not fixed: a clearing flag was tried
+    /// and removed because it could wipe an unrelated live error). The stale error survives at
+    /// most one poll round trip: the next successful poll page unconditionally rewrites
+    /// statusLine/statusKind regardless of what set them.
+    func testCancelRetrySucceedsButErrorStatusClearsOnlyOnNextPollPage() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+
+        await store.cancel()
+        XCTAssertEqual(store.turnState, .error, "setup: the failed cancel must have written the error turnState")
+        XCTAssertEqual(store.statusKind, .error, "setup: the failed cancel must have written the error status")
+        let failedCommandId = (await client.sentCalls).last!.commandId
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let callsAfterRetry = await client.sentCalls
+        XCTAssertEqual(callsAfterRetry.count, 2)
+        XCTAssertEqual(callsAfterRetry[1].commandId, failedCommandId, "a successful retry must reuse the failed cancel's command id")
+        XCTAssertEqual(store.turnState, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error turnState")
+        XCTAssertEqual(store.statusKind, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error status")
+
+        // A further failure must mint a fresh command id, proving the successful retry cleared
+        // unconfirmedCancel rather than leaving the old (already-accepted) command id in place.
+        await client.setSendResult(.failure(URLError(.timedOut)))
+        await store.cancel()
+        let callsAfterSecondFailure = await client.sentCalls
+        XCTAssertEqual(callsAfterSecondFailure.count, 3)
+        XCTAssertNotEqual(callsAfterSecondFailure[2].commandId, failedCommandId, "unconfirmedCancel must have been cleared by the successful retry, so this failure mints a fresh command id")
+
+        // The next successful poll page unconditionally rewrites statusLine/statusKind, clearing
+        // the stale error within one round trip.
+        await client.setEventsResults([
+            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+        ])
+        store.start()
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertNotEqual(store.statusKind, .error, "the next successful poll page must clear the stale error status")
+    }
+
+    /// R-007: cancel() shares isSending with decide(); a decide() send in flight must make a
+    /// concurrent cancel() tap a no-op, not a second command.
+    func testCancelIsNoOpWhileDecideInFlight() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(store.isSending)
+
+        await store.cancel()
+
+        await client.openSendGate()
+        await approveTask.value
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 1, "a cancel() tap while decide() is sending must not add a second command")
+        if case .approvalAccept = calls[0].payload {} else {
+            XCTFail("the one command sent must be decide()'s, not cancel()'s")
+        }
+    }
+
+    /// R-007 (reverse): a cancel() send in flight must make a concurrent decide() tap a no-op.
+    func testDecideIsNoOpWhileCancelInFlight() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let cancelTask = Task { await store.cancel() }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(store.isSending)
+
+        await store.approve()
+
+        await client.openSendGate()
+        await cancelTask.value
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 1, "a decide() tap while cancel() is sending must not add a second command")
+        if case .sessionCancel = calls[0].payload {} else {
+            XCTFail("the one command sent must be cancel()'s, not decide()'s")
+        }
+        XCTAssertNotNil(store.pendingApproval, "the no-op approve() must leave the card in place")
+    }
+
+    /// R-008: resetSessionState()'s explicit `unconfirmedCancel = nil` must clear it even when
+    /// the new session reuses the same sessionId the stale unconfirmedCancel was recorded
+    /// under -- the sessionId-mismatch guard in cancel() alone would not catch this case.
+    func testResetSessionStateClearsUnconfirmedCancelForReusedSessionId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+
+        await store.cancel()
+        let staleCommandId = (await client.sentCalls).last!.commandId
+
+        // Session completes and a new session reuses the exact same id ("sess_1").
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:02:00.000Z", "type": "session.completed",
+            "payload": { "reason": "completed" }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 4, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:03:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        XCTAssertEqual(store.sessionId, "sess_1")
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[1].commandId, staleCommandId, "a fresh session reusing the same id must not replay the stale cancel's command id")
+    }
+
     /// A different choice after an offline send is a different command, so it must not reuse
     /// the id (the bridge would refuse it as a conflict).
     func testOfflineThenDifferentChoiceUsesNewCommandId() async throws {
