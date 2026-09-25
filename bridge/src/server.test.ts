@@ -1118,6 +1118,13 @@ describe("projectIdFor", () => {
     expect(first).toMatch(/^prj_app_[0-9a-f]{8}$/);
     expect(second).toMatch(/^prj_app_[0-9a-f]{8}$/);
   });
+
+  test("equivalent paths normalize to the same id", () => {
+    const base = projectIdFor("/a/b");
+    expect(projectIdFor("/a/b/")).toBe(base);
+    expect(projectIdFor("/a/x/../b")).toBe(base);
+    expect(projectIdFor("/a//b")).toBe(base);
+  });
 });
 
 describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {

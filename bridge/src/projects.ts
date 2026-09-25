@@ -4,11 +4,15 @@ import { digest, type Project } from "@agentremote/protocol";
 
 // Derives a stable project id from an absolute directory: the basename for readability, plus
 // a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
-// both named "app") never collide.
+// both named "app") never collide. The path is normalized first (collapsing "..", "." and
+// repeated slashes, and dropping a trailing slash) so equivalent paths like "/a/b/",
+// "/a/x/../b" and "/a//b" all yield the same id; symlinked paths are not resolved, so a
+// symlink and its target still get distinct ids.
 export function projectIdFor(dir: string): string {
-  const base = dir.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
+  const normalized = path.normalize(dir).replace(/(?<=.)\/+$/, "");
+  const base = normalized.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
   const slug = base.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
-  const suffix = digest(dir).replace("sha256:", "").slice(0, 8);
+  const suffix = digest(normalized).replace("sha256:", "").slice(0, 8);
   return `prj_${slug}_${suffix}`;
 }
 
@@ -39,11 +43,14 @@ export function resolveProjectIds(env: NodeJS.ProcessEnv, cwd: string): Project[
       }
     }
     const dirs = parsedDirs.length > 0 ? parsedDirs : [cwd];
-    return dirs.map((dir) => ({
-      id: projectIdFor(dir),
-      name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir,
-      path: dir,
-    }));
+    return dirs.map((dir) => {
+      const normalized = path.normalize(dir).replace(/(?<=.)\/+$/, "");
+      return {
+        id: projectIdFor(normalized),
+        name: normalized.split("/").filter((p) => p.length > 0).at(-1) ?? normalized,
+        path: normalized,
+      };
+    });
   }
   return [{ id: "prj_demo", name: "demo", path: cwd }];
 }

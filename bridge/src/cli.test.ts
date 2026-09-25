@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
+import { PairingCodeStore } from "./auth/pairing";
 import { runCli, type CliDeps, type CliHealth } from "./cli";
 import { projectIdFor } from "./projects";
 
@@ -103,6 +104,43 @@ describe("pair", () => {
     expect(exitCode).toBe(1);
     expect(deps.stderrLines).toContain("Pairing code expired before a device paired.");
   });
+
+  test("stops waiting when a second pair run replaces pairing.json before a device pairs with our code", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const pairingFilePath = join(stateDir, "pairing.json");
+    const deps = makeDeps({
+      sleep: async () => {
+        // Stands in for a second `pair` run (or a bridge restart) minting its own code and
+        // overwriting pairing.json, then a device enrolling under that new code -- all while
+        // this invocation is still waiting on its own, now-superseded code.
+        const otherStore = new PairingCodeStore(pairingFilePath);
+        otherStore.mint(new Date("2026-09-25T00:00:05.000Z"));
+        const registry = DeviceRegistry.load(devicesFilePath);
+        registry.register(sampleRecord({ pairedAt: new Date("2026-09-25T00:00:06.000Z").toISOString() }));
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines).toContain(
+      "pairing code was replaced by another pair run or a bridge restart; re-run pair",
+    );
+    expect(deps.stdoutLines.some((line) => line.includes(sampleRecord().deviceId))).toBe(false);
+  });
+
+  test("reports used up when the pairing code is burned without a device ever registering", async () => {
+    const deps = makeDeps({
+      sleep: async () => {
+        rmSync(join(stateDir, "pairing.json"), { force: true });
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines).toContain("Pairing code was used up before a device paired.");
+  });
 });
 
 describe("devices", () => {
@@ -141,6 +179,76 @@ describe("revoke", () => {
     expect(exitCode).toBe(0);
     const reloaded = DeviceRegistry.load(devicesFilePath);
     expect(reloaded.get(sampleRecord().deviceId)?.revokedAt).not.toBeNull();
+  });
+
+  test("retries and succeeds when a concurrent writer clobbers the revoke exactly once", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord());
+    const original = readFileSync(devicesFilePath, "utf8");
+    let clobbered = false;
+    const deps = makeDeps({
+      sleep: async () => {
+        if (!clobbered) {
+          clobbered = true;
+          // Simulate a second CLI invocation reverting our just-persisted revoke before this
+          // process re-reads devices.json to confirm it.
+          writeFileSync(devicesFilePath, original, { mode: 0o600 });
+        }
+      },
+    });
+
+    const exitCode = await runCli(["revoke", sampleRecord().deviceId], deps);
+
+    expect(exitCode).toBe(0);
+    const reloaded = DeviceRegistry.load(devicesFilePath);
+    expect(reloaded.get(sampleRecord().deviceId)?.revokedAt).not.toBeNull();
+  });
+
+  test("exits 1 when every retry is clobbered by a concurrent writer", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord());
+    const original = readFileSync(devicesFilePath, "utf8");
+    const deps = makeDeps({
+      sleep: async () => {
+        writeFileSync(devicesFilePath, original, { mode: 0o600 });
+      },
+    });
+
+    const exitCode = await runCli(["revoke", sampleRecord().deviceId], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines).toContain("devices.json was rewritten concurrently; state not confirmed, re-run");
+    const reloaded = DeviceRegistry.load(devicesFilePath);
+    expect(reloaded.get(sampleRecord().deviceId)?.revokedAt).toBeNull();
+  });
+
+  test("exits 1 when devices.json can't be persisted", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord());
+    const deps = makeDeps();
+
+    chmodSync(stateDir, 0o500);
+    try {
+      const exitCode = await runCli(["revoke", sampleRecord().deviceId], deps);
+      expect(exitCode).toBe(1);
+      expect(deps.stderrLines.some((line) => line.includes(devicesFilePath))).toBe(true);
+    } finally {
+      chmodSync(stateDir, 0o700);
+    }
+  });
+
+  test("a corrupt devices.json exits 1", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    writeFileSync(devicesFilePath, "{not valid json", { mode: 0o600 });
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["revoke", "dev_unknown"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
   });
 });
 
@@ -196,6 +304,74 @@ describe("projects", () => {
     const reloaded = DeviceRegistry.load(devicesFilePath);
     expect(reloaded.get(sampleRecord().deviceId)?.allowedProjects).toEqual(["prj_nonexistent"]);
   });
+
+  test("deny of a project not allowed for the device exits 1 and leaves devices.json unchanged", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord({ allowedProjects: ["prj_demo"] }));
+    const before = readFileSync(devicesFilePath, "utf8");
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "deny", sampleRecord().deviceId, "prj_other"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes("prj_other") && line.includes("not allowed"))).toBe(true);
+    expect(readFileSync(devicesFilePath, "utf8")).toBe(before);
+  });
+
+  test("allow exits 1 when devices.json can't be persisted", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord({ allowedProjects: [] }));
+    const deps = makeDeps();
+
+    chmodSync(stateDir, 0o500);
+    try {
+      const exitCode = await runCli(["projects", "allow", sampleRecord().deviceId, "prj_nonexistent", "--force"], deps);
+      expect(exitCode).toBe(1);
+      expect(deps.stderrLines.some((line) => line.includes(devicesFilePath))).toBe(true);
+    } finally {
+      chmodSync(stateDir, 0o700);
+    }
+  });
+
+  test("deny exits 1 when devices.json can't be persisted", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord({ allowedProjects: ["prj_other"] }));
+    const deps = makeDeps();
+
+    chmodSync(stateDir, 0o500);
+    try {
+      const exitCode = await runCli(["projects", "deny", sampleRecord().deviceId, "prj_other"], deps);
+      expect(exitCode).toBe(1);
+      expect(deps.stderrLines.some((line) => line.includes(devicesFilePath))).toBe(true);
+    } finally {
+      chmodSync(stateDir, 0o700);
+    }
+  });
+
+  test("allow: a corrupt devices.json exits 1", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    writeFileSync(devicesFilePath, "{not valid json", { mode: 0o600 });
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "allow", "dev_unknown", "prj_nonexistent", "--force"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
+  });
+
+  test("deny: a corrupt devices.json exits 1", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    writeFileSync(devicesFilePath, "{not valid json", { mode: 0o600 });
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "deny", "dev_unknown", "prj_nonexistent"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
+  });
 });
 
 describe("corrupt state", () => {
@@ -205,6 +381,17 @@ describe("corrupt state", () => {
     const deps = makeDeps();
 
     const exitCode = await runCli(["devices"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
+  });
+
+  test("pair: a corrupt devices.json exits 1 while waiting", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    writeFileSync(devicesFilePath, "{not valid json", { mode: 0o600 });
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(1);
     expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
