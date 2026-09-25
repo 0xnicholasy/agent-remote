@@ -206,10 +206,11 @@ mid-write cannot truncate the registry.
 Every reload -> mutate -> write of `devices.json` (register, revoke, project allow/deny, the
 throttled `lastSeenAt` write) runs under an exclusive `devices.json.lock` holding the writer's pid;
 the bridge and the operator CLI both honour it, so neither can overwrite the other's write with a
-stale copy. A lock is taken over only when its pid is dead, or when it is empty or unreadable and
-older than 10 s; a live pid's lock is never taken over. Otherwise the CLI waits up to 2 s and the
-bridge up to 250 ms, then fails; the `lastSeenAt` write does not wait and just skips. If the pid in
-a lock that will not clear is not an agent-remote process, remove the lock file by hand.
+stale copy. The lock is never taken over: a lock that exists is held, full stop. The CLI waits up
+to 2 s and the bridge up to 250 ms, then fails; the `lastSeenAt` write does not wait and just
+skips. A lock left behind by a writer that crashed mid-write is removed automatically the next
+time the bridge starts, if the pid it names is no longer running; otherwise remove it by hand — the
+error names the pid and says whether that pid is still running.
 
 A newly paired device is granted every action, and every project the bridge currently exposes. The
 registry format carries per-device narrowing so a Mac control surface can tighten it later (M4)

@@ -430,7 +430,7 @@ describe("DeviceRegistry", () => {
     writeFileSync(join(dir, "devices.json.lock"), String(process.pid), "utf8");
 
     expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
-      /locked by pid/,
+      new RegExp(`held by running pid ${process.pid}`),
     );
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     registry.touch(record.deviceId, new Date("2026-09-20T12:01:00.000Z"));
@@ -440,7 +440,8 @@ describe("DeviceRegistry", () => {
     expect(registry.get(record.deviceId)?.revokedAt).toBeNull();
   });
 
-  // F-23: age alone never makes a lock naming a live pid stale (a paused or slow holder).
+  // F-23: age never matters. A lock naming a live pid is not taken over however old its mtime,
+  // because the lock is never taken over at all: it is held until its owner unlinks it.
   test("a devices.json.lock held by a live pid is not taken over however old its mtime", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");
@@ -455,7 +456,7 @@ describe("DeviceRegistry", () => {
     utimesSync(lockPath, anHourAgo, anHourAgo);
 
     expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
-      new RegExp(`locked by pid ${process.pid} at .*devices\\.json\\.lock.*remove .* manually`),
+      new RegExp(`held by running pid ${process.pid}`),
     );
     expect(readFileSync(filePath, "utf8")).toBe(before);
     expect(readFileSync(lockPath, "utf8")).toBe(String(process.pid));
@@ -483,7 +484,25 @@ describe("DeviceRegistry", () => {
     expect(readFileSync(filePath, "utf8")).toBe(before);
   });
 
-  test("a devices.json.lock left by a dead pid is taken over and released", () => {
+  test("a devices.json.lock naming a dead pid is NOT taken over: it is only cleared at bridge startup", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const lockPath = join(dir, "devices.json.lock");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath, { lockTimeoutMs: 50 });
+    registry.register(record);
+    const before = readFileSync(filePath, "utf8");
+
+    writeFileSync(lockPath, "999999", "utf8");
+
+    expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
+      /pid 999999, which is not running/,
+    );
+    expect(readFileSync(filePath, "utf8")).toBe(before);
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("an empty devices.json.lock is reported as naming no pid", () => {
     const dir = tempDir();
     const filePath = join(dir, "devices.json");
     const lockPath = join(dir, "devices.json.lock");
@@ -491,11 +510,46 @@ describe("DeviceRegistry", () => {
     const registry = DeviceRegistry.load(filePath, { lockTimeoutMs: 50 });
     registry.register(record);
 
-    writeFileSync(lockPath, "999999", "utf8");
-    registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"));
+    writeFileSync(lockPath, "", "utf8");
 
-    expect(DeviceRegistry.load(filePath).get(record.deviceId)?.revokedAt).toBe("2026-09-20T12:30:00.000Z");
-    expect(existsSync(lockPath)).toBe(false);
+    expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
+      /names no pid/,
+    );
+  });
+
+  // Isolates a release-only failure (the write itself succeeds; only the unlink that releases the
+  // lock fails) by mocking unlinkSync rather than chmod'ing the state dir: chmod would also break
+  // the persist inside the same locked callback, which would throw for an unrelated reason and
+  // leave this regression untested.
+  test("a lock that cannot be unlinked on release throws instead of wedging silently", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const lockPath = join(dir, "devices.json.lock");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+    const before = readFileSync(filePath, "utf8");
+
+    const realUnlinkSync = fs.unlinkSync;
+    const unlinkSpy = spyOn(fs, "unlinkSync").mockImplementation((path: fs.PathLike) => {
+      if (path === lockPath) {
+        const error = new Error("EACCES: permission denied, unlink") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realUnlinkSync(path);
+    });
+    try {
+      expect(() =>
+        registry.updateAllowedProjects(record.deviceId, (current) => [...current, "proj-x"]),
+      ).toThrow(/EACCES/);
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    // The write itself went through (unlink is the only thing that failed); what did not survive
+    // is releasing the lock.
+    expect(readFileSync(filePath, "utf8")).not.toBe(before);
+    expect(existsSync(lockPath)).toBe(true);
   });
 
   // C1-02: registry A has already loaded devices.json when registry B (standing in for the CLI)
@@ -513,22 +567,22 @@ describe("DeviceRegistry", () => {
     const b = DeviceRegistry.load(filePath);
     const revokedAt = new Date("2026-09-20T12:05:00.000Z");
 
-    const realOpenSync = fs.openSync;
+    const realWriteFileSync = fs.writeFileSync;
     let raced = false;
-    const openSpy = spyOn(fs, "openSync").mockImplementation(
-      (path: fs.PathLike, flags: fs.OpenMode = "r", mode?: fs.Mode | null) => {
+    const writeSpy = spyOn(fs, "writeFileSync").mockImplementation(
+      (path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
         if (!raced && path === lockPath) {
           raced = true;
           b.revoke(record.deviceId, revokedAt);
         }
-        return realOpenSync(path, flags, mode);
+        return realWriteFileSync(path, data, options);
       },
     );
     try {
       // Past the throttle interval, so this touch persists.
       a.touch(record.deviceId, new Date("2026-09-20T12:10:00.000Z"));
     } finally {
-      openSpy.mockRestore();
+      writeSpy.mockRestore();
     }
     expect(raced).toBe(true);
 

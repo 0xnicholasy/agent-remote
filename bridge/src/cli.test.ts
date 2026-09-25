@@ -480,3 +480,20 @@ describe("corrupt state", () => {
     expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
   });
 });
+
+describe("usage errors", () => {
+  test.each([
+    [["revoke"]],
+    [["projects", "allow", "dev"]],
+    [["projects", "deny", "dev"]],
+    [["projects", "bogus"]],
+    [["bogus"]],
+  ])("argv %p exits 2 with usage on stderr", async (argv: string[]) => {
+    const deps = makeDeps();
+
+    const exitCode = await runCli(argv, deps);
+
+    expect(exitCode).toBe(2);
+    expect(deps.stderrLines[0]).toStartWith("Usage:");
+  });
+});

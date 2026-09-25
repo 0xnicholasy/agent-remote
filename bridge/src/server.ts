@@ -30,7 +30,7 @@ import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, ty
 import commandSchema from "../../protocol/schema/command.schema.json";
 import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "./auth/pairing";
 import { BRIDGE_LOCK_TIMEOUT_MS, DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
-import { atomicWriteFileSync } from "./auth/persist";
+import { atomicWriteFileSync, clearLockIfHolderDead } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
 import { CommandJournal } from "./state/commands";
@@ -284,6 +284,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
             "Stop that process before starting a new one against the same state directory.",
         );
       }
+    }
+    // The one race-free moment to clear a devices.json.lock orphaned by a crashed writer: this
+    // process holds bridge.lock, so no other bridge exists, and a live CLI's lock is left alone.
+    if (clearLockIfHolderDead(`${devicesFilePath}.lock`)) {
+      console.warn(`Agent Remote bridge: removed devices.json.lock left by a dead process`);
     }
     let lockReleased = false;
     releaseLock = (): void => {

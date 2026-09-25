@@ -155,15 +155,15 @@ function isRegistryError(value: DeviceRegistry | { error: string }): value is { 
 /**
  * Applies `mutate` against a freshly loaded registry, then confirms the change actually reached
  * disk by loading a *second* fresh registry and checking `holds` against the persisted record.
- * DeviceRegistry's own `devices.json.lock` (see auth/devices.ts) is now the primary guarantee
- * against two concurrent CLI invocations against the same device (`allow` racing `deny`, two
- * `revoke`s, ...) clobbering one another's read-modify-write; the verify-after-write and retry
- * here are belt-and-braces for whatever gets past that lock (e.g. a writer that doesn't take it),
- * not the main defense. `mutate` must recompute whatever it needs from the registry it is handed,
- * not from state captured outside this call, so every retry starts from the current on-disk
- * state. A hard persist failure inside `mutate` (disk full, EACCES, ...) is caught and reported
- * once via `deps.stderr`, matching the CLI's corrupt-file error contract, without burning the
- * remaining retries meant for the clobber case.
+ * DeviceRegistry's own `devices.json.lock` (see auth/persist.ts's no-takeover `withFileLock`) is
+ * now the primary guarantee against two concurrent CLI invocations against the same device
+ * (`allow` racing `deny`, two `revoke`s, ...) clobbering one another's read-modify-write; the
+ * verify-after-write and retry here are belt-and-braces for whatever gets past that lock (e.g. a
+ * writer that doesn't take it), not the main defense. `mutate` must recompute whatever it needs
+ * from the registry it is handed, not from state captured outside this call, so every retry
+ * starts from the current on-disk state. A hard persist failure inside `mutate` (disk full,
+ * EACCES, ...) is caught and reported once via `deps.stderr`, matching the CLI's corrupt-file
+ * error contract, without burning the remaining retries meant for the clobber case.
  */
 async function applyVerified(
   deps: CliDeps,
@@ -180,6 +180,10 @@ async function applyVerified(
       return false;
     }
     try {
+      // A FileLockTimeoutError here has already waited the full lock timeout inside mutate (it
+      // is thrown by withFileLock, not by us), so re-spending that timeout on every retry would
+      // only multiply the wait. The retry budget on this loop is for the verify-read clobber
+      // case above (a writer that bypasses the lock), not for lock contention.
       mutate(registry);
     } catch (cause) {
       deps.stderr(`${filePath}: ${cause instanceof Error ? cause.message : String(cause)}`);

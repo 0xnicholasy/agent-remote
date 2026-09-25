@@ -14,8 +14,6 @@ const LAST_SEEN_PERSIST_INTERVAL_MS = 60_000;
 // reload + write (milliseconds), so a short bound is plenty and never stalls every other request.
 const DEFAULT_LOCK_TIMEOUT_MS = 2000;
 export const BRIDGE_LOCK_TIMEOUT_MS = 250;
-// Only consulted for an empty/unparseable lock file; a lock naming a live pid is never stale.
-const LOCK_STALE_MS = 10_000;
 
 export interface DeviceRegistryOptions {
   /** How long a mutating call waits for devices.json.lock before failing. */
@@ -98,15 +96,15 @@ export class DeviceRegistry {
    * could predate another process's rename, and our later rename would then silently undo that
    * write (resurrecting a revoked device or re-granting a denied project). In-memory registries
    * have no file to race on and run `fn` directly.
+   *
+   * The lock is never taken over (see persist.ts's `withFileLock`); a lock left by a crashed
+   * writer is only ever cleared at bridge startup, by `clearLockIfHolderDead`.
    */
   private locked<T>(fn: () => T, timeoutMs: number = this.lockTimeoutMs): T {
     if (this.filePath === undefined) {
       return fn();
     }
-    return withFileLock(`${this.filePath}.lock`, fn, {
-      timeoutMs,
-      staleMs: LOCK_STALE_MS,
-    });
+    return withFileLock(`${this.filePath}.lock`, fn, timeoutMs);
   }
 
   /** Re-reads the backing file only when its `statSync` stamp differs from `knownStamp`, i.e.

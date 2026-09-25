@@ -2632,6 +2632,37 @@ describe("single-writer state dir lock", () => {
 
     fresh?.close();
   });
+
+  test("startup removes a devices.json.lock left by a dead process but leaves one naming a live pid", () => {
+    const deadLockDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    const liveLockDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    try {
+      // No real process can hold this pid; it is well past any platform's max pid.
+      writeFileSync(join(deadLockDir, "devices.json.lock"), "999999999", "utf8");
+      writeFileSync(join(liveLockDir, "devices.json.lock"), String(process.pid), "utf8");
+
+      const deadLockBridge = createBridge({
+        devicesFilePath: join(deadLockDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+      const liveLockBridge = createBridge({
+        devicesFilePath: join(liveLockDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+      try {
+        expect(existsSync(join(deadLockDir, "devices.json.lock"))).toBe(false);
+        expect(existsSync(join(liveLockDir, "devices.json.lock"))).toBe(true);
+      } finally {
+        deadLockBridge.close();
+        liveLockBridge.close();
+      }
+    } finally {
+      rmSync(deadLockDir, { recursive: true, force: true });
+      rmSync(liveLockDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("retained events of a reused session id", () => {
