@@ -239,7 +239,7 @@ describe("verifyEnvelope", () => {
       "X-AgentRemote-Device": "dev_9f2c4a1b7d3e5061",
       "X-AgentRemote-Timestamp": now.toISOString(),
       "X-AgentRemote-Nonce": "n0nce",
-      "X-AgentRemote-Signature": "v1=" + "0".repeat(64),
+      "X-AgentRemote-Signature": `v1=${"0".repeat(64)}`,
     };
     const result = verifyEnvelope({
       headers,
@@ -314,7 +314,7 @@ describe("verifyEnvelope", () => {
     const params = baseParams();
     const headers = {
       ...(params.headers as Record<string, string>),
-      "X-AgentRemote-Signature": "v1=" + "0".repeat(64),
+      "X-AgentRemote-Signature": `v1=${"0".repeat(64)}`,
     };
     const result = verifyEnvelope({ ...params, headers });
     expect(result).toEqual({ ok: false, status: 401, code: "unauthenticated" });
@@ -334,7 +334,7 @@ describe("verifyEnvelope", () => {
     const params = baseParams();
     const headers = {
       ...(params.headers as Record<string, string>),
-      "X-AgentRemote-Signature": "v1=" + "0".repeat(64),
+      "X-AgentRemote-Signature": `v1=${"0".repeat(64)}`,
     };
     verifyEnvelope({ ...params, headers });
     expect(params.nonces.has("dev_9f2c4a1b7d3e5061", "n0nce", params.now)).toBe(false);

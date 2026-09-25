@@ -60,14 +60,17 @@ test in the same style as the existing ones, sized to the behaviour rather than 
 target.
 
 Run the checks that exist for the area you changed: `bun run check` at the repository root
-(`bun run typecheck` across every TypeScript workspace, then `bun test`), and `swift test` from
+(`bun run lint` with Biome, `bun run typecheck` across every TypeScript workspace, then
+`bun test`), and `swift test` from
 `protocol/swift` when the Swift package changes. Watch changes need an Xcode build or test with
 a compatible installed watchOS destination, and networking/background claims require a physical
 Watch result. Record the exact checks and any unavailable toolchain or destination in the pull
 request.
 
-The repository has no linter configured yet. That is a tooling gap, not permission to claim a
-lint check ran. Do not invent a command or substitute generated-project
+Biome lints the TypeScript workspaces with its recommended rules (`biome.json`); formatting is
+not enforced. `style/noNonNullAssertion` is off because the code asserts array elements it has
+already bounds-checked. A `biome-ignore` comment needs a reason, as a type-check suppression
+does. Swift has no linter configured. Do not invent a command or substitute generated-project
 existence for a build result.
 
 A change to an accepted decision in `docs/adr/` needs a new ADR rather than an edit to the old

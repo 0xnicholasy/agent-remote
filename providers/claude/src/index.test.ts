@@ -138,7 +138,7 @@ function asQuery(
     return undefined;
   };
   const originalReturn = gen.return.bind(gen);
-  query.return = ((value: void) => {
+  query.return = ((value: undefined) => {
     returned = true;
     return originalReturn(value);
   }) as Query["return"];
@@ -818,6 +818,7 @@ describe("ClaudeProvider", () => {
 
   test("a pump crash clears pending interactions, terminates the session, and blocks further prompts (E-001)", async () => {
     const queryFn: QueryFn = ((args) => {
+      // biome-ignore lint/correctness/useYield: fixture generator deliberately ends or throws before yielding
       async function* gen(): AsyncGenerator<SDKMessage, void> {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         void args.options!.canUseTool!("Bash", { command: "ls" }, callOpts());
@@ -1019,7 +1020,7 @@ describe("ClaudeProvider", () => {
       const originalReturn = wrapped.query.return;
       // Defers `.return()` so `terminateConversation` is caught mid-teardown: `terminal` has
       // already been set synchronously, but the conversation is still in `this.conversations`.
-      wrapped.query.return = (async (value: void) => {
+      wrapped.query.return = (async (value: undefined) => {
         await gate;
         return originalReturn(value);
       }) as Query["return"];
@@ -1329,11 +1330,12 @@ describe("ClaudeProvider", () => {
       titleFidelity: "truncated",
       fullLength: 300,
     });
-    expect((requested?.payload as { title: string }).title.length).toBe(200);
+    expect((requested!.payload as { title: string }).title.length).toBe(200);
   });
 
   test("a generator that ends mid-turn without a result is treated as an abnormal teardown (R-031)", async () => {
     const queryFn: QueryFn = ((args) => {
+      // biome-ignore lint/correctness/useYield: fixture generator deliberately ends or throws before yielding
       async function* gen(): AsyncGenerator<SDKMessage, void> {
         await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
         // Ends without ever yielding a `result`: the turn is still in progress.
@@ -1916,7 +1918,7 @@ describe("ClaudeProvider", () => {
         }
         return new Promise((resolve) => waiters.push(resolve));
       },
-      return(value: void): Promise<IteratorResult<SDKMessage, void>> {
+      return(value: undefined): Promise<IteratorResult<SDKMessage, void>> {
         return new Promise((resolve) => {
           releaseReturn = () => resolve({ value, done: true });
         });

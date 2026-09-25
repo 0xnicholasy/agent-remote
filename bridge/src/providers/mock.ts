@@ -142,7 +142,7 @@ export class MockProvider implements AgentProvider {
       ? `git push origin main --force-with-lease --push-option=ci.skip --push-option=deploy.notify=${"a".repeat(240)}`
       : "git push origin main";
     const truncated = action.length > ACTION_TEXT_MAX_LENGTH;
-    const title = wantsDeskOnlyCard ? action.slice(0, ACTION_TEXT_MAX_LENGTH - 1) + "…" : action;
+    const title = wantsDeskOnlyCard ? `${action.slice(0, ACTION_TEXT_MAX_LENGTH - 1)}…` : action;
     const binding: ApprovalBinding = {
       approvalId: `apr_${randomUUID()}`,
       sessionId,
