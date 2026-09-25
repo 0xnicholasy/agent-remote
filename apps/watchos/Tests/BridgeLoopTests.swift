@@ -39,7 +39,7 @@ final class BridgeLoopTests: XCTestCase {
         guard case .approvalRequested(let approval) = approvalEvent.payload else {
             return XCTFail("expected an approval payload")
         }
-        XCTAssertEqual(approval.title, "Run git push origin main")
+        XCTAssertEqual(approval.title, "git push origin main")
 
         try await client.send(
             .approvalAccept(ApprovalAcceptPayload(binding: approval.binding)),

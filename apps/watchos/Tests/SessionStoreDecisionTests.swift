@@ -1597,6 +1597,46 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.outcome(forCard: "appr_1"), .reviewAtDesk)
     }
 
+    /// R-007 regression: decide()'s `.reviewAtDesk` case must apply the same stale-card guard
+    /// as the offline/failed/rateLimited branch above it. If a newer `approval.requested`
+    /// replaces the pending card while a stale send is still resolving to review_at_desk, the
+    /// stale response must not stamp its outcome onto the new card's slot (wrong id) nor leave
+    /// a dangling outcome for the id that is gone.
+    func testStaleCardReviewAtDeskDoesNotSetOutcomeOnNewerCard() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.reviewAtDesk))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerApprovalRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main --force",
+                "titleFidelity": "exact"
+            }
+        }
+        """)
+        store.apply(newerApprovalRequested)
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale review_at_desk response")
+        XCTAssertNil(store.outcome(forCard: "appr_1"), "the stale card is gone; nothing should keep its outcome set")
+        XCTAssertNil(store.outcome(forCard: "appr_2"), "the newer card's outcome slot must not be stomped by the stale response")
+    }
+
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
     /// reconnect() moved on to a new generation while the send was in flight), the stale id it
     /// carries must not be returned to sendPrompt() as a valid target.
