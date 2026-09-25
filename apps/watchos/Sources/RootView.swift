@@ -1,12 +1,74 @@
 import SwiftUI
 
 struct RootView: View {
+    @Environment(SessionStore.self) private var store
+
     var body: some View {
-        TabView {
-            ConversationView()
-            SettingsView()
+        // Until the stored credential is known, a plain spinner beats flashing onboarding (or
+        // the paired TabView) for an instant while refreshPairedState() is still in flight.
+        if !store.pairingChecked {
+            ProgressView()
+        } else if store.pairingCheckFailed && !store.everPaired {
+            // The credential lookup failed to read (a Keychain error), not "no credential" --
+            // never fold this into onboarding: on a first launch that would show the 3-step
+            // walkthrough for what may be a perfectly valid, unreadable pairing (E-002).
+            PairingCheckFailedView()
+        } else if !store.paired && !store.everPaired {
+            // Gated on `everPaired`, not the live `paired`, so a paired->unpaired transition
+            // mid-session (e.g. Settings "Connect" reconnecting to an unpaired host) keeps the
+            // user on the TabView/Settings instead of ejecting them into onboarding (E-001).
+            OnboardingView()
+        } else {
+            TabView {
+                ConversationView()
+                SettingsView()
+            }
+            .tabViewStyle(.verticalPage)
         }
-        .tabViewStyle(.verticalPage)
+    }
+}
+
+/// Shown only on a first launch whose credential lookup failed to read (see `pairingCheckFailed`
+/// on `SessionStore`). Offers a retry instead of silently routing to onboarding.
+private struct PairingCheckFailedView: View {
+    @Environment(SessionStore.self) private var store
+    @State private var retrying = false
+    @State private var clearing = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("Could not check pairing")
+                .font(.footnote)
+            Text("The stored pairing could not be read. Try again.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if let pairingError = store.pairingError {
+                Text(pairingError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+            Button("Retry") {
+                Task {
+                    retrying = true
+                    await store.refreshPairedState()
+                    retrying = false
+                }
+            }
+            .disabled(retrying || clearing)
+            // R2-001: if the stored credential is permanently undecodable (corrupt data, not a
+            // transient error), Retry fails forever. This is the only way out short of deleting
+            // the app -- an explicit, user-initiated escape hatch, never triggered automatically.
+            Button("Pair again", role: .destructive) {
+                Task {
+                    clearing = true
+                    await store.clearPairing()
+                    clearing = false
+                }
+            }
+            .disabled(retrying || clearing)
+            .accessibilityIdentifier("pairing-check-failed-pair-again")
+        }
+        .padding()
     }
 }
 

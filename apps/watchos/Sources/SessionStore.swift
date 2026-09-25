@@ -210,6 +210,21 @@ final class SessionStore {
     @ObservationIgnored private var unconfirmedCancel: UnconfirmedSend?
     private(set) var paired = false
     private(set) var pairingError: String?
+    /// False until the first `refreshPairedState()` (or `pair()`) has resolved, so RootView can
+    /// hold a plain ProgressView instead of flashing onboarding for an instant before the
+    /// stored credential is known.
+    private(set) var pairingChecked = false
+    /// True once `paired` has been true at any point since launch, and never cleared again.
+    /// RootView gates onboarding on this (rather than the live `paired`) so a paired->unpaired
+    /// transition mid-session -- e.g. Settings "Connect" reconnecting to a host with no stored
+    /// pairing -- keeps the user on the TabView (and Settings) instead of ejecting them into
+    /// onboarding (E-001).
+    private(set) var everPaired = false
+    /// True when the last credential lookup failed to read rather than finding none (a
+    /// Keychain error). Kept distinct from "not paired" so a transient read failure does not
+    /// misroute a paired user to onboarding, or invite them to re-pair over a credential that
+    /// may still be valid (E-002).
+    private(set) var pairingCheckFailed = false
 
     var hostText: String {
         didSet { defaults.set(hostText, forKey: SessionStore.hostKey) }
@@ -224,6 +239,11 @@ final class SessionStore {
     /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
     /// tell its own results are stale even when it was not cancelled in time to observe it.
     @ObservationIgnored private var pollGeneration = 0
+    /// Bumped on every refreshPairedState()/pair() so a paired-state lookup from a superseded
+    /// generation cannot overwrite a newer one: SessionStore is @MainActor but reentrant across
+    /// awaits, so a concurrent reloadCredential()/pair()/second refreshPairedState() can start
+    /// and finish while an earlier one is still suspended on `await client...`.
+    @ObservationIgnored private var pairGeneration = 0
     /// Kept so an answered question can be shown by its label rather than its option id.
     @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
     /// Kept so a resolved approval can say what was decided, not only how.
@@ -260,20 +280,102 @@ final class SessionStore {
     }
 
     func refreshPairedState() async {
-        paired = await client.isPaired()
+        pairGeneration += 1
+        let generation = pairGeneration
+        // A prior check found the Keychain read itself failed (E-002), so the cached
+        // credential/error state is stale: reload before re-checking, or a Retry from
+        // PairingCheckFailedView could never clear pairingCheckFailed. Either branch is a
+        // single atomic actor call (PairingLookup), so there is no window between two reads
+        // for a concurrent pair()/refreshPairedState() to interleave into.
+        let lookup: PairingLookup
+        if pairingCheckFailed {
+            lookup = await client.reloadCredential()
+        } else {
+            lookup = await client.pairingLookup()
+        }
+        // A concurrent refreshPairedState()/pair() started after this one and may have already
+        // applied a newer result; this stale lookup must not overwrite it.
+        guard generation == pairGeneration else { return }
+        applyPairedLookup(lookup)
+        pairingChecked = true
     }
 
     /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
     /// stores the device credential and subsequent requests are signed.
     func pair(code: String, deviceName: String) async {
         pairingError = nil
+        pairGeneration += 1
+        let generation = pairGeneration
         do {
             try await client.pair(code: code, deviceName: deviceName)
+            guard generation == pairGeneration else { return }
             paired = true
+            everPaired = true
+            pairingCheckFailed = false
+            pairingChecked = true
             start()
         } catch {
-            paired = await client.isPaired()
-            pairingError = "\(error)"
+            let lookup = await client.pairingLookup()
+            // A concurrent pair()/refreshPairedState() may have already applied a newer result
+            // while this one was suspended on the awaits above; guard every write below, not
+            // just applyPairedLookup(), or a stale failure could overwrite a newer pairingError.
+            guard generation == pairGeneration else { return }
+            applyPairedLookup(lookup)
+            // applyPairedLookup() already set pairingError to the load failure's own
+            // description when the lookup itself failed (.checkFailed); that is the more
+            // specific, actionable cause. Otherwise fall back to the pair() failure itself.
+            if case .checkFailed = lookup {} else {
+                pairingError = "\(error)"
+            }
+            pairingChecked = true
+        }
+    }
+
+    /// Clears the stored device credential and routes back to onboarding (R2-001): a
+    /// permanently undecodable credential (corrupt keychain data, not a transient read error)
+    /// would otherwise leave `PairingCheckFailedView`'s Retry failing forever with no way out
+    /// short of deleting the app. Only ever called from the user's explicit "Pair again" tap --
+    /// never automatically -- since this discards a credential that may still be valid.
+    func clearPairing() async {
+        pairGeneration += 1
+        let generation = pairGeneration
+        do {
+            try await client.clearCredential()
+        } catch {
+            // The keychain delete itself failed: the old (possibly undecodable) credential is
+            // still stored, so routing to onboarding here would just repeat the same failure on
+            // next launch (V2-001). Stay on PairingCheckFailedView -- pairingCheckFailed stays
+            // true, paired/everPaired untouched -- and surface the error so Retry/Pair again
+            // remain reachable.
+            guard generation == pairGeneration else { return }
+            pairingError = "Couldn't clear pairing: \(error)"
+            return
+        }
+        guard generation == pairGeneration else { return }
+        paired = false
+        everPaired = false
+        pairingCheckFailed = false
+        pairingError = nil
+    }
+
+    /// Applies a `PairingLookup`, distinguishing "no credential" from "the lookup failed to
+    /// read" (E-002). Shared by `refreshPairedState()` and `pair()`'s failure path so both apply
+    /// the same rule: a read failure must not be folded into "not paired" and leaves
+    /// `paired`/`everPaired` untouched.
+    private func applyPairedLookup(_ lookup: PairingLookup) {
+        switch lookup {
+        case .paired:
+            paired = true
+            everPaired = true
+            pairingCheckFailed = false
+            pairingError = nil
+        case .checkFailed(let message):
+            pairingCheckFailed = true
+            pairingError = message
+        case .notPaired:
+            paired = false
+            pairingCheckFailed = false
+            pairingError = nil
         }
     }
 

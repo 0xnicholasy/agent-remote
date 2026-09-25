@@ -178,12 +178,37 @@ private struct ErrorBody: Decodable {
     var error: String?
 }
 
+/// The result of a paired-state lookup, as a single value. Replaces two separate calls
+/// (`isPaired()` + `pairingCheckFailed()`) that used to be awaited one after another: since
+/// `SessionStore` is `@MainActor` and reentrant across awaits, a concurrent
+/// `reloadCredential()`/`pair()`/second lookup could interleave between those two calls and
+/// produce an inconsistent read (e.g. `paired == true` and `checkFailed == true`, or a stale
+/// result winning a race). One atomic actor call can only return one consistent answer.
+enum PairingLookup: Sendable, Equatable {
+    case paired
+    case notPaired
+    /// The credential lookup itself failed to read (a Keychain error), as opposed to finding
+    /// no credential (E-002). Carries a short, user-safe description of the failure (OSStatus /
+    /// decode-failure summary -- never key material) so callers can surface it (C2-003).
+    case checkFailed(String)
+}
+
 /// The calls `SessionStore` makes on the bridge client. Lets tests substitute a fake client
 /// without opening a real network connection.
 protocol BridgeClientProtocol: Sendable {
     func setBaseURL(_ url: URL) async
     func pair(code: String, deviceName: String) async throws
-    func isPaired() async -> Bool
+    /// Single atomic read of the credential's pairing state. See `PairingLookup`.
+    func pairingLookup() async -> PairingLookup
+    /// Re-reads the stored credential from the Keychain and returns the resulting lookup in
+    /// the same atomic actor call, so a Retry after a transient read error (E-002) can actually
+    /// clear `.checkFailed` instead of replaying the same cached failure forever.
+    @discardableResult
+    func reloadCredential() async -> PairingLookup
+    /// Deletes the stored device credential (Settings/onboarding "Pair again", R2-001), so a
+    /// permanently undecodable credential does not leave the user stuck on
+    /// `PairingCheckFailedView` forever. Only ever invoked from an explicit user action.
+    func clearCredential() async throws
     func events(after: Int, wait: Int) async throws -> EventsPage
     /// `commandId` is the idempotency key: resending the same payload with the same id gets the
     /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
@@ -212,11 +237,24 @@ actor BridgeClient: BridgeClientProtocol {
     private let encoder = JSONEncoder()
     private let credentialStore: any CredentialStore
     private var credential: DeviceCredential?
+    /// Set to the load failure's description when the credential lookup failed to read (rather
+    /// than finding nothing), so `pairingLookup()` returning `.notPaired` is not mistaken for
+    /// "genuinely unpaired" (E-002), and the description can be surfaced via `.checkFailed`
+    /// (C2-003).
+    private var credentialLoadError: String?
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
         self.credentialStore = credentialStore
-        self.credential = credentialStore.load()
+        switch credentialStore.loadResult() {
+        case .found(let credential):
+            self.credential = credential
+        case .notFound:
+            self.credential = nil
+        case .error(let message):
+            self.credential = nil
+            self.credentialLoadError = message
+        }
         let configuration = URLSessionConfiguration.ephemeral
         // Long polls hold the connection open for up to 30 seconds, so the request
         // timeout has to sit comfortably above the bridge's own ceiling.
@@ -234,8 +272,51 @@ actor BridgeClient: BridgeClientProtocol {
         baseURL
     }
 
+    /// Single atomic read of the credential's pairing state (see `PairingLookup`). Actor
+    /// isolation means this whole read happens between one pair of suspension points, so a
+    /// concurrent `reloadCredential()` cannot land in the middle of it the way two separate
+    /// `isPaired()`/`pairingCheckFailed()` awaits used to allow.
+    func pairingLookup() -> PairingLookup {
+        if credential != nil { return .paired }
+        if let credentialLoadError { return .checkFailed(credentialLoadError) }
+        return .notPaired
+    }
+
+    /// Re-reads the stored credential from the Keychain (E-002) and returns the resulting
+    /// lookup in the same actor call. Lets a Retry after a transient read error actually clear
+    /// `.checkFailed` instead of replaying the same cached failure forever; actor isolation
+    /// keeps this write, and the read that reports it, serialized with every other access to
+    /// `credential` and `credentialLoadError`.
+    @discardableResult
+    func reloadCredential() -> PairingLookup {
+        switch credentialStore.loadResult() {
+        case .found(let credential):
+            self.credential = credential
+            self.credentialLoadError = nil
+        case .notFound:
+            self.credential = nil
+            self.credentialLoadError = nil
+        case .error(let message):
+            self.credential = nil
+            self.credentialLoadError = message
+        }
+        return pairingLookup()
+    }
+
+    /// Deletes the stored device credential and clears the in-memory copy, so the next
+    /// `pairingLookup()` reports `.notPaired` even for a credential that was undecodable
+    /// (`.error`, not `.notFound`) and would otherwise never clear itself.
+    func clearCredential() throws {
+        try credentialStore.clear()
+        credential = nil
+        credentialLoadError = nil
+    }
+
+    /// Kept for `BridgeClientAuthTests`, which exercises pairing directly against the concrete
+    /// actor rather than through `BridgeClientProtocol`. `SessionStore` and other protocol
+    /// callers use `pairingLookup()` instead.
     func isPaired() -> Bool {
-        credential != nil
+        pairingLookup() == .paired
     }
 
     /// `POST /v1/pair`: the only signed-off route. Derives the device key locally from the

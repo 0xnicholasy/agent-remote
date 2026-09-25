@@ -102,38 +102,61 @@ final class CoreScreensUITests: XCTestCase {
     }
 
     /// The simulator's pairing state carries over from a prior run, so this cannot assume a
-    /// fresh install. It detects which of the two states it is in, takes the matching path, and
-    /// asserts the postcondition for that path explicitly rather than assuming success.
+    /// fresh install. It detects which of the two states it is in by whether the onboarding
+    /// flow's first step renders, takes the matching path, and asserts the postcondition for
+    /// that path explicitly rather than assuming success.
     private func pairIfNeeded() throws {
-        app.swipeUp()
-        XCTAssertTrue(button("Create session").waitForExistence(timeout: 10))
-        let pairLink = labeled("Pair Watch")
-        reveal(pairLink)
-        let pairedIndicator = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'Paired' OR value == 'Paired'")).firstMatch
-        if pairedIndicator.exists {
+        let onboardingNext1 = app.buttons["onboarding-next-1"]
+        guard onboardingNext1.waitForExistence(timeout: 5) else {
+            // Already paired from a prior simulator run: RootView goes straight to the
+            // TabView, so this is the same path CoreScreensUITests always used.
             XCTContext.runActivity(named: "already paired from a prior simulator run") { _ in }
+            app.swipeUp()
+            XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render for an already-paired launch")
             relaunchToSettings()
+            XCTAssertFalse(app.buttons["onboarding-next-1"].exists, "a paired Watch must not show onboarding after relaunch")
+            let pairLink = labeled("Pair Watch")
             reveal(pairLink)
             XCTAssertTrue(pairedIndicator.exists, "expected pairing to remain intact across relaunch")
             return
         }
-        XCTContext.runActivity(named: "pairing for the first time") { _ in }
-        pairLink.tap()
-        let field = app.textFields.firstMatch
-        XCTAssertTrue(field.waitForExistence(timeout: 5))
-        field.tap()
+
+        XCTContext.runActivity(named: "pairing for the first time through onboarding") { _ in }
+        shot("o1-mac-setup")
+        onboardingNext1.tap()
+
+        let hostField = app.textFields["onboarding-host"]
+        XCTAssertTrue(hostField.waitForExistence(timeout: 5), "expected the Mac address step to render")
+        // Launched with -dev.agentremote.watch.host, the argument domain already prefills this
+        // field with AGENTREMOTE_UI_BRIDGE's host:port, so there is nothing to type here.
+        shot("o2-host-address")
+        let next2 = app.buttons["onboarding-next-2"]
+        XCTAssertTrue(next2.isEnabled, "Next must be enabled once the host field is prefilled")
+        next2.tap()
+
+        let codeField = app.textFields["pairing-code"]
+        XCTAssertTrue(codeField.waitForExistence(timeout: 10), "expected the pairing code step to render after reconnecting")
+        shot("o3-pairing-code")
+        codeField.tap()
         // The field opens the system input sheet; the text goes into its focused text view.
         let input = app.textViews.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
         XCTAssertTrue(input.waitForExistence(timeout: 5))
         input.typeText(ProcessInfo.processInfo.environment["AGENTREMOTE_UI_PAIR_CODE"]!)
         button("Done").tap()
-        shot("p1-code-entered")
+        shot("o4-code-entered")
         button("Pair").tap()
-        // A successful pair pops back to Settings; a failed one stays on the pairing form.
+        // A successful pair flips store.paired and RootView swaps onboarding out for the
+        // TabView; the pairing form (and its Pair button) goes with it.
         XCTAssertTrue(button("Pair").waitForNonExistence(timeout: 15), "pairing did not complete")
         relaunchToSettings()
+        let pairLink = labeled("Pair Watch")
         reveal(pairLink)
         XCTAssertTrue(pairedIndicator.exists, "expected pairing to have completed")
+    }
+
+    /// Matches Settings' "Device: Paired" row, on either path through pairIfNeeded().
+    private var pairedIndicator: XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'Paired' OR value == 'Paired'")).firstMatch
     }
 
     /// Scrolling the form back up can overshoot onto the previous page, so start Settings fresh.

@@ -52,6 +52,8 @@ targets:
       - path: Sources/DeviceIdentity.swift
       - path: Sources/SessionStore.swift
       - path: Sources/Speech.swift
+      - path: Sources/OnboardingView.swift
+      - path: Sources/PairingView.swift
     dependencies:
       - package: AgentRemoteProtocol
         product: AgentRemoteProtocol

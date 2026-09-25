@@ -33,9 +33,15 @@ code to authenticate against otherwise.
 bun run bridge pair
 ```
 
-This prints the host:port to enter in Watch Settings, a dashed pairing code, and its expiry, then
-waits for the Watch to pair. On the Watch: Settings, enter the host:port, then Pair Watch and enter
-the code.
+This prints the host:port to enter on the Watch, a dashed pairing code, and its expiry, then waits
+for the Watch to pair.
+
+An unpaired Watch opens straight into a three-step onboarding flow instead of the conversation
+page: "Set up on your Mac" (repeats the `bun run bridge pair` command), "Mac address" (a text
+field for the host:port above), then "Pairing code" (the same form as Settings' Pair Watch, for
+the dashed code). Once pairing succeeds the Watch swaps onboarding for the normal conversation and
+Settings pages on its own. Re-pairing (a new Mac, a revoked device) still goes through Settings'
+"Pair Watch" as before.
 
 ## 4. Manage devices and projects
 
@@ -54,5 +60,5 @@ running, the last bridge started against this state dir), not this shell's own e
 
 ## What is not here yet
 
-Watch-side onboarding screens (guided pairing UI, project picker) are not built; pairing today is
-Watch Settings plus the CLI output above. See [Roadmap](../tasks/todo.md) (M4).
+A project picker (choosing which authorized project a session targets) is not built. See
+[Roadmap](../tasks/todo.md) (M4).
