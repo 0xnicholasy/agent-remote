@@ -210,6 +210,10 @@ final class SessionStore {
     @ObservationIgnored private var unconfirmedCancel: UnconfirmedSend?
     private(set) var paired = false
     private(set) var pairingError: String?
+    /// False until the first `refreshPairedState()` (or `pair()`) has resolved, so RootView can
+    /// hold a plain ProgressView instead of flashing onboarding for an instant before the
+    /// stored credential is known.
+    private(set) var pairingChecked = false
 
     var hostText: String {
         didSet { defaults.set(hostText, forKey: SessionStore.hostKey) }
@@ -261,6 +265,7 @@ final class SessionStore {
 
     func refreshPairedState() async {
         paired = await client.isPaired()
+        pairingChecked = true
     }
 
     /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
@@ -270,9 +275,11 @@ final class SessionStore {
         do {
             try await client.pair(code: code, deviceName: deviceName)
             paired = true
+            pairingChecked = true
             start()
         } catch {
             paired = await client.isPaired()
+            pairingChecked = true
             pairingError = "\(error)"
         }
     }

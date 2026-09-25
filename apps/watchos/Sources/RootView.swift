@@ -1,12 +1,22 @@
 import SwiftUI
 
 struct RootView: View {
+    @Environment(SessionStore.self) private var store
+
     var body: some View {
-        TabView {
-            ConversationView()
-            SettingsView()
+        // Until the stored credential is known, a plain spinner beats flashing onboarding (or
+        // the paired TabView) for an instant while refreshPairedState() is still in flight.
+        if !store.pairingChecked {
+            ProgressView()
+        } else if !store.paired {
+            OnboardingView()
+        } else {
+            TabView {
+                ConversationView()
+                SettingsView()
+            }
+            .tabViewStyle(.verticalPage)
         }
-        .tabViewStyle(.verticalPage)
     }
 }
 

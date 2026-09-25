@@ -16,6 +16,7 @@ struct PairingView: View {
                     #if os(watchOS)
                     .textInputAutocapitalization(.characters)
                     #endif
+                    .accessibilityIdentifier("pairing-code")
             }
             Section {
                 Button("Pair") { Task { await pair() } }

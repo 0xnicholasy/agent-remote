@@ -2539,6 +2539,36 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, .connected, "a successful re-pair must resume polling without a relaunch or host change")
     }
 
+    /// RootView holds a plain ProgressView until `pairingChecked`, so a store that never
+    /// resolves the initial paired lookup must not report itself checked.
+    func testPairingCheckedFlipsOnlyAfterRefreshPairedState() async throws {
+        let client = FakeBridgeClient()
+        await client.setPaired(false)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        XCTAssertFalse(store.pairingChecked, "pairingChecked must start false, before any lookup has run")
+
+        await store.refreshPairedState()
+
+        XCTAssertTrue(store.pairingChecked, "pairingChecked must be true once refreshPairedState() resolves")
+        XCTAssertFalse(store.paired, "an unpaired fake must leave paired false")
+    }
+
+    /// A failing pair() must still resolve pairingChecked -- otherwise a Watch that fails
+    /// pairing on first run would sit on the onboarding spinner instead of the onboarding UI.
+    func testPairFailureSetsPairingCheckedTrue() async throws {
+        let client = FakeBridgeClient()
+        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
+        await client.setPaired(false)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
+
+        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
+        XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
+        XCTAssertTrue(store.pairingChecked, "pairingChecked must be true even when pair() fails")
+    }
+
     // MARK: - Recovery (M3 slice 4)
     //
     // Each test parks its poll loop on the fake's gate after the last page, so it does not keep
