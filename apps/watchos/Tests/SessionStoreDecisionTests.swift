@@ -488,6 +488,26 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.actionOutcome, .acknowledged, "a resolution for an unrelated question id must not clear this card's outcome")
     }
 
+    /// The conversation page offers Stop turn only while a turn is in progress for a session.
+    func testCanCancelTurnOnlyWhileATurnIsInProgress() async throws {
+        let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertFalse(idle.canCancelTurn, "no session: nothing to stop")
+
+        let (store, _) = try await makeStoreWithPendingApproval()
+        XCTAssertEqual(store.turnState, .waiting)
+        XCTAssertTrue(store.canCancelTurn, "a turn waiting on an approval can be stopped")
+    }
+
+    /// The dictation review screen names where the text goes, matching submitDictation's routing.
+    func testDictationDestinationFollowsPendingQuestion() async throws {
+        let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertEqual(idle.dictationDestination, "New prompt")
+
+        let (store, _) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        XCTAssertEqual(store.dictationDestination, "Answer to: \(question.text)")
+    }
+
     /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,
     /// the outcome is rateLimited, and the same choice retries with the same command id.
     func testRateLimitedKeepsCardAndRetriesWithSameCommandId() async throws {

@@ -97,6 +97,7 @@ Dependencies: M1 delivery decision and M3 control guarantees.
   5. [x] Watch: desk-only card shows Deny only and "Review at the Mac before allowing"; `approve()` refuses desk-only; `review_at_desk` maps to "Not allowed".
   6. [ ] Docs, tests (bun + XCTest), simulator screenshot of a desk-only card. (docs and unit tests done; simulator screenshot left to the parent session, which owns the UI test run.)
 - [ ] Finish the glanceable conversation/status experience, reviewed dictation, foreground speech, and prominent cancel behavior.
+  - [x] 2026-09-25 (branch `feat/watch-reviewed-dictation-cancel`): dictated text is shown in full with its destination ("New prompt" or "Answer to: <question>") before Send; the conversation page shows a confirmed "Stop turn" button while a turn is thinking, running or waiting. Simulator only; dictation itself still needs physical hardware (M1).
 
 Exit gate: a new user can pair one Watch with one Mac, start an authorized session, understand connection and command state, and complete the core loop without setup knowledge from the developer.
 

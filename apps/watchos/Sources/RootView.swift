@@ -15,6 +15,7 @@ struct RootView: View {
 struct ConversationView: View {
     @Environment(SessionStore.self) private var store
     @State private var dictating = false
+    @State private var confirmingStop = false
 
     var body: some View {
         NavigationStack {
@@ -51,6 +52,13 @@ struct ConversationView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
+                        if store.canCancelTurn {
+                            // Named "Stop turn" so it is not confused with Settings' "Cancel turn";
+                            // both send the same session.cancel. Confirmed first because a stray
+                            // tap on a small screen would end the agent's work.
+                            Button("Stop turn", role: .destructive) { confirmingStop = true }
+                                .disabled(store.isSending)
+                        }
                         Button("Reply") { dictating = true }
                             .buttonStyle(.bordered)
                             .id("reply-\(store.transcript.count)")
@@ -65,6 +73,9 @@ struct ConversationView: View {
             }
             // No navigation title: on this page it only covered the top of a pending card.
             .sheet(isPresented: $dictating) { DictateView() }
+            .confirmationDialog("Stop this turn?", isPresented: $confirmingStop) {
+                Button("Stop turn", role: .destructive) { Task { await store.cancel() } }
+            }
         }
     }
 

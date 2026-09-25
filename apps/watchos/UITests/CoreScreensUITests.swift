@@ -59,6 +59,10 @@ final class CoreScreensUITests: XCTestCase {
         try await sendPrompt("run the tests and push", sessionId: sessionId)
         XCTAssertTrue(button("Allow").waitForExistence(timeout: 15))
         shot("2-approval")
+        // While the turn waits on the approval, Stop turn sits on the conversation page itself.
+        // exists, not isHittable: scrolling to it here would move Deny off screen for the tap below.
+        let stop = button("Stop turn")
+        XCTAssertTrue(stop.exists && stop.isEnabled, "expected Stop turn on the conversation page during a turn")
 
         button("Deny").tap()
         XCTAssertTrue(button("Allow").waitForNonExistence(timeout: 15))

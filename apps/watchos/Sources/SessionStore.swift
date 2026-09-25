@@ -810,6 +810,19 @@ final class SessionStore {
         }
     }
 
+    /// Whether a turn is in progress that Cancel would stop, so the conversation page can offer
+    /// it where the user is already looking instead of only in Settings.
+    var canCancelTurn: Bool {
+        sessionId != nil && [.thinking, .running, .waiting].contains(turnState)
+    }
+
+    /// Where dictated text will go, shown on the review screen before it is sent: the pending
+    /// question it answers, or a new prompt. Mirrors the routing in `submitDictation`.
+    var dictationDestination: String {
+        if let question = pendingQuestion { return "Answer to: \(question.text)" }
+        return "New prompt"
+    }
+
     /// Routes free text to the pending question when there is one, and to a new prompt otherwise.
     func submitDictation(_ text: String) async {
         if pendingQuestion != nil {
