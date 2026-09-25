@@ -178,6 +178,22 @@ final class SessionStore {
     private(set) var pendingApproval: ApprovalRequest?
     private(set) var pendingQuestion: QuestionRequestedPayload?
     private(set) var turnState: TurnState = .idle
+    /// The event id of the most recent turnStarted, so a caller that captured it before showing
+    /// UI (e.g. a confirmation dialog) can tell whether the turn it was shown for is still the
+    /// one running when the user acts, or a stop/start happened underneath it.
+    private(set) var currentTurnId: Int?
+    /// True between sendPrompt() and the turnStarted that answers it. Separates "this turn's id
+    /// is not known yet because it was just sent from here" from "a turn is running whose
+    /// turnStarted was never seen" (e.g. a gap replay that starts mid-turn): both leave
+    /// currentTurnId nil, but only the first may later be bound to the next turnStarted's id.
+    private(set) var awaitingLocalTurnStart = false
+    /// The id turnStarted bound `awaitingLocalTurnStart` to, kept so `.pendingLocal` stays
+    /// current through the very turnStarted that resolves it: applying a reconnect page can
+    /// run turnStarted's write to `currentTurnId` and a later turn's own start in one
+    /// synchronous loop, so a view's onChange never fires in between and must not be relied on
+    /// to rebind. Cleared on session reset and on the next sendPrompt(), so it never outlives
+    /// the turn it names.
+    @ObservationIgnored private var localResolvedTurnId: Int?
     private(set) var sessionId: String?
     private(set) var lastSeenEventId: Int
     private(set) var syncState: SyncState = .disconnected
@@ -295,6 +311,9 @@ final class SessionStore {
         sessionId = nil
         pendingApproval = nil
         pendingQuestion = nil
+        currentTurnId = nil
+        awaitingLocalTurnStart = false
+        localResolvedTurnId = nil
         if !preservingUnconfirmedSend {
             unconfirmedSend = nil
             unconfirmedCancel = nil
@@ -478,6 +497,9 @@ final class SessionStore {
             pendingApproval = nil
             pendingQuestion = nil
             turnState = .idle
+            currentTurnId = nil
+            awaitingLocalTurnStart = false
+            localResolvedTurnId = nil
             append(.system, "Session \(event.sessionId) started", id: event.eventId)
             return
         }
@@ -491,6 +513,11 @@ final class SessionStore {
             break
         case .turnStarted(let payload):
             turnState = .thinking
+            currentTurnId = event.eventId
+            if awaitingLocalTurnStart {
+                localResolvedTurnId = event.eventId
+            }
+            awaitingLocalTurnStart = false
             if let prompt = payload.prompt, !prompt.isEmpty {
                 append(.user, prompt, id: event.eventId)
             }
@@ -534,6 +561,9 @@ final class SessionStore {
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
             turnState = .completed
+            currentTurnId = nil
+            awaitingLocalTurnStart = false
+            localResolvedTurnId = nil
         case .sessionCompleted(let payload):
             turnState = payload.reason == .error ? .error : .completed
             append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
@@ -543,12 +573,19 @@ final class SessionStore {
             // instead of leaving it stuck on screen with a no-op approve()/answer().
             resetSessionState()
         case .error(let payload):
-            turnState = .error
             append(.system, payload.message, id: event.eventId)
             // Only a fatal error ends the session; a recoverable one keeps the binding so
-            // in-flight events for it are still applied.
+            // in-flight events for it are still applied. Turn tracking (currentTurnId) and
+            // turnState must only be cleared/overwritten here when there is no turn currently
+            // tracked as cancelable -- otherwise a recoverable error event (arriving on the
+            // stream while a turn is still running) would hide the Stop-turn button. This is
+            // the event stream's own rule, independent of report(), which no longer touches
+            // turnState at all.
             if payload.fatal {
+                turnState = .error
                 resetSessionState()
+            } else if !canCancelTurn {
+                turnState = .error
             }
         case .fileRead(let payload):
             append(.system, "Read \(payload.path)", id: event.eventId)
@@ -593,17 +630,40 @@ final class SessionStore {
         }
     }
 
-    func sendPrompt(_ text: String) async {
+    /// Returns whether the prompt was sent (a refused, empty or failed send returns false).
+    @discardableResult
+    func sendPrompt(_ text: String) async -> Bool {
+        // The bridge rejects any prompt.send while a turn is already running (409). Refusing
+        // here, before turnState/currentTurnId/awaitingLocalTurnStart are touched, keeps those
+        // untouched too -- a rejected send must not hide the Stop button while the turn it
+        // guards is still running.
+        guard !canCancelTurn else {
+            statusLine = "Turn in progress. Stop it or wait."
+            statusKind = .error
+            return false
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         var target = sessionId
         if target == nil { target = await createSession() }
-        guard let target else { return }
+        guard let target else { return false }
         turnState = .thinking
+        // The real turn id is not known until turnStarted arrives; clearing it here (rather
+        // than leaving the previous turn's id) stops a Stop-turn dialog opened in this window
+        // from being guarded against the wrong, stale id when that event lands.
+        currentTurnId = nil
+        awaitingLocalTurnStart = true
+        localResolvedTurnId = nil
         do {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
+            return true
         } catch {
+            // Only this send's own failure ends the wait for its turn; rollBackLocalTurn() is
+            // scoped to sendPrompt's own optimistic state, unlike report() which is shared with
+            // decide() and cancel() and must not touch turnState.
+            rollBackLocalTurn()
             report(error)
+            return false
         }
     }
 
@@ -646,24 +706,29 @@ final class SessionStore {
         )
     }
 
-    func answer(text: String) async {
-        guard let question = pendingQuestion, let target = sessionId else { return }
-        await decide(
+    @discardableResult
+    func answer(text: String) async -> Bool {
+        guard let question = pendingQuestion, let target = sessionId else { return false }
+        return await decide(
             .questionAnswer(QuestionAnswerPayload(questionId: question.questionId, text: text)),
             sessionId: target,
             card: .question(question.questionId)
         )
     }
 
-    /// Sends a decision for a pending card and records its outcome.
+    /// Sends a decision for a pending card and records its outcome. Returns whether the
+    /// decision actually reached the bridge (the send did not throw) -- callers that clear
+    /// UI state such as dictated text on success must gate that on this result, not on the
+    /// call merely returning.
     ///
     /// A send that fails without reaching a verdict (no connection, lost response, rate limit,
     /// or any other indeterminate failure) keeps the card and remembers the command id.
     /// Repeating the same choice reuses that id, so if the first send did land the bridge
     /// returns its recorded outcome instead of refusing the retry as no longer pending, or
     /// double-applying it. A different choice gets a fresh id.
-    private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async {
-        guard !isSending else { return }
+    @discardableResult
+    private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async -> Bool {
+        guard !isSending else { return false }
         isSending = true
         defer { isSending = false }
         // Bumped by reconnect(); if it moves while the send is in flight, this call's response
@@ -682,18 +747,23 @@ final class SessionStore {
         setOutcome(.sending, for: card)
         do {
             try await client.send(payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp)
-            guard generation == pollGeneration else { return }
+            // The send itself succeeded (accepted by the bridge) regardless of what the guards
+            // below do with local UI state, so every path out of this do block reports success.
+            guard generation == pollGeneration else { return true }
             unconfirmedSend = nil
             // If the resolution event already removed the card, its transcript line shows the
             // outcome and a "Sent" banner would only linger under it.
             guard isCurrent(card) else {
                 if actionOutcomeCardId == card.id { clearOutcome() }
-                return
+                return true
             }
             setOutcome(.acknowledged, for: card)
             clearCard(card)
+            return true
         } catch {
-            guard generation == pollGeneration else { return }
+            // Every path below reports failure: the send did not land a confirmed decision, so
+            // callers must not treat this as delivered (e.g. clearing dictated text).
+            guard generation == pollGeneration else { return false }
             unconfirmedSend = nil
             let outcome = ActionOutcome.classify(error)
             switch outcome {
@@ -704,7 +774,7 @@ final class SessionStore {
                 // would treat as a distinct command).
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 unconfirmedSend = UnconfirmedSend(
                     payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
@@ -717,7 +787,7 @@ final class SessionStore {
                 // button -- must stay. Only the outcome slot changes.
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 setOutcome(.reviewAtDesk, for: card)
             case let terminal:
@@ -729,13 +799,14 @@ final class SessionStore {
                 // call wrote at the top if it's still ours, or it would linger forever.
                 guard isCurrent(card) else {
                     if actionOutcomeCardId == card.id { clearOutcome() }
-                    return
+                    return false
                 }
                 setOutcome(terminal, for: card)
                 clearCard(card)
                 statusLine = terminal.statusText ?? statusLine
                 statusKind = terminal == .authRequired ? .authFailed : .requestInvalid
             }
+            return false
         }
     }
 
@@ -810,12 +881,88 @@ final class SessionStore {
         }
     }
 
+    /// Which turn a Stop-turn confirmation was opened for. Captured when the dialog opens and
+    /// checked when the user confirms, so a confirm never reaches a different turn.
+    enum StopTurnTarget: Equatable {
+        /// A turn whose turnStarted was seen.
+        case turn(Int)
+        /// The turn sendPrompt() just asked for; its id is not known yet.
+        case pendingLocal
+        /// A running turn whose turnStarted was never seen (e.g. joined mid-turn by a replay).
+        case unknown
+    }
+
+    var stopTurnTarget: StopTurnTarget {
+        if let currentTurnId { return .turn(currentTurnId) }
+        return awaitingLocalTurnStart ? .pendingLocal : .unknown
+    }
+
+    /// Whether confirming a Stop opened for `target` would still cancel that same turn. Resolved
+    /// entirely from store state rather than a view's onChange, so it gives the right answer
+    /// even when a reconnect page applies several events (e.g. this turn's completed followed by
+    /// a new turn's started) in one synchronous loop, with no render pass in between to observe.
+    func isStopTargetCurrent(_ target: StopTurnTarget) -> Bool {
+        guard canCancelTurn else { return false }
+        switch target {
+        case .turn(let id):
+            return currentTurnId == id
+        case .pendingLocal:
+            // Still current either while the id is still unknown, or once it has resolved to
+            // this turn's own turnStarted -- but not once a later, unrelated turn has started.
+            return awaitingLocalTurnStart
+                || (localResolvedTurnId != nil && currentTurnId == localResolvedTurnId)
+        case .unknown:
+            return currentTurnId == nil && !awaitingLocalTurnStart
+        }
+    }
+
+    /// Whether a turn is in progress that Cancel would stop, so the conversation page can offer
+    /// it where the user is already looking instead of only in Settings.
+    var canCancelTurn: Bool {
+        sessionId != nil && [.thinking, .running, .waiting].contains(turnState)
+    }
+
+    /// Where dictated text will go: the pending question it answers, or a new prompt.
+    enum DictationDestination: Equatable {
+        case newPrompt
+        case answer(questionId: String, text: String)
+
+        /// The label shown on the review screen. Mirrors what `dictationDestination` produced
+        /// as a `String` before this type existed.
+        var label: String {
+            switch self {
+            case .newPrompt: "New prompt"
+            case .answer(_, let text): "Answer to: \(text)"
+            }
+        }
+    }
+
+    /// Where dictated text will go, shown on the review screen before it is sent: the pending
+    /// question it answers, or a new prompt. Mirrors the routing in `submitDictation`.
+    var dictationDestination: DictationDestination {
+        if let question = pendingQuestion { return .answer(questionId: question.questionId, text: question.text) }
+        return .newPrompt
+    }
+
     /// Routes free text to the pending question when there is one, and to a new prompt otherwise.
-    func submitDictation(_ text: String) async {
-        if pendingQuestion != nil {
-            await answer(text: text)
-        } else {
-            await sendPrompt(text)
+    /// `expecting` is the destination the user reviewed and confirmed; it is compared against the
+    /// live `dictationDestination` synchronously, before any await, so a destination that changed
+    /// underneath the review screen (a new question, or the pending one being superseded) cannot
+    /// silently redirect this send. Returns whether the text was sent anywhere.
+    @discardableResult
+    func submitDictation(_ text: String, expecting: DictationDestination) async -> Bool {
+        guard expecting == dictationDestination else {
+            statusLine = "Not sent: the question changed. Review again."
+            statusKind = .error
+            return false
+        }
+        switch expecting {
+        case .answer:
+            return await answer(text: text)
+        case .newPrompt:
+            // sendPrompt() applies the R-010 guard itself and reports whether the text was
+            // actually sent, including when session creation fails first.
+            return await sendPrompt(text)
         }
     }
 
@@ -824,8 +971,20 @@ final class SessionStore {
     }
 
     private func report(_ error: any Error) {
-        turnState = .error
+        // report() is status-only; the turn-state consequence of a failure belongs to the
+        // caller that made the optimistic write (sendPrompt via rollBackLocalTurn) or to the
+        // event stream.
         statusLine = "\(error)"
         statusKind = .error
+    }
+
+    /// Sole owner of the undo for sendPrompt()'s optimistic turn state. A turnStarted that landed
+    /// during the send already cleared `awaitingLocalTurnStart` and is authoritative, so it wins.
+    private func rollBackLocalTurn() {
+        guard awaitingLocalTurnStart else { return }
+        awaitingLocalTurnStart = false
+        localResolvedTurnId = nil
+        currentTurnId = nil
+        turnState = .error
     }
 }

@@ -488,6 +488,587 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.actionOutcome, .acknowledged, "a resolution for an unrelated question id must not clear this card's outcome")
     }
 
+    /// The conversation page offers Stop turn only while a turn is in progress for a session.
+    func testCanCancelTurnOnlyWhileATurnIsInProgress() async throws {
+        let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertFalse(idle.canCancelTurn, "no session: nothing to stop")
+
+        let (store, _) = try await makeStoreWithPendingApproval()
+        XCTAssertEqual(store.turnState, .waiting)
+        XCTAssertTrue(store.canCancelTurn, "a turn waiting on an approval can be stopped")
+    }
+
+    /// R-005: every TurnState case, not just `.waiting`, must be exercised so a regression that
+    /// flips any single case's expected value fails this test. `.thinking`/`.running`/`.waiting`
+    /// are cancellable; `.idle`/`.completed`/`.error` are not; no session is never cancellable.
+    func testCanCancelTurnCoversEveryTurnState() async throws {
+        let noSession = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertFalse(noSession.canCancelTurn, "no session: nothing to stop")
+
+        let sessionStarted = """
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """
+
+        func makeStore() throws -> SessionStore {
+            let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+            store.apply(try decodeEvent(sessionStarted))
+            return store
+        }
+
+        let idle = try makeStore()
+        XCTAssertEqual(idle.turnState, .idle)
+        XCTAssertFalse(idle.canCancelTurn, "idle: no turn in progress")
+
+        let thinking = try makeStore()
+        thinking.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(thinking.turnState, .thinking)
+        XCTAssertTrue(thinking.canCancelTurn, "thinking: a turn is in progress")
+
+        let running = try makeStore()
+        running.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(running.turnState, .running)
+        XCTAssertTrue(running.canCancelTurn, "running: a turn is in progress")
+
+        let waiting = try makeStore()
+        waiting.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "question.requested",
+            "payload": {
+                "questionId": "q_1", "turnId": "turn_1", "text": "Continue?",
+                "options": [{ "id": "yes", "label": "Yes" }],
+                "allowFreeText": true
+            }
+        }
+        """))
+        XCTAssertEqual(waiting.turnState, .waiting)
+        XCTAssertTrue(waiting.canCancelTurn, "waiting: a turn is in progress")
+
+        let completed = try makeStore()
+        completed.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(completed.turnState, .completed)
+        XCTAssertNotNil(completed.sessionId, "turn.completed does not reset the session binding")
+        XCTAssertFalse(completed.canCancelTurn, "completed: no turn in progress")
+
+        let errored = try makeStore()
+        errored.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "recoverable boom", "fatal": false }
+        }
+        """))
+        XCTAssertEqual(errored.turnState, .error)
+        XCTAssertNotNil(errored.sessionId, "a recoverable error does not reset the session binding")
+        XCTAssertFalse(errored.canCancelTurn, "error: no turn in progress")
+    }
+
+    /// R-001: sendPrompt() sets turnState optimistically before the new turn's id is known, so it
+    /// must also clear currentTurnId rather than leaving the previous turn's id in place -- a
+    /// Stop-turn dialog opened in that window must be able to bind to the next turn.started
+    /// instead of staying pinned to a turn that already completed.
+    func testSendPromptClearsCurrentTurnIdUntilNextTurnStarted() async throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+
+        XCTAssertFalse(store.awaitingLocalTurnStart)
+        await store.sendPrompt("go again")
+        XCTAssertNil(store.currentTurnId, "the new turn's id is not known yet; must not still read the finished turn's id")
+        XCTAssertTrue(store.awaitingLocalTurnStart, "sendPrompt must mark the id-less turn as this Watch's own")
+        XCTAssertEqual(store.stopTurnTarget, .pendingLocal)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 5, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:03.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_2" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 5, "the freshly started turn's id must now be current")
+        XCTAssertFalse(store.awaitingLocalTurnStart, "turnStarted answers the local send; the flag must not stick")
+    }
+
+    /// R-016: a failed cancel reports through the shared report() path; that must not clear the
+    /// wait for a prompt this Watch already sent, or its turnStarted would no longer be claimed.
+    func testCancelFailureKeepsAwaitingLocalTurnStart() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        let sentPrompt = await store.sendPrompt("go")
+        XCTAssertTrue(sentPrompt)
+        XCTAssertTrue(store.awaitingLocalTurnStart)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.cancel()
+
+        XCTAssertTrue(store.awaitingLocalTurnStart, "a cancel failure must not end the wait for this Watch's own turn")
+    }
+
+    /// R-016: cancel() has no turnState precondition of its own -- it can be called with no turn
+    /// tracked as cancelable. A failed cancel while idle (turn already completed) must go through
+    /// report()'s status-only path and leave turnState untouched, since report() no longer writes
+    /// turnState at all.
+    func testCancelFailureWhileIdleDoesNotChangeTurnState() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(store.turnState, .completed)
+        XCTAssertFalse(store.canCancelTurn)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.cancel()
+
+        XCTAssertEqual(store.turnState, .completed, "a failed cancel while idle must not invent a turn or an error state")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-017: dictation with no session whose session creation fails sent nothing, so it must
+    /// report false rather than claiming the text went somewhere.
+    func testSubmitDictationReturnsFalseWhenSessionCreationFails() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+
+        let sent = await store.submitDictation("go", expecting: .newPrompt)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertFalse(calls.contains { if case .promptSend = $0.payload { true } else { false } }, "no prompt may be sent")
+    }
+
+    /// R-001: a failed prompt send must not leave the Watch believing its own turn is still on
+    /// the way, or a later unrelated turnStarted would be adopted by a Stop dialog.
+    func testSendPromptFailureClearsAwaitingLocalTurnStart() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.sendPrompt("go")
+        XCTAssertFalse(store.awaitingLocalTurnStart)
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+    }
+
+    /// R-016/R-022: a failed sendPrompt() must roll back all of its own optimistic turn state --
+    /// not just awaitingLocalTurnStart -- so the UI does not keep showing a turn in progress for
+    /// a send that never reached the bridge. rollBackLocalTurn() is sendPrompt's own undo, not
+    /// report()'s, so this must hold even though report() no longer touches turnState at all.
+    func testSendPromptFailureResetsTurnStateAndStopTurn() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        let firstSend = await store.sendPrompt("go")
+
+        XCTAssertFalse(firstSend)
+        XCTAssertEqual(store.turnState, .error)
+        XCTAssertFalse(store.canCancelTurn)
+        XCTAssertNil(store.currentTurnId)
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+        XCTAssertEqual(store.statusKind, .error)
+
+        await client.setSendResult(.success(CommandResponse()))
+        let secondSend = await store.sendPrompt("go again")
+        XCTAssertTrue(secondSend, "a later, successful send must not be blocked by the earlier failure's leftover state")
+    }
+
+    /// R-016: a turnStarted that lands while sendPrompt()'s send is still in flight is
+    /// authoritative and must win over a failure that arrives after it -- rollBackLocalTurn()
+    /// only undoes the wait it started, and that wait was already resolved by the event.
+    func testSendPromptFailureAfterTurnStartedKeepsEventState() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        await client.gateSendCall(1)
+        let sendTask = Task { await store.sendPrompt("go") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertFalse(store.awaitingLocalTurnStart, "turnStarted already resolved the wait")
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await client.openSendGate()
+        _ = await sendTask.value
+
+        XCTAssertEqual(store.turnState, .thinking, "turn.started's turnState must survive a send failure that lands after it")
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertTrue(store.canCancelTurn)
+    }
+
+    /// R-007: `.pendingLocal` must stay current through the very turnStarted that resolves it,
+    /// with no view onChange needed to rebind it -- and must not follow a later, unrelated turn.
+    func testStopTurnTargetPendingLocalStaysCurrentAcrossItsOwnTurnStarted() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let started = #"{ "projectId": "prj_demo", "resumed": false }"#
+
+        let local = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        local.apply(try event(1, "session.started", started))
+        await local.sendPrompt("go")
+        let pending = local.stopTurnTarget
+        XCTAssertEqual(pending, .pendingLocal)
+        XCTAssertTrue(local.isStopTargetCurrent(pending))
+
+        local.apply(try event(4, "turn.started", #"{ "turnId": "turn_4" }"#))
+        XCTAssertTrue(local.isStopTargetCurrent(pending), "pendingLocal stays current once its own turn's id resolves")
+
+        // A later, unrelated turn must not be treated as still current for that target.
+        local.apply(try event(5, "turn.completed", #"{ "turnId": "turn_4" }"#))
+        local.apply(try event(6, "turn.started", #"{ "turnId": "turn_6" }"#))
+        XCTAssertFalse(local.isStopTargetCurrent(pending), "a dialog for the first local turn must not cancel a later one")
+        XCTAssertTrue(local.isStopTargetCurrent(.turn(6)))
+    }
+
+    /// R-007: a reconnect page can apply a turn's completed and a new turn's started in one
+    /// synchronous loop (the same path SessionStore.apply() takes for every event in a page), so
+    /// `.turn(id)` must read as stale from store state alone once that loop has run, with no
+    /// intermediate render pass to observe canCancelTurn's true -> false -> true swing.
+    func testStopTurnTargetTurnIsStaleAfterCompletedThenStartedInOnePass() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        store.apply(try event(2, "turn.started", #"{ "turnId": "turn_5" }"#))
+        let target = store.stopTurnTarget
+        XCTAssertEqual(target, .turn(2))
+        XCTAssertTrue(store.isStopTargetCurrent(target))
+
+        // Same batch a reconnect gap-replay page would apply: completed(2) then started(3), back
+        // to back with no render pass between them.
+        store.apply(try event(3, "turn.completed", #"{ "turnId": "turn_5" }"#))
+        store.apply(try event(4, "turn.started", #"{ "turnId": "turn_6" }"#))
+
+        XCTAssertFalse(store.isStopTargetCurrent(target), "turn 2's dialog must not read as current once a new turn has started")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(4)), "the new turn is the one now running")
+    }
+
+    /// R-008: turn.completed must clear currentTurnId, not just awaitingLocalTurnStart. A partial
+    /// replay page can apply the next turn's questionRequested without ever seeing its
+    /// turnStarted; that must read as `.unknown`, never as the previous, already-finished turn's
+    /// id, or a Stop dialog opened for the old turn would stay valid and cancel the new one.
+    func testStopTurnTargetClearsAfterCompletedThenQuestionWithoutTurnStarted() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        store.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        store.apply(try event(5, "turn.started", #"{ "turnId": "turn_5" }"#))
+        XCTAssertEqual(store.stopTurnTarget, .turn(5))
+
+        store.apply(try event(6, "turn.completed", #"{ "turnId": "turn_5" }"#))
+        // The next turn's turnStarted is missing from this replay page; its questionRequested
+        // arrives directly.
+        store.apply(try event(7, "question.requested", """
+        {
+            "questionId": "q_1", "turnId": "turn_6", "text": "Continue?",
+            "options": [{ "id": "yes", "label": "Yes" }],
+            "allowFreeText": true
+        }
+        """))
+
+        XCTAssertNil(store.currentTurnId, "turn.completed must clear the finished turn's id")
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+        XCTAssertFalse(store.isStopTargetCurrent(.turn(5)), "a dialog opened for the finished turn must not cancel the new one")
+    }
+
+    /// R-007: `.unknown` (a turn joined mid-run, whose turnStarted was never seen) must not be
+    /// treated as current once an unrelated turn.started lands.
+    func testStopTurnTargetUnknownIsStaleAfterUnrelatedTurnStarted() async throws {
+        func event(_ id: Int, _ type: String, _ payload: String) throws -> AgentEvent {
+            try decodeEvent("""
+            {
+                "eventId": \(id), "sessionId": "sess_1", "provider": "mock",
+                "timestamp": "2026-09-17T00:00:00.000Z", "type": "\(type)", "payload": \(payload)
+            }
+            """)
+        }
+        let orphan = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        orphan.apply(try event(1, "session.started", #"{ "projectId": "prj_demo", "resumed": false }"#))
+        orphan.apply(try event(2, "command.started", #"{ "executionId": "exec_1", "command": "ls" }"#))
+        let unknown = orphan.stopTurnTarget
+        XCTAssertEqual(unknown, .unknown)
+        XCTAssertTrue(orphan.isStopTargetCurrent(unknown), "the unseen turn is still the one running")
+
+        orphan.apply(try event(9, "turn.started", #"{ "turnId": "turn_9" }"#))
+        XCTAssertFalse(orphan.isStopTargetCurrent(unknown), "confirm must not cancel the unrelated turn")
+    }
+
+    /// The dictation review screen names where the text goes, matching submitDictation's routing.
+    func testDictationDestinationFollowsPendingQuestion() async throws {
+        let idle = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        XCTAssertEqual(idle.dictationDestination, .newPrompt)
+        XCTAssertEqual(idle.dictationDestination.label, "New prompt")
+
+        let (store, _) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        XCTAssertEqual(store.dictationDestination, .answer(questionId: question.questionId, text: question.text))
+        XCTAssertEqual(store.dictationDestination.label, "Answer to: \(question.text)")
+    }
+
+    /// R-010: sendPrompt() must refuse while a turn is already running rather than clobbering the
+    /// live turn's id/state -- the bridge rejects prompt.send with a 409 in this window, and
+    /// clearing currentTurnId first would hide the Stop button for a turn that is still going.
+    func testSendPromptRefusesWhileTurnIsRunning() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertEqual(store.turnState, .running)
+
+        await store.sendPrompt("x")
+
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a running turn must refuse the send rather than reach the bridge")
+        XCTAssertEqual(store.currentTurnId, 2, "the live turn's id must be untouched")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(2)), "the Stop button must still target the running turn")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-010: submitDictation() must apply the same running-turn refusal as sendPrompt() when the
+    /// reviewed destination is .newPrompt and a turn is live underneath it.
+    func testSubmitDictationNewPromptRefusedWhileTurnRunning() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "command.started",
+            "payload": { "executionId": "exec_1", "command": "echo hi" }
+        }
+        """))
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertEqual(store.turnState, .running)
+
+        let sent = await store.submitDictation("x", expecting: .newPrompt)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a running turn must refuse the send rather than reach the bridge")
+        XCTAssertEqual(store.currentTurnId, 2, "the live turn's id must be untouched")
+        XCTAssertTrue(store.isStopTargetCurrent(.turn(2)), "the Stop button must still target the running turn")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-009: a review screen captured while a question was pending must not silently redirect
+    /// its send to a new prompt once that question is answered or replaced from elsewhere.
+    func testSubmitDictationRefusesWhenExpectedQuestionNoLongerPending() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        let expecting = SessionStore.DictationDestination.answer(questionId: question.questionId, text: question.text)
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "question.answered",
+            "payload": { "questionId": "q_1", "answer": "yes" }
+        }
+        """))
+        XCTAssertNil(store.pendingQuestion, "setup should leave the question no longer pending")
+
+        let sent = await store.submitDictation("x", expecting: expecting)
+
+        XCTAssertFalse(sent)
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty, "a mismatched destination must send nothing")
+        XCTAssertEqual(store.statusLine, "Not sent: the question changed. Review again.")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
+    /// R-009: the positive paths -- a confirmed destination that still matches live state routes
+    /// exactly where it says it will.
+    func testSubmitDictationRoutesToMatchingDestination() async throws {
+        let (questionStore, questionClient) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(questionStore.pendingQuestion)
+        await questionClient.setSendResult(.success(CommandResponse(accepted: true)))
+
+        let answered = await questionStore.submitDictation(
+            "yes please",
+            expecting: .answer(questionId: question.questionId, text: question.text)
+        )
+
+        XCTAssertTrue(answered)
+        let questionCalls = await questionClient.sentCalls
+        XCTAssertEqual(questionCalls.count, 1, "expecting .answer must route through answer(text:)")
+
+        let promptClient = FakeBridgeClient()
+        let promptStore = SessionStore(client: promptClient, defaults: freshDefaults())
+        promptStore.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        let sent = await promptStore.submitDictation("go", expecting: .newPrompt)
+
+        XCTAssertTrue(sent)
+        let promptCalls = await promptClient.sentCalls
+        XCTAssertEqual(promptCalls.count, 1, "expecting .newPrompt with no turn active must route through sendPrompt")
+        if case .promptSend(let payload) = promptCalls.first?.payload {
+            XCTAssertEqual(payload.text, "go")
+        } else {
+            XCTFail("expected a promptSend command")
+        }
+    }
+
+    /// R-018: submitDictation's .answer case must not report success when the underlying
+    /// decide() send fails -- DictateView only clears the dictated text and dismisses when
+    /// submitDictation returns true, so a failed answer send must return false and keep the
+    /// card, not silently look like it succeeded.
+    func testSubmitDictationAnswerReturnsFalseWhenSendFails() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        let question = try XCTUnwrap(store.pendingQuestion)
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+
+        let sent = await store.submitDictation(
+            "Sure",
+            expecting: .answer(questionId: question.questionId, text: question.text)
+        )
+
+        XCTAssertFalse(sent, "a failed answer send must not be reported as sent")
+        XCTAssertNotNil(store.pendingQuestion, "the card must stay so the answer can be retried")
+        XCTAssertEqual(store.outcome(forCard: question.questionId), .offline)
+    }
+
     /// E-28: a rate-limited send goes through decide() like an offline one: the card stays,
     /// the outcome is rateLimited, and the same choice retries with the same command id.
     func testRateLimitedKeepsCardAndRetriesWithSameCommandId() async throws {
@@ -727,19 +1308,23 @@ final class SessionStoreDecisionTests: XCTestCase {
     }
 
     /// R-005/R-009 (ACCEPTED contract): a retryable cancel failure sets an error status and
-    /// turnState (report(error)'s side effect). A later successful retry reuses the failed
-    /// cancel's command id and clears `unconfirmedCancel` -- proven here by a further failure
-    /// minting a fresh command id instead of replaying the old one -- but it does NOT itself
-    /// clear the error status/turnState (R-005 is accepted, not fixed: a clearing flag was tried
-    /// and removed because it could wipe an unrelated live error). The stale error survives at
-    /// most one poll round trip: the next successful poll page unconditionally rewrites
-    /// statusLine/statusKind regardless of what set them.
+    /// status (report(error)'s side effect). Per R-019, a failed cancel is a recoverable error
+    /// while a turn is still tracked as cancelable, so it must not overwrite turnState (and
+    /// hide the Stop-turn button) -- turnState stays whatever it was (here `.waiting`, from the
+    /// pending approval in setup). A later successful retry reuses the failed cancel's command
+    /// id and clears `unconfirmedCancel` -- proven here by a further failure minting a fresh
+    /// command id instead of replaying the old one -- but it does NOT itself clear the error
+    /// status (R-005 is accepted, not fixed: a clearing flag was tried and removed because it
+    /// could wipe an unrelated live error). The stale error survives at most one poll round
+    /// trip: the next successful poll page unconditionally rewrites statusLine/statusKind
+    /// regardless of what set them.
     func testCancelRetrySucceedsButErrorStatusClearsOnlyOnNextPollPage() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()
         await client.setSendResult(.failure(URLError(.timedOut)))
 
         await store.cancel()
-        XCTAssertEqual(store.turnState, .error, "setup: the failed cancel must have written the error turnState")
+        XCTAssertEqual(store.turnState, .waiting, "R-019: a recoverable cancel failure must not clear the in-progress turnState")
+        XCTAssertTrue(store.canCancelTurn, "R-019: the Stop-turn button must stay available after a recoverable cancel failure")
         XCTAssertEqual(store.statusKind, .error, "setup: the failed cancel must have written the error status")
         let failedCommandId = (await client.sentCalls).last!.commandId
 
@@ -749,7 +1334,7 @@ final class SessionStoreDecisionTests: XCTestCase {
         let callsAfterRetry = await client.sentCalls
         XCTAssertEqual(callsAfterRetry.count, 2)
         XCTAssertEqual(callsAfterRetry[1].commandId, failedCommandId, "a successful retry must reuse the failed cancel's command id")
-        XCTAssertEqual(store.turnState, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error turnState")
+        XCTAssertEqual(store.turnState, .waiting, "a successful retry keeps the in-progress turnState")
         XCTAssertEqual(store.statusKind, .error, "ACCEPTED (R-005): a successful retry alone does not clear the error status")
 
         // A further failure must mint a fresh command id, proving the successful retry cleared
@@ -1502,6 +2087,54 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, statusKindAfterReconnect)
     }
 
+    /// R-024: decide()'s "the send itself succeeded" early return (`guard generation ==
+    /// pollGeneration else { return true }`) must still report true through answer(text:) even
+    /// though a concurrent reconnect() means no local outcome/card state gets touched -- callers
+    /// like submitDictation() must not treat a send that reached the bridge as failed.
+    func testDecideSuccessAfterConcurrentReconnectStillReturnsTrue() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(text: "yes please") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.sessionId)
+        XCTAssertNil(store.pendingQuestion, "reconnect() must have already discarded the old card")
+
+        await client.openSendGate()
+        let sent = await answerTask.value
+
+        XCTAssertTrue(sent, "the send reached the bridge; a stale generation must not turn that into a reported failure")
+        XCTAssertNil(store.actionOutcome, "a stale generation's response must not resurrect an outcome for a discarded card")
+        XCTAssertNil(store.outcome(forCard: "q_1"))
+    }
+
+    /// R-024 twin: the catch-path early return (`guard generation == pollGeneration else {
+    /// return false }`) must still report false through answer(text:) after a concurrent
+    /// reconnect(), and must not write any outcome for the discarded binding.
+    func testDecideFailureAfterConcurrentReconnectStillReturnsFalse() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(text: "yes please") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.pendingQuestion, "reconnect() must have already discarded the old card")
+
+        await client.openSendGate()
+        let sent = await answerTask.value
+
+        XCTAssertFalse(sent)
+        XCTAssertNil(store.actionOutcome, "a stale generation's failure must not record an outcome")
+        XCTAssertNil(store.outcome(forCard: "q_1"))
+    }
+
     /// Covers E-05: action_not_allowed / project_not_allowed come from static device policy, so
     /// the same command can never succeed on retry. They must classify as a terminal outcome,
     /// not the generic retryable `.failed`.
@@ -1714,6 +2347,65 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertEqual(store.sessionId, "sess_1")
         XCTAssertNotNil(store.pendingApproval, "a recoverable error must not clear an unrelated pending card")
+        XCTAssertEqual(store.turnState, .waiting, "the pending approval's turnState must survive the recoverable error")
+        XCTAssertTrue(store.canCancelTurn, "a turn tracked as cancelable must not be hidden by a recoverable error")
+    }
+
+    /// R-023 twin: a recoverable, non-fatal error that arrives with no turn currently tracked as
+    /// cancelable is the one case apply(.error) still turns into an error pill -- there is no
+    /// running turn whose Stop button this would hide.
+    func testRecoverableErrorWithNoTurnShowsErrorPill() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        let recoverableError = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "recoverable boom", "fatal": false }
+        }
+        """)
+        store.apply(recoverableError)
+
+        XCTAssertEqual(store.sessionId, "sess_1", "a non-fatal error must keep the session bound")
+        XCTAssertEqual(store.turnState, .error)
+        XCTAssertFalse(store.canCancelTurn)
+    }
+
+    /// Regression for R-019: a failed decide() send (e.g. a network hiccup rejecting reject())
+    /// reports a recoverable, non-fatal error through `report()`. That must not hide the
+    /// Stop-turn button or lose track of the running turn's id -- the server-side turn may
+    /// still be running even though this send failed.
+    func testFailedDecideSendKeepsStopTurnAvailableForSameTurn() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+
+        let turnStarted = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """)
+        store.apply(turnStarted)
+        XCTAssertTrue(store.canCancelTurn, "setup should leave a running, cancelable turn")
+        XCTAssertEqual(store.currentTurnId, 3)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.reject()
+
+        XCTAssertEqual(store.statusKind, .error)
+        XCTAssertTrue(
+            store.canCancelTurn,
+            "a recoverable decide() failure must not hide the Stop-turn button for a turn that may still be running"
+        )
+        XCTAssertEqual(store.currentTurnId, 3, "the turn being tracked must not change on a recoverable error")
     }
 
     /// Regression for R-020: reject()'s 409 branch was never exercised; mirrors the existing
