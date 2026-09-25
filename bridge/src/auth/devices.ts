@@ -8,8 +8,13 @@ import { atomicWriteFileSync, withFileLock } from "./persist";
 // why an on-disk lastSeenAt lagging by up to this much is safe.
 const LAST_SEEN_PERSIST_INTERVAL_MS = 60_000;
 
-// devices.json.lock defaults, per the "Device registry" section of docs/pairing-v0.md.
+// devices.json.lock defaults, per the "Device registry" section of docs/pairing-v0.md. The 2 s
+// default suits the one-shot admin CLI. The bridge runs on a single event loop and the lock wait is
+// synchronous, so it passes BRIDGE_LOCK_TIMEOUT_MS instead: the CLI holds the lock only for one
+// reload + write (milliseconds), so a short bound is plenty and never stalls every other request.
 const DEFAULT_LOCK_TIMEOUT_MS = 2000;
+export const BRIDGE_LOCK_TIMEOUT_MS = 250;
+// Only consulted for an empty/unparseable lock file; a lock naming a live pid is never stale.
 const LOCK_STALE_MS = 10_000;
 
 export interface DeviceRegistryOptions {
@@ -94,12 +99,12 @@ export class DeviceRegistry {
    * write (resurrecting a revoked device or re-granting a denied project). In-memory registries
    * have no file to race on and run `fn` directly.
    */
-  private locked<T>(fn: () => T): T {
+  private locked<T>(fn: () => T, timeoutMs: number = this.lockTimeoutMs): T {
     if (this.filePath === undefined) {
       return fn();
     }
     return withFileLock(`${this.filePath}.lock`, fn, {
-      timeoutMs: this.lockTimeoutMs,
+      timeoutMs,
       staleMs: LOCK_STALE_MS,
     });
   }
@@ -274,8 +279,9 @@ export class DeviceRegistry {
     // frequent than it, so the on-disk lastSeenAt would freeze at the first write forever.
     const persistedAtMs = this.persistedLastSeenAtMs.get(deviceId);
     if (persistedAtMs === undefined || now.getTime() - persistedAtMs >= LAST_SEEN_PERSIST_INTERVAL_MS) {
-      // Best-effort: a lock held past lockTimeoutMs (an operator command mid-write) skips this
-      // write rather than failing the request; the next touch past the interval retries.
+      // Best-effort and non-blocking: touch runs on every authenticated request, so it makes one
+      // lock attempt (timeout 0, no wait) and a busy lock (an operator command mid-write) skips
+      // this write rather than stalling the event loop; the next touch past the interval retries.
       let acquired = false;
       try {
         this.locked(() => {
@@ -291,7 +297,7 @@ export class DeviceRegistry {
           } catch (cause) {
             console.warn(`Agent Remote bridge: failed to persist lastSeenAt for device ${deviceId}`, cause);
           }
-        });
+        }, 0);
       } catch (cause) {
         // Errors from inside the lock (a corrupt file on reload) propagate as before; failing to
         // take the lock at all (timeout, or an unwritable state dir) just skips this write.

@@ -29,7 +29,7 @@ import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, ty
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
 import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "./auth/pairing";
-import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
+import { BRIDGE_LOCK_TIMEOUT_MS, DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { atomicWriteFileSync } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
@@ -189,7 +189,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const authEnabled = options.authEnabled ?? process.env.AGENTREMOTE_AUTH !== "off";
 
   const devicesFilePath = options.devicesFilePath ?? path.join(resolveStateDir(), "devices.json");
-  const registry = options.registry ?? DeviceRegistry.load(devicesFilePath);
+  // Short lock bound: the devices.json.lock wait is synchronous and would block the event loop.
+  const registry =
+    options.registry ?? DeviceRegistry.load(devicesFilePath, { lockTimeoutMs: BRIDGE_LOCK_TIMEOUT_MS });
   const SKEW_MS = 120_000; // 120 seconds in either direction, per docs/pairing-v0.md.
 
   // Durable bridge state lives next to the device registry, per docs/durability-v0.md. The same

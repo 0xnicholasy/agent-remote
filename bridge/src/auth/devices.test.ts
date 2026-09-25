@@ -9,6 +9,7 @@ import {
   rmSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -406,6 +407,49 @@ describe("DeviceRegistry", () => {
     warnSpy.mockRestore();
     expect(readFileSync(filePath, "utf8")).toBe(before);
     expect(registry.get(record.deviceId)?.revokedAt).toBeNull();
+  });
+
+  // F-23: age alone never makes a lock naming a live pid stale (a paused or slow holder).
+  test("a devices.json.lock held by a live pid is not taken over however old its mtime", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const lockPath = join(dir, "devices.json.lock");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath, { lockTimeoutMs: 50 });
+    registry.register(record);
+    const before = readFileSync(filePath, "utf8");
+
+    writeFileSync(lockPath, String(process.pid), "utf8");
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    utimesSync(lockPath, anHourAgo, anHourAgo);
+
+    expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
+      new RegExp(`locked by pid ${process.pid} at .*devices\\.json\\.lock.*remove .* manually`),
+    );
+    expect(readFileSync(filePath, "utf8")).toBe(before);
+    expect(readFileSync(lockPath, "utf8")).toBe(String(process.pid));
+  });
+
+  // F-24: touch runs on the bridge event loop, so a busy lock must not make it wait at all, even
+  // with the CLI's 2 s default configured for the mutating calls.
+  test("touch with a busy devices.json.lock returns immediately and skips its write", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ lastSeenAt: "2026-09-20T12:00:00.000Z" });
+    const registry = DeviceRegistry.load(filePath);
+    registry.register(record);
+    const before = readFileSync(filePath, "utf8");
+
+    writeFileSync(join(dir, "devices.json.lock"), String(process.pid), "utf8");
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const startedAt = performance.now();
+    registry.touch(record.deviceId, new Date("2026-09-20T12:05:00.000Z"));
+    const elapsedMs = performance.now() - startedAt;
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+
+    expect(elapsedMs).toBeLessThan(50);
+    expect(readFileSync(filePath, "utf8")).toBe(before);
   });
 
   test("a devices.json.lock left by a dead pid is taken over and released", () => {

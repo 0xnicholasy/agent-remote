@@ -70,12 +70,17 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
  * DeviceRegistry and the admin CLI on devices.json) cannot interleave and have the later rename
  * silently undo the earlier write. Synchronous, like every caller of `atomicWriteFileSync`.
  *
- * A lock whose holder pid is dead, or whose mtime is older than `staleMs`, is taken over using
+ * A lock is stale, and taken over, ONLY when its holder pid is provably dead (`kill(pid, 0)` ->
+ * ESRCH), or when its content is empty/unparseable AND its mtime is older than `staleMs` (a holder
+ * that crashed between its `wx` create and its pid write). A live pid is never taken over however
+ * old the lock is: a paused or slow holder (long fsync, SIGSTOP) still owns it, and taking it
+ * would let two processes run their read-modify-write at once. Takeover uses
  * the same rename-claim sequence as the bridge.lock takeover in server.ts: rename the stale file
  * to a unique claim path (only one contender's rename can consume it), check the claimed content
  * is the stale holder we probed (else put it back), then re-create the lock with `wx` so a third
  * process that slipped in wins instead of being overwritten. A contender that loses any step just
- * retries until `timeoutMs`, after which `FileLockTimeoutError` is thrown.
+ * retries until `timeoutMs`, after which `FileLockTimeoutError` is thrown. `timeoutMs: 0` makes
+ * exactly one attempt and never sleeps (for callers on an event loop that must not block).
  */
 export function withFileLock<T>(
   lockPath: string,
@@ -105,9 +110,13 @@ export function withFileLock<T>(
     }
     // holder === null: the lock vanished between our create and read; retry immediately-ish.
     if (Date.now() >= deadline) {
-      throw new FileLockTimeoutError(`devices.json is locked by pid ${lastHolder} at ${lockPath}`);
+      throw new FileLockTimeoutError(
+        `devices.json is locked by pid ${lastHolder} at ${lockPath}; if pid ${lastHolder} is not an ` +
+          `agent-remote process (pid reuse), remove ${lockPath} manually`,
+      );
     }
-    Atomics.wait(sleepCell, 0, 0, LOCK_RETRY_INTERVAL_MS);
+    // Never sleep past the deadline, so a short timeout bounds the total block time.
+    Atomics.wait(sleepCell, 0, 0, Math.max(1, Math.min(LOCK_RETRY_INTERVAL_MS, deadline - Date.now())));
   }
 
   const heldFd = lockFd;
@@ -125,7 +134,7 @@ export function withFileLock<T>(
         unlinkSync(lockPath);
       }
     } catch {
-      // ignore: already gone; a leftover lock is recovered by the stale check.
+      // ignore: already gone; a leftover lock is recovered once its pid is dead.
     } finally {
       closeSync(heldFd);
     }
@@ -175,15 +184,13 @@ function readLockHolder(lockPath: string): LockHolder | null {
 }
 
 function isLockStale(holder: LockHolder, staleMs: number): boolean {
-  if (Date.now() - holder.mtimeMs > staleMs) {
-    return true;
+  const pid = /^\d+$/.test(holder.raw) ? Number.parseInt(holder.raw, 10) : Number.NaN;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    // Empty/unparseable: a holder between its `wx` create and its pid write, or one that crashed
+    // there. Only the age can tell those apart, since there is no pid to probe.
+    return Date.now() - holder.mtimeMs > staleMs;
   }
-  const pid = Number.parseInt(holder.raw, 10);
-  // An empty/unparseable file is a holder between its `wx` create and its pid write: not stale
-  // until the mtime check above says so.
-  if (!Number.isFinite(pid) || pid <= 0) {
-    return false;
-  }
+  // A parseable pid is stale only when provably dead, regardless of the lock's age.
   try {
     process.kill(pid, 0);
     return false;
