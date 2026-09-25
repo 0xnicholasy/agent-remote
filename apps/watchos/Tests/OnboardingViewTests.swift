@@ -35,6 +35,19 @@ final class OnboardingViewTests: XCTestCase {
         XCTAssertTrue(OnboardingView.canAdvanceFromHostStep(host: "http://localhost:8799"))
     }
 
+    // MARK: - shouldShowDefaultHostHint
+
+    /// C3-005: the untouched default parses as valid (no red error) but still can't advance,
+    /// so the hint must show to explain why Next is disabled.
+    func testShouldShowDefaultHostHint_untouchedDefault_isTrue() {
+        XCTAssertTrue(OnboardingView.shouldShowDefaultHostHint(host: BridgeClient.defaultBaseURL.absoluteString))
+    }
+
+    /// An edited, valid, non-default host can advance, so the hint must not show.
+    func testShouldShowDefaultHostHint_validEditedHost_isFalse() {
+        XCTAssertFalse(OnboardingView.shouldShowDefaultHostHint(host: "192.168.1.20:8787"))
+    }
+
     // MARK: - previousStep
 
     func testPreviousStep_fromPairingCode_isHostAddress() {

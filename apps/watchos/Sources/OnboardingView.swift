@@ -38,6 +38,14 @@ struct OnboardingView: View {
         Self.canAdvanceFromHostStep(host: store.hostText)
     }
 
+    /// C3-005: on a real first launch `hostText` is the untouched default, so it parses as
+    /// valid (no red error) but still fails `canAdvanceFromHostStep` because it equals
+    /// `BridgeClient.defaultBaseURL`. Without this, Next is disabled with no visible reason.
+    /// True only for that specific "valid but still the default" state.
+    static func shouldShowDefaultHostHint(host: String) -> Bool {
+        BridgeClient.parseBaseURL(host) != nil && !canAdvanceFromHostStep(host: host)
+    }
+
     /// Back navigation from each step, extracted as a pure function so it can be unit tested
     /// without driving the view through SwiftUI.
     static func previousStep(_ step: Step) -> Step {
@@ -105,6 +113,11 @@ struct OnboardingView: View {
                         .font(.caption2)
                         .foregroundStyle(.red)
                         .accessibilityIdentifier("onboarding-host-error")
+                } else if Self.shouldShowDefaultHostHint(host: store.hostText) {
+                    Text("Replace the default with the address shown on your Mac.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("onboarding-host-default-hint")
                 }
             }
             Section {

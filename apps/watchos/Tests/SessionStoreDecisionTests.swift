@@ -2627,6 +2627,25 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
     }
 
+    /// Regression for C3-004: when pair() throws AND the follow-up pairing lookup is
+    /// .checkFailed, applyPairedLookup() already set pairingError to the keychain-failure
+    /// message; the pair() exception message must not overwrite it.
+    func testPairFailureWithCheckFailedLookupKeepsKeychainErrorMessage() async throws {
+        let client = FakeBridgeClient()
+        let defaults = freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+        await client.setPaired(false)
+        await client.setPairingCheckFailed(true)
+        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
+
+        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
+
+        XCTAssertTrue(store.pairingCheckFailed, "a checkFailed lookup after a failed pair() must set pairingCheckFailed")
+        XCTAssertEqual(store.pairingError, "simulated keychain read failure", "the lookup's own message must win over the pair() exception message")
+        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
+        XCTAssertTrue(store.pairingChecked)
+    }
+
     /// Regression for R-029: a terminal auth failure stops the poll loop, but a subsequent
     /// successful pair() must resume polling on its own -- without this, the loop stays dead
     /// until the app relaunches or the user changes host in Settings.
