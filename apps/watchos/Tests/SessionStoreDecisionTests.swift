@@ -467,6 +467,57 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNil(store.pendingApproval)
     }
 
+    /// C3-06: an accepted send whose reply cannot be read must not say "Not sent". The card
+    /// stays with its own label, and the same choice retries under the same command id so the
+    /// bridge replays its recorded outcome.
+    func testUnreadableReplyKeepsCardAndRetriesWithSameCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.commandResponseUnreadable))
+
+        await store.approve()
+
+        XCTAssertNotNil(store.pendingApproval, "an unreadable reply must keep the card for a retry")
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .unconfirmed)
+        XCTAssertNotEqual(ActionOutcome.unconfirmed.label, ActionOutcome.failed.label)
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(calls[0].timestamp, calls[1].timestamp)
+        XCTAssertNil(store.pendingApproval)
+    }
+
+    /// C3-07: a cancel whose outcome was lost retries under the same command id and body
+    /// timestamp, instead of sending a second, distinct cancel.
+    func testCancelRetryAfterLostResponseReusesCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+
+        await store.cancel()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(calls[0].timestamp, calls[1].timestamp)
+    }
+
+    /// C3-07: once a cancel is confirmed, the next cancel is a new command with a new id.
+    func testCancelAfterConfirmedCancelUsesNewCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+
+        await store.cancel()
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
+    }
+
     /// A different choice after an offline send is a different command, so it must not reuse
     /// the id (the bridge would refuse it as a conflict).
     func testOfflineThenDifferentChoiceUsesNewCommandId() async throws {

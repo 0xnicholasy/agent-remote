@@ -36,6 +36,9 @@ enum ActionOutcome: Equatable {
     case offline
     /// The bridge cannot say whether the command took effect.
     case indeterminate
+    /// The bridge accepted the send but its reply could not be read; the card stays and the
+    /// same choice can be sent again, which replays the recorded outcome under the same id.
+    case unconfirmed
     /// Any other failure; the card stays for a retry.
     case failed
     /// The bridge is rate limiting this device; the card stays and the same choice can be
@@ -56,6 +59,7 @@ enum ActionOutcome: Equatable {
         case .expired: "Expired"
         case .offline: "Not sent: offline. Tap again to retry."
         case .indeterminate: "Outcome unknown. Check at the desk."
+        case .unconfirmed: "Reply unreadable. Tap again to confirm."
         case .failed: "Not sent. Tap again to retry."
         case .rateLimited: "Bridge is busy. Tap again in a moment."
         case .authRequired: "Not sent: this Watch needs to be paired again."
@@ -79,6 +83,7 @@ enum ActionOutcome: Equatable {
         switch error {
         case BridgeError.decisionExpired: return .expired
         case BridgeError.commandIndeterminate: return .indeterminate
+        case BridgeError.commandResponseUnreadable: return .unconfirmed
         case BridgeError.interactionNotPending, BridgeError.commandIdConflict: return .noLongerValid
         // Pre-typed 409 bodies, such as a stale approval binding.
         case BridgeError.http(let status, _) where status == 409: return .noLongerValid
@@ -174,6 +179,8 @@ final class SessionStore {
     private(set) var actionOutcome: ActionOutcome?
     @ObservationIgnored private var actionOutcomeCardId: String?
     @ObservationIgnored private var unconfirmedSend: UnconfirmedSend?
+    /// A cancel whose outcome never reached the Watch; retrying reuses its command id.
+    @ObservationIgnored private var unconfirmedCancel: UnconfirmedSend?
     private(set) var paired = false
     private(set) var pairingError: String?
 
@@ -279,6 +286,7 @@ final class SessionStore {
         pendingQuestion = nil
         if !preservingUnconfirmedSend {
             unconfirmedSend = nil
+            unconfirmedCancel = nil
         }
         actionOutcome = nil
         actionOutcomeCardId = nil
@@ -666,7 +674,7 @@ final class SessionStore {
             unconfirmedSend = nil
             let outcome = ActionOutcome.classify(error)
             switch outcome {
-            case .offline, .failed, .rateLimited:
+            case .offline, .failed, .rateLimited, .unconfirmed:
                 // Keep the card so the choice can be retried, and remember the command id: the
                 // send may have reached the bridge even though its outcome did not reach the
                 // Watch, so a retry must reuse it rather than mint a fresh one (which the bridge
@@ -732,11 +740,27 @@ final class SessionStore {
         }
     }
 
+    /// Cancels the running turn. A cancel whose outcome did not reach the Watch keeps its
+    /// command id, so tapping Cancel again replays the bridge's recorded outcome instead of
+    /// sending a second, distinct cancel (same rule as `decide`).
     func cancel() async {
         guard let target = sessionId else { return }
+        let payload = CommandPayload.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch"))
+        let retry = unconfirmedCancel?.sessionId == target ? unconfirmedCancel : nil
+        let commandId = retry?.commandId ?? UUID().uuidString
+        let timestamp = retry?.timestamp ?? BridgeClient.timestamp()
         do {
-            try await perform(.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch")), sessionId: target)
+            try await client.send(payload, sessionId: target, commandId: commandId, timestamp: timestamp)
+            unconfirmedCancel = nil
         } catch {
+            switch ActionOutcome.classify(error) {
+            case .offline, .failed, .rateLimited, .unconfirmed:
+                unconfirmedCancel = UnconfirmedSend(
+                    payload: payload, sessionId: target, commandId: commandId, timestamp: timestamp
+                )
+            default:
+                unconfirmedCancel = nil
+            }
             report(error)
         }
     }
