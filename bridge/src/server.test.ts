@@ -288,6 +288,35 @@ describe("bridge HTTP surface", () => {
     expect(after.some((event) => event.type === "approval.resolved")).toBe(false);
   });
 
+  test("a desk-only approval past its expiresAt is refused with 410, not 403 review_at_desk", async () => {
+    // "desk" in the prompt is MockProvider's scripted trigger for a desk-only card (see mock.ts).
+    await post({
+      commandId: "d0000000-0000-4000-8000-000000000005",
+      sessionId: bridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "review this at the desk" },
+    });
+    const initialEvents = await eventsAfter(0);
+    const requested = approvalRequested(initialEvents);
+    expect(requested.titleFidelity).toBe("truncated");
+    const binding = pendingBinding(initialEvents);
+    const expired = { ...binding, expiresAt: new Date(Date.now() - 1000).toISOString() };
+
+    const response = await post({
+      commandId: "d0000000-0000-4000-8000-000000000006",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: expired },
+    });
+
+    // Expiry is checked before the desk-only gate, so a past-deadline desk-only approval reads
+    // as expired, not as a desk-only refusal.
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+
   test("approval.reject still works on a desk-only approval", async () => {
     await post({
       commandId: "d0000000-0000-4000-8000-000000000003",

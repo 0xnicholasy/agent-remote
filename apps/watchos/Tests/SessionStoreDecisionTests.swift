@@ -1579,7 +1579,22 @@ final class SessionStoreDecisionTests: XCTestCase {
     func testReviewAtDeskClassifiesDistinctlyFromNotAllowed() async throws {
         XCTAssertEqual(ActionOutcome.classify(BridgeError.reviewAtDesk), .reviewAtDesk)
         XCTAssertNotEqual(ActionOutcome.reviewAtDesk, .notAllowed)
-        XCTAssertNotNil(ActionOutcome.reviewAtDesk.statusText, "must clear the card with a message, like .notAllowed")
+        XCTAssertNotNil(ActionOutcome.reviewAtDesk.statusText, "status text exists for callers that do clear the card on it")
+    }
+
+    /// R-005 regression: unlike a static policy refusal, the bridge's `review_at_desk` for a
+    /// command that did reach it (decide()'s catch path) leaves the approval pending there, not
+    /// decided -- so the card, and the Deny button on it, must stay, exactly like the local
+    /// desk-only guard in approve().
+    func testBridgeReviewAtDeskKeepsCardAndDenyAvailable() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.reviewAtDesk))
+
+        await store.approve()
+
+        XCTAssertNotNil(store.pendingApproval, "the approval is still pending on the bridge; Deny must stay available")
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .reviewAtDesk)
     }
 
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a

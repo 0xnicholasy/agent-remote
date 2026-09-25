@@ -62,11 +62,11 @@ final class CoreScreensUITests: XCTestCase {
 
         button("Deny").tap()
         XCTAssertTrue(button("Allow").waitForNonExistence(timeout: 15))
-        // The mock provider's approval title is always "Run git push origin main", so the
+        // The mock provider's approval title is always "git push origin main", so the
         // resolution line SessionStore.resolutionLine renders is deterministic regardless of
         // the prompt text sent above.
         XCTAssertTrue(
-            app.staticTexts.matching(NSPredicate(format: "label == %@", "Denied: Run git push origin main")).firstMatch
+            app.staticTexts.matching(NSPredicate(format: "label == %@", "Denied: git push origin main")).firstMatch
                 .waitForExistence(timeout: 5),
             "expected the transcript to show the deny resolution line"
         )

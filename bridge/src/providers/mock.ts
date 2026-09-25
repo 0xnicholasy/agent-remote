@@ -142,13 +142,13 @@ export class MockProvider implements AgentProvider {
       ? `git push origin main --force-with-lease --push-option=ci.skip --push-option=deploy.notify=${"a".repeat(240)}`
       : "git push origin main";
     const truncated = action.length > ACTION_TEXT_MAX_LENGTH;
-    const title = wantsDeskOnlyCard ? action.slice(0, ACTION_TEXT_MAX_LENGTH - 1) + "…" : `Run ${action}`;
+    const title = wantsDeskOnlyCard ? action.slice(0, ACTION_TEXT_MAX_LENGTH - 1) + "…" : action;
     const binding: ApprovalBinding = {
       approvalId: `apr_${randomUUID()}`,
       sessionId,
       turnId,
       toolCallId: `tc_${++this.counter}`,
-      actionDigest: digest(action),
+      actionDigest: digest(title),
       expiresAt: new Date(this.now().getTime() + this.ttlMs).toISOString(),
     };
     const expiryTimer = this.armApprovalExpiry(sessionId, binding.approvalId);

@@ -711,6 +711,15 @@ final class SessionStore {
                 )
                 setOutcome(outcome, for: card)
                 if outcome == .failed { report(error) }
+            case .reviewAtDesk:
+                // The bridge refused this as desk-only, same as the local guard in approve()
+                // (~line 620): the approval is still pending there, so the card -- and the Deny
+                // button -- must stay. Only the outcome slot changes.
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
+                setOutcome(.reviewAtDesk, for: card)
             case let terminal:
                 // A newer card can have replaced this one while the send was in flight (same
                 // guard the offline/failed/rateLimited branch above already applies). Bail out
