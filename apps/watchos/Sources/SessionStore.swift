@@ -316,11 +316,41 @@ final class SessionStore {
             start()
         } catch {
             let lookup = await client.pairingLookup()
-            pairingError = "\(error)"
+            // A concurrent pair()/refreshPairedState() may have already applied a newer result
+            // while this one was suspended on the awaits above; guard every write below, not
+            // just applyPairedLookup(), or a stale failure could overwrite a newer pairingError.
             guard generation == pairGeneration else { return }
+            pairingError = "\(error)"
             applyPairedLookup(lookup)
             pairingChecked = true
         }
+    }
+
+    /// Clears the stored device credential and routes back to onboarding (R2-001): a
+    /// permanently undecodable credential (corrupt keychain data, not a transient read error)
+    /// would otherwise leave `PairingCheckFailedView`'s Retry failing forever with no way out
+    /// short of deleting the app. Only ever called from the user's explicit "Pair again" tap --
+    /// never automatically -- since this discards a credential that may still be valid.
+    func clearPairing() async {
+        pairGeneration += 1
+        let generation = pairGeneration
+        do {
+            try await client.clearCredential()
+        } catch {
+            // The keychain delete itself failed: the old (possibly undecodable) credential is
+            // still stored, so routing to onboarding here would just repeat the same failure on
+            // next launch (V2-001). Stay on PairingCheckFailedView -- pairingCheckFailed stays
+            // true, paired/everPaired untouched -- and surface the error so Retry/Pair again
+            // remain reachable.
+            guard generation == pairGeneration else { return }
+            pairingError = "Couldn't clear pairing: \(error)"
+            return
+        }
+        guard generation == pairGeneration else { return }
+        paired = false
+        everPaired = false
+        pairingCheckFailed = false
+        pairingError = nil
     }
 
     /// Applies a `PairingLookup`, distinguishing "no credential" from "the lookup failed to

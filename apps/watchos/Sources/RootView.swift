@@ -33,6 +33,7 @@ struct RootView: View {
 private struct PairingCheckFailedView: View {
     @Environment(SessionStore.self) private var store
     @State private var retrying = false
+    @State private var clearing = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -41,6 +42,11 @@ private struct PairingCheckFailedView: View {
             Text("The stored pairing could not be read. Try again.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+            if let pairingError = store.pairingError {
+                Text(pairingError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
             Button("Retry") {
                 Task {
                     retrying = true
@@ -48,7 +54,19 @@ private struct PairingCheckFailedView: View {
                     retrying = false
                 }
             }
-            .disabled(retrying)
+            .disabled(retrying || clearing)
+            // R2-001: if the stored credential is permanently undecodable (corrupt data, not a
+            // transient error), Retry fails forever. This is the only way out short of deleting
+            // the app -- an explicit, user-initiated escape hatch, never triggered automatically.
+            Button("Pair again", role: .destructive) {
+                Task {
+                    clearing = true
+                    await store.clearPairing()
+                    clearing = false
+                }
+            }
+            .disabled(retrying || clearing)
+            .accessibilityIdentifier("pairing-check-failed-pair-again")
         }
         .padding()
     }

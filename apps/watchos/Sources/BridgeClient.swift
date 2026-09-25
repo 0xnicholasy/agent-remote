@@ -204,6 +204,10 @@ protocol BridgeClientProtocol: Sendable {
     /// clear `.checkFailed` instead of replaying the same cached failure forever.
     @discardableResult
     func reloadCredential() async -> PairingLookup
+    /// Deletes the stored device credential (Settings/onboarding "Pair again", R2-001), so a
+    /// permanently undecodable credential does not leave the user stuck on
+    /// `PairingCheckFailedView` forever. Only ever invoked from an explicit user action.
+    func clearCredential() async throws
     func events(after: Int, wait: Int) async throws -> EventsPage
     /// `commandId` is the idempotency key: resending the same payload with the same id gets the
     /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
@@ -294,6 +298,15 @@ actor BridgeClient: BridgeClientProtocol {
             self.credentialLoadFailed = true
         }
         return pairingLookup()
+    }
+
+    /// Deletes the stored device credential and clears the in-memory copy, so the next
+    /// `pairingLookup()` reports `.notPaired` even for a credential that was undecodable
+    /// (`.error`, not `.notFound`) and would otherwise never clear itself.
+    func clearCredential() throws {
+        try credentialStore.clear()
+        credential = nil
+        credentialLoadFailed = false
     }
 
     /// Kept for `BridgeClientAuthTests`, which exercises pairing directly against the concrete
