@@ -1538,7 +1538,21 @@ final class SessionStoreDecisionTests: XCTestCase {
         let calls = await client.sentCalls
         XCTAssertEqual(calls.count, 0, "approve() must not send anything for a desk-only approval")
         XCTAssertNotNil(store.pendingApproval, "the card must stay in place")
-        XCTAssertNil(store.actionOutcome)
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+    }
+
+    /// R-001 regression: approve() must not silently no-op the desk-only guard -- it has to
+    /// surface a visible outcome on the current card, e.g. for a stale-card race where the
+    /// card the user tapped Allow on was replaced by a desk-only one before this call ran.
+    func testApproveSurfacesOutcomeForDeskOnlyGuard() async throws {
+        let (store, client) = try await makeStoreWithPendingDeskOnlyApproval()
+
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 0)
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .reviewAtDesk)
     }
 
     /// M4: reject() is unaffected by the desk-only gate -- declining an action the user cannot
@@ -1558,11 +1572,14 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.actionOutcome, .acknowledged)
     }
 
-    /// M4: the bridge's `review_at_desk` refusal (e.g. if a stale client somehow did send
-    /// approve() for a desk-only approval) classifies the same way a static policy refusal
-    /// does -- terminal, not retryable.
-    func testReviewAtDeskClassifiesAsNotAllowed() async throws {
-        XCTAssertEqual(ActionOutcome.classify(BridgeError.reviewAtDesk), .notAllowed)
+    /// R-002 regression: the bridge's `review_at_desk` refusal (e.g. if a stale client somehow
+    /// did send approve() for a desk-only approval) gets its own outcome, not the generic
+    /// `.notAllowed`, so the Watch can still say "review at the Mac" -- while remaining terminal
+    /// and not retryable, same as a static policy refusal.
+    func testReviewAtDeskClassifiesDistinctlyFromNotAllowed() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.reviewAtDesk), .reviewAtDesk)
+        XCTAssertNotEqual(ActionOutcome.reviewAtDesk, .notAllowed)
+        XCTAssertNotNil(ActionOutcome.reviewAtDesk.statusText, "must clear the card with a message, like .notAllowed")
     }
 
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
