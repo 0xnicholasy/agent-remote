@@ -203,6 +203,12 @@ holds `deviceId`, `deviceName`, `keyId`, the device key as hex, `pairedAt`, `all
 The file holds live credentials. It is written atomically (temp file then rename) so a crash
 mid-write cannot truncate the registry.
 
+Every reload -> mutate -> write of `devices.json` (register, revoke, project allow/deny, the
+throttled `lastSeenAt` write) runs under an exclusive `devices.json.lock` holding the writer's pid;
+the bridge and the operator CLI both honour it, so neither can overwrite the other's write with a
+stale copy. A lock whose pid is dead or that is older than 10 s is taken over; otherwise a writer
+waits up to 2 s and then fails (the `lastSeenAt` write just skips).
+
 A newly paired device is granted every action, and every project the bridge currently exposes. The
 registry format carries per-device narrowing so a Mac control surface can tighten it later (M4)
 without another protocol change.

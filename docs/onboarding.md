@@ -49,6 +49,9 @@ bun run bridge projects deny <deviceId> <prj_id|/abs/path>
 
 An empty `allowedProjects` means the device is allowed no project at all, not "allow everything."
 
+`projects list` and `projects allow` read the project list of the running bridge (or, if none is
+running, the last bridge started against this state dir), not this shell's own environment.
+
 ## What is not here yet
 
 Watch-side onboarding screens (guided pairing UI, project picker) are not built; pairing today is

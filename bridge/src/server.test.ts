@@ -22,11 +22,13 @@ import { SessionLimitError, TurnInProgressError, UnknownSessionError } from "@ag
 import {
   assertAuthBypassAllowed,
   createBridge,
+  legacyOperatorEnvError,
   projectIdFor,
   resolveBindHost,
   type Bridge,
   type CreateBridgeOptions,
 } from "./server";
+import { readBridgeProjects } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { deriveDeviceKey, pairingProof } from "./auth/pairing";
 import { signRequest } from "./auth/verify";
@@ -1845,6 +1847,60 @@ describe("pairing", () => {
     expect(afterDeny.status).toBe(403);
     expect(await afterDeny.json()).toEqual({ error: "project_not_allowed" });
   });
+
+  // Grant direction of the regression above: a device paired without a project (denied by the
+  // CLI's `projects deny`, or simply never granted it) must see `session.create` for that
+  // project start succeeding the moment a separate `projects grant` edits devices.json, with no
+  // bridge restart in between.
+  test("projects grant run against the same devices file is enforced without a bridge restart", async () => {
+    const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_ffffffffffffffff";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await bridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+
+    // Stands in for `bun run bridge projects deny <deviceId> prj_demo`: a separate registry
+    // instance over the same file strips the project the pairing flow granted by default.
+    const operatorRegistry = DeviceRegistry.load(devicesFilePath);
+    operatorRegistry.setAllowedProjects(deviceId, []);
+
+    const createCommand: Command = {
+      commandId: "aaaaaaaa-0000-4000-8000-000000000000",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: "prj_demo", provider: "mock" },
+    };
+    const beforeGrant = await bridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createCommand, deviceId, deviceKey }),
+    );
+    expect(beforeGrant.status).toBe(403);
+    expect(await beforeGrant.json()).toEqual({ error: "project_not_allowed" });
+
+    // Stands in for `bun run bridge projects grant <deviceId> prj_demo`.
+    operatorRegistry.setAllowedProjects(deviceId, ["prj_demo"]);
+
+    const afterGrant = await bridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: { ...createCommand, commandId: "bbbbbbbb-0000-4000-8000-000000000000" },
+        deviceId,
+        deviceKey,
+      }),
+    );
+    expect(afterGrant.status).toBe(200);
+  });
 });
 
 describe("interaction lifecycle", () => {
@@ -2748,5 +2804,76 @@ describe("retained events of a reused session id", () => {
     // retained event belongs to project A and stays withheld. Authorizing it against the live
     // session instead of its own stamp is exactly the hole this closes.
     expect(page.events.some((event) => event.sessionId === first)).toBe(false);
+  });
+});
+
+describe("bridge-written projects.json", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-projects-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  test("starting the bridge with a state dir writes projects.json whose ids match the served projects", async () => {
+    const localBridge = createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+    try {
+      const response = await localBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      const served = (await response.json()) as { projects: Project[] };
+
+      const written = readBridgeProjects(stateDir);
+      expect(written?.map((project) => project.id)).toEqual(served.projects.map((project) => project.id));
+    } finally {
+      localBridge.close();
+    }
+  });
+
+  test("readBridgeProjects returns undefined when projects.json does not exist", () => {
+    expect(readBridgeProjects(stateDir)).toBeUndefined();
+  });
+
+  test("readBridgeProjects throws, naming the file path, on corrupt JSON", () => {
+    const projectsFilePath = join(stateDir, "projects.json");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(projectsFilePath, "not json");
+
+    expect(() => readBridgeProjects(stateDir)).toThrow(projectsFilePath);
+  });
+
+  test("readBridgeProjects throws on a well-formed JSON value that is not an array of {id, name, path}", () => {
+    const projectsFilePath = join(stateDir, "projects.json");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(projectsFilePath, JSON.stringify([{ id: "prj_demo" }]));
+
+    expect(() => readBridgeProjects(stateDir)).toThrow(projectsFilePath);
+  });
+});
+
+describe("legacyOperatorEnvError", () => {
+  test("returns undefined when none of the legacy operator env vars are set", () => {
+    expect(legacyOperatorEnvError({})).toBeUndefined();
+  });
+
+  test("AGENTREMOTE_PAIR names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_PAIR: "" });
+    expect(message).toContain("AGENTREMOTE_PAIR");
+    expect(message).toContain("bun run bridge pair");
+  });
+
+  test("AGENTREMOTE_REVOKE names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_REVOKE: "dev_x" });
+    expect(message).toContain("AGENTREMOTE_REVOKE");
+    expect(message).toContain("bun run bridge revoke <deviceId>");
+  });
+
+  test("AGENTREMOTE_LIST_DEVICES names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_LIST_DEVICES: "1" });
+    expect(message).toContain("AGENTREMOTE_LIST_DEVICES");
+    expect(message).toContain("bun run bridge devices");
   });
 });

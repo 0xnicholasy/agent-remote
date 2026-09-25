@@ -32,7 +32,7 @@ import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "
 import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { atomicWriteFileSync } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
-import { projectIdFor, resolveProjectIds } from "./projects";
+import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
 import { CommandJournal } from "./state/commands";
 import { EventLog } from "./state/event-log";
 import { InteractionRegistry } from "./state/interactions";
@@ -499,6 +499,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
   let provider: SeedableProvider;
   let seedProjectId: string;
+  let resolvedProjects: Project[];
   if (providerId === "claude") {
     // `resolveProjectIds` throws `AGENTREMOTE_PROJECT_DIRS must contain only absolute paths` for
     // a non-absolute entry, and falls back to `process.cwd()` when the variable is unset, blank,
@@ -508,11 +509,22 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
     provider = createClaudeProvider(host, { projects });
     seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
+    resolvedProjects = projects;
   } else {
     provider = new MockProvider(host, options.mockProviderOptions);
     seedProjectId = "prj_demo";
+    resolvedProjects = [{ id: "prj_demo", name: "demo", path: process.cwd() }];
   }
   emittedProviderId = provider.id;
+
+  // The bridge is the sole writer of projects.json: the CLI reads it to show the RUNNING
+  // bridge's project list instead of re-resolving its own (possibly different) environment.
+  // Only written when there is a real state dir to persist into (mirrors bridgeIdFilePath /
+  // pairingCodeFilePath above).
+  const projectsFilePath = journalPath(bridgeProjectsFileName);
+  if (projectsFilePath !== undefined) {
+    atomicWriteFileSync(projectsFilePath, JSON.stringify(resolvedProjects));
+  }
 
   const seedTimestamp = now().toISOString();
   const session: Session = {
@@ -1176,11 +1188,37 @@ export function assertAuthBypassAllowed(params: {
   );
 }
 
+// The legacy one-shot operator env vars (AGENTREMOTE_PAIR / AGENTREMOTE_REVOKE /
+// AGENTREMOTE_LIST_DEVICES) used to short-circuit this block before a bridge ever started.
+// Now that those commands live in cli.ts (see the comment below), leaving one of those vars set
+// no longer does anything except silently start a full bridge instead of running the one-shot
+// the operator asked for -- a state that looks fine on the surface (the bridge starts, no error)
+// but is not what was requested. Checked first, before createBridge, so it fails loudly instead.
+export function legacyOperatorEnvError(env: NodeJS.ProcessEnv): string | undefined {
+  const replacements: Record<string, string> = {
+    AGENTREMOTE_PAIR: "bun run bridge pair",
+    AGENTREMOTE_REVOKE: "bun run bridge revoke <deviceId>",
+    AGENTREMOTE_LIST_DEVICES: "bun run bridge devices",
+  };
+  const setVars = Object.keys(replacements).filter((name) => env[name] !== undefined);
+  if (setVars.length === 0) {
+    return undefined;
+  }
+  const details = setVars.map((name) => `${name} (use \`${replacements[name]}\` instead)`).join(", ");
+  return `${details}. unset it to start the bridge.`;
+}
+
 if (import.meta.main) {
   // Operator commands (pair/devices/revoke/projects) live in cli.ts now: they edit
   // devices.json/pairing.json directly the same way this block always has, but never open a
   // journal or take bridge.lock, and must not import this module (see cli.ts's header comment).
   {
+    const legacyEnvError = legacyOperatorEnvError(process.env);
+    if (legacyEnvError !== undefined) {
+      console.error(legacyEnvError);
+      process.exit(2);
+    }
+
     const authEnabled = process.env.AGENTREMOTE_AUTH !== "off";
     const bridge = createBridge();
     const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);

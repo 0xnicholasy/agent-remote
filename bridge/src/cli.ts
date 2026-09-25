@@ -15,7 +15,7 @@ import type { Project } from "@agentremote/protocol";
 
 import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { formatPairingCode, PairingCodeStore } from "./auth/pairing";
-import { projectIdFor, resolveProjectIds } from "./projects";
+import { bridgeProjectsFileName, projectIdFor, readBridgeProjects, resolveProjectIds } from "./projects";
 
 const DEFAULT_PORT = 8787;
 const PAIRING_TTL_MS = 5 * 60 * 1000;
@@ -89,6 +89,45 @@ function isResolveError(value: string | { error: string }): value is { error: st
   return typeof value !== "string";
 }
 
+type ProjectsResult = { projects: Project[]; source: "file" | "env" } | { error: string };
+
+/** Resolves the projects a `projects` subcommand should treat as current: the running (or last
+ * started) bridge's own `projects.json` when present, falling back to this shell's env/cwd (the
+ * same resolution `createBridge` would do on a fresh start) with a stderr warning when it is
+ * missing. Prefer this over calling `resolveProjectIds` directly so `list`/`allow` agree with
+ * whatever project set the bridge actually seeded, rather than guessing from this invocation's
+ * own environment. */
+function currentProjects(deps: CliDeps): ProjectsResult {
+  let fileProjects: Project[] | undefined;
+  try {
+    fileProjects = readBridgeProjects(deps.stateDir);
+  } catch (cause) {
+    return { error: cause instanceof Error ? cause.message : String(cause) };
+  }
+  if (fileProjects !== undefined) {
+    return { projects: fileProjects, source: "file" };
+  }
+
+  deps.stderr(
+    `Warning: no ${bridgeProjectsFileName} in ${deps.stateDir} (bridge never started here); showing projects resolved from this shell's env/cwd`,
+  );
+  try {
+    return { projects: resolveProjectIds(deps.env, deps.cwd), source: "env" };
+  } catch (cause) {
+    return { error: cause instanceof Error ? cause.message : String(cause) };
+  }
+}
+
+function isProjectsError(value: ProjectsResult): value is { error: string } {
+  return "error" in value;
+}
+
+/** True for a Node `ENOENT` (file does not exist), the one error a read racing an external
+ * writer's unlink is expected to see. */
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
 function devicesFilePath(stateDir: string): string {
   return path.join(stateDir, "devices.json");
 }
@@ -116,14 +155,15 @@ function isRegistryError(value: DeviceRegistry | { error: string }): value is { 
 /**
  * Applies `mutate` against a freshly loaded registry, then confirms the change actually reached
  * disk by loading a *second* fresh registry and checking `holds` against the persisted record.
- * Two concurrent CLI invocations against the same device (`allow` racing `deny`, two `revoke`s,
- * ...) can each read-modify-write against a stale snapshot and silently clobber one another, so a
- * mismatch here retries the whole read-mutate-persist cycle up to `attempts` times rather than
- * trusting the in-memory result of a single attempt. `mutate` must recompute whatever it needs
- * from the registry it is handed, not from state captured outside this call, so every retry
- * starts from the current on-disk state. A hard persist failure inside `mutate` (disk full,
- * EACCES, ...) is caught and reported once via `deps.stderr`, matching the CLI's corrupt-file
- * error contract, without burning the remaining retries meant for the clobber case.
+ * DeviceRegistry's own `devices.json.lock` (see auth/devices.ts) is now the primary guarantee
+ * against two concurrent CLI invocations against the same device (`allow` racing `deny`, two
+ * `revoke`s, ...) clobbering one another's read-modify-write; the verify-after-write and retry
+ * here are belt-and-braces for whatever gets past that lock (e.g. a writer that doesn't take it),
+ * not the main defense. `mutate` must recompute whatever it needs from the registry it is handed,
+ * not from state captured outside this call, so every retry starts from the current on-disk
+ * state. A hard persist failure inside `mutate` (disk full, EACCES, ...) is caught and reported
+ * once via `deps.stderr`, matching the CLI's corrupt-file error contract, without burning the
+ * remaining retries meant for the clobber case.
  */
 async function applyVerified(
   deps: CliDeps,
@@ -222,7 +262,15 @@ async function runPair(args: string[], deps: CliDeps): Promise<number> {
         if (typeof parsed === "object" && parsed !== null && typeof (parsed as { mintedAt?: unknown }).mintedAt === "string") {
           currentMintedAt = (parsed as { mintedAt: string }).mintedAt;
         }
-      } catch {
+      } catch (cause) {
+        // Only the file vanishing between the exists() check above and this read is expected --
+        // the pairing store's own burn-on-verify race this block exists to handle. Anything else
+        // (invalid JSON, EACCES, ...) is a real problem: report it and stop rather than silently
+        // treating it as "no supersession" and looping forever.
+        if (!isEnoent(cause)) {
+          deps.stderr(`${pairingPath}: ${cause instanceof Error ? cause.message : String(cause)}`);
+          return 1;
+        }
         currentMintedAt = undefined;
       }
       if (currentMintedAt !== undefined && currentMintedAt !== mintedAtIso) {
@@ -356,11 +404,9 @@ async function runRevoke(args: string[], deps: CliDeps): Promise<number> {
 }
 
 function runProjectsList(deps: CliDeps): number {
-  let projects: Project[];
-  try {
-    projects = resolveProjectIds(deps.env, deps.cwd);
-  } catch (cause) {
-    deps.stderr(cause instanceof Error ? cause.message : String(cause));
+  const result = currentProjects(deps);
+  if (isProjectsError(result)) {
+    deps.stderr(result.error);
     return 1;
   }
 
@@ -370,8 +416,8 @@ function runProjectsList(deps: CliDeps): number {
     return 1;
   }
 
-  deps.stdout("Current projects:");
-  for (const project of projects) {
+  deps.stdout(result.source === "file" ? "Current projects (from last bridge start):" : "Current projects:");
+  for (const project of result.projects) {
     deps.stdout(`  ${project.id}\t${project.path}`);
   }
 
@@ -410,13 +456,12 @@ async function runProjectsAllow(args: string[], deps: CliDeps): Promise<number> 
   }
 
   if (!flags.has("--force")) {
-    let currentProjectIds: Set<string>;
-    try {
-      currentProjectIds = new Set(resolveProjectIds(deps.env, deps.cwd).map((project) => project.id));
-    } catch (cause) {
-      deps.stderr(cause instanceof Error ? cause.message : String(cause));
+    const result = currentProjects(deps);
+    if (isProjectsError(result)) {
+      deps.stderr(result.error);
       return 1;
     }
+    const currentProjectIds = new Set(result.projects.map((project) => project.id));
     if (!currentProjectIds.has(projectId)) {
       deps.stderr(`${projectId} is not a current project. Pass --force to allow it anyway.`);
       return 1;

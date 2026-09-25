@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -140,6 +140,21 @@ describe("pair", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.stderrLines).toContain("Pairing code was used up before a device paired.");
+  });
+
+  test("pairing.json becoming invalid JSON during the wait exits 1 instead of retrying or hanging", async () => {
+    const pairingFilePath = join(stateDir, "pairing.json");
+    const deps = makeDeps({
+      sleep: async () => {
+        writeFileSync(pairingFilePath, "{not valid json", { mode: 0o600 });
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.some((line) => line.includes(pairingFilePath))).toBe(true);
+    expect(deps.stdoutLines.some((line) => line.startsWith("Paired device"))).toBe(false);
   });
 });
 
@@ -371,6 +386,74 @@ describe("projects", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
+  });
+});
+
+describe("projects: bridge-sourced project list", () => {
+  test("projects.json present with ids differing from the CLI env: list shows file ids, allow enforces them", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const registry = DeviceRegistry.load(devicesFilePath);
+    registry.register(sampleRecord({ allowedProjects: [] }));
+    writeFileSync(
+      join(stateDir, "projects.json"),
+      JSON.stringify([{ id: "prj_file_abc", name: "file-project", path: "/some/file/project" }]),
+      { mode: 0o600 },
+    );
+    const deps = makeDeps();
+
+    const listExit = await runCli(["projects", "list"], deps);
+    expect(listExit).toBe(0);
+    expect(deps.stdoutLines).toContain("Current projects (from last bridge start):");
+    expect(deps.stdoutLines.some((line) => line.includes("prj_file_abc"))).toBe(true);
+
+    // "prj_demo" is only what this shell's env/cwd would resolve to (the mock provider default),
+    // not a project.json entry, so allow without --force must refuse it.
+    const allowEnvOnlyExit = await runCli(["projects", "allow", sampleRecord().deviceId, "prj_demo"], deps);
+    expect(allowEnvOnlyExit).toBe(1);
+
+    const allowFileExit = await runCli(["projects", "allow", sampleRecord().deviceId, "prj_file_abc"], deps);
+    expect(allowFileExit).toBe(0);
+    const reloaded = DeviceRegistry.load(devicesFilePath);
+    expect(reloaded.get(sampleRecord().deviceId)?.allowedProjects).toEqual(["prj_file_abc"]);
+  });
+
+  test("no projects.json: warns on stderr and falls back to env/cwd resolution", async () => {
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "list"], deps);
+
+    expect(exitCode).toBe(0);
+    expect(
+      deps.stderrLines.some(
+        (line) => line.includes("no projects.json") && line.includes(stateDir) && line.includes("bridge never started here"),
+      ),
+    ).toBe(true);
+    expect(deps.stdoutLines).toContain("Current projects:");
+    expect(deps.stdoutLines.some((line) => line.includes("prj_demo"))).toBe(true);
+  });
+});
+
+describe("projects: unknown device on a clean registry", () => {
+  test("allow exits 1 and does not write devices.json", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "allow", "dev_unknown", "prj_demo"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines).toContain("No such device: dev_unknown");
+    expect(existsSync(devicesFilePath)).toBe(false);
+  });
+
+  test("deny exits 1 and does not write devices.json", async () => {
+    const devicesFilePath = join(stateDir, "devices.json");
+    const deps = makeDeps();
+
+    const exitCode = await runCli(["projects", "deny", "dev_unknown", "prj_demo"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines).toContain("No such device: dev_unknown");
+    expect(existsSync(devicesFilePath)).toBe(false);
   });
 });
 

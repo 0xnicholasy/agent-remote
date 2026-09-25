@@ -385,4 +385,79 @@ describe("DeviceRegistry", () => {
     expect(registry.get(sampleRecord().deviceId)).toBeUndefined();
     expect(registry.list()).toEqual([]);
   });
+
+  test("a live holder of devices.json.lock makes revoke fail closed and touch skip its write", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const record = sampleRecord({ lastSeenAt: "2026-09-20T12:00:00.000Z" });
+    const registry = DeviceRegistry.load(filePath, { lockTimeoutMs: 50 });
+    registry.register(record);
+    const before = readFileSync(filePath, "utf8");
+
+    // Held by a live process (this one), as if the operator CLI were mid-write.
+    writeFileSync(join(dir, "devices.json.lock"), String(process.pid), "utf8");
+
+    expect(() => registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"))).toThrow(
+      /locked by pid/,
+    );
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    registry.touch(record.deviceId, new Date("2026-09-20T12:01:00.000Z"));
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+    expect(readFileSync(filePath, "utf8")).toBe(before);
+    expect(registry.get(record.deviceId)?.revokedAt).toBeNull();
+  });
+
+  test("a devices.json.lock left by a dead pid is taken over and released", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const lockPath = join(dir, "devices.json.lock");
+    const record = sampleRecord();
+    const registry = DeviceRegistry.load(filePath, { lockTimeoutMs: 50 });
+    registry.register(record);
+
+    writeFileSync(lockPath, "999999", "utf8");
+    registry.revoke(record.deviceId, new Date("2026-09-20T12:30:00.000Z"));
+
+    expect(DeviceRegistry.load(filePath).get(record.deviceId)?.revokedAt).toBe("2026-09-20T12:30:00.000Z");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  // C1-02: registry A has already loaded devices.json when registry B (standing in for the CLI)
+  // revokes; B's write is injected at the moment A goes to take devices.json.lock for its touch
+  // persist. Because A reloads only once it holds the lock, it rewrites on top of B's revoke
+  // instead of landing a stale, un-revoked copy.
+  test("a touch persisting after another registry's revoke keeps the device revoked", () => {
+    const dir = tempDir();
+    const filePath = join(dir, "devices.json");
+    const lockPath = `${filePath}.lock`;
+    const record = sampleRecord({ lastSeenAt: "2026-09-20T12:00:00.000Z" });
+    const a = DeviceRegistry.load(filePath);
+    a.register(record);
+    a.get(record.deviceId);
+    const b = DeviceRegistry.load(filePath);
+    const revokedAt = new Date("2026-09-20T12:05:00.000Z");
+
+    const realOpenSync = fs.openSync;
+    let raced = false;
+    const openSpy = spyOn(fs, "openSync").mockImplementation(
+      (path: fs.PathLike, flags: fs.OpenMode = "r", mode?: fs.Mode | null) => {
+        if (!raced && path === lockPath) {
+          raced = true;
+          b.revoke(record.deviceId, revokedAt);
+        }
+        return realOpenSync(path, flags, mode);
+      },
+    );
+    try {
+      // Past the throttle interval, so this touch persists.
+      a.touch(record.deviceId, new Date("2026-09-20T12:10:00.000Z"));
+    } finally {
+      openSpy.mockRestore();
+    }
+    expect(raced).toBe(true);
+
+    const after = JSON.parse(readFileSync(filePath, "utf8")) as DeviceRecord[];
+    expect(after.find((r) => r.deviceId === record.deviceId)?.revokedAt).toBe(revokedAt.toISOString());
+  });
 });
