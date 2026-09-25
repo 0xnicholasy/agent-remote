@@ -87,6 +87,7 @@ Dependencies: M1 delivery decision and M3 control guarantees.
 
 - [ ] Build onboarding, Mac pairing, project authorization, and a Mac control surface.
 - [x] 2026-09-25 (branch `feat/watch-action-outcomes`): every approve, deny or answer ends in one visible outcome on the Watch (`ActionOutcome`): sending, acknowledged, no longer valid (`interaction_not_pending`, stale 409, `command_id_conflict`), expired (`decision_expired`), offline (URL transport errors), outcome unknown (`command_indeterminate`, previously shown as "no longer valid"), or failed. Offline keeps the card and a repeat of the same choice reuses its `commandId`. Simulator and unit tests only; offline behaviour on a physical Watch is part of the M5 device scenarios.
+- [x] 2026-09-25 (branch `fix/watch-outcome-followups`, PR #18 backlog C3-06 and C3-07): a success status with an unreadable command reply is `commandResponseUnreadable` and reads "Reply unreadable. Tap again to confirm." instead of "Not sent"; the card stays and the retry reuses the command id. `cancel()` now keeps the command id and body timestamp of a cancel whose outcome was lost, so tapping Cancel again replays the bridge's recorded outcome instead of sending a second cancel.
 - [ ] Provide sufficient exact context for a risky or long action, or direct the user to review it at the desk. A spoken summary alone is not authorization context.
 - [ ] Finish the glanceable conversation/status experience, reviewed dictation, foreground speech, and prominent cancel behavior.
 

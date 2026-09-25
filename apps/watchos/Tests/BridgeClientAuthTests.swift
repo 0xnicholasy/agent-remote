@@ -545,4 +545,28 @@ final class BridgeClientAuthTests: XCTestCase {
         let secondBody = try XCTUnwrap(capture.requestBody(at: 1))
         XCTAssertEqual(secondBody["timestamp"] as? String, timestamp, "the body timestamp stays the one passed in")
     }
+
+    /// C3-06: a 2xx reply whose body is not a CommandResponse means the bridge accepted the
+    /// command, so it must surface as `commandResponseUnreadable`, not a raw DecodingError that
+    /// the Watch would label "Not sent".
+    func testSendOnUnreadableSuccessBodyThrowsCommandResponseUnreadable() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: "not json")
+
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_unreadable",
+                timestamp: BridgeClient.timestamp()
+            )
+            XCTFail("expected an unreadable 200 body to throw")
+        } catch BridgeError.commandResponseUnreadable {
+        } catch {
+            XCTFail("expected BridgeError.commandResponseUnreadable, got \(error)")
+        }
+    }
 }

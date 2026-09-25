@@ -123,12 +123,16 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     /// The approval or question is no longer waiting for an answer (already decided, expired,
     /// cancelled or superseded).
     case interactionNotPending
+    /// The bridge answered a command with a success status but a body the Watch could not read,
+    /// so the command may have taken effect without the Watch knowing its result.
+    case commandResponseUnreadable
 
     var description: String {
         switch self {
         case .invalidHost(let value): "Not a usable bridge address: \(value)"
         case .http(let status, let message): "Bridge returned \(status): \(message)"
         case .malformedResponse(let message): "Bridge sent a response the client could not parse: \(message)"
+        case .commandResponseUnreadable: "The bridge accepted the command but its reply could not be read."
         case .notPaired: "This Watch is not paired with a bridge yet."
         case .unauthenticated: "The bridge did not accept this device's credentials."
         case .deviceRevoked: "This Watch's pairing was revoked."
@@ -306,7 +310,13 @@ actor BridgeClient: BridgeClientProtocol {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         let (data, response) = try await urlSession.data(for: request)
         try Self.checkStatus(response, data: data)
-        return try decoder.decode(CommandResponse.self, from: data)
+        // Past checkStatus the bridge has accepted the command, so an unreadable body must not
+        // surface as a generic failure that tells the user it was not sent.
+        do {
+            return try decoder.decode(CommandResponse.self, from: data)
+        } catch {
+            throw BridgeError.commandResponseUnreadable
+        }
     }
 
     private func get(_ url: URL) async throws -> Data {

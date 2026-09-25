@@ -28,6 +28,7 @@ struct SettingsView: View {
                 }
                 Section {
                     Button("Cancel turn", role: .destructive) { Task { await store.cancel() } }
+                        .disabled(store.isSending)
                 }
             }
             .navigationTitle("Settings")
