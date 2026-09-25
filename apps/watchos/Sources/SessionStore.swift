@@ -320,8 +320,13 @@ final class SessionStore {
             // while this one was suspended on the awaits above; guard every write below, not
             // just applyPairedLookup(), or a stale failure could overwrite a newer pairingError.
             guard generation == pairGeneration else { return }
-            pairingError = "\(error)"
             applyPairedLookup(lookup)
+            // applyPairedLookup() already set pairingError to the load failure's own
+            // description when the lookup itself failed (.checkFailed); that is the more
+            // specific, actionable cause. Otherwise fall back to the pair() failure itself.
+            if case .checkFailed = lookup {} else {
+                pairingError = "\(error)"
+            }
             pairingChecked = true
         }
     }
@@ -363,11 +368,14 @@ final class SessionStore {
             paired = true
             everPaired = true
             pairingCheckFailed = false
-        case .checkFailed:
+            pairingError = nil
+        case .checkFailed(let message):
             pairingCheckFailed = true
+            pairingError = message
         case .notPaired:
             paired = false
             pairingCheckFailed = false
+            pairingError = nil
         }
     }
 

@@ -141,14 +141,39 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
 /// In-memory credential store for tests and previews.
 final class InMemoryCredentialStore: CredentialStore, @unchecked Sendable {
     private var stored: DeviceCredential?
+    /// When set, `loadResult()` returns `.error(loadError)` instead of reading `stored`, so a
+    /// test can drive the real `BridgeClient`'s `.checkFailed`/`reloadCredential()` paths
+    /// (C2-004) the way a Keychain read failure would.
+    private var loadError: String?
+    /// When set, `clear()` throws this instead of clearing `stored`, so a test can drive
+    /// `clearCredential()`'s failure path against the real `BridgeClient`.
+    private var clearError: (any Error)?
 
     init(_ initial: DeviceCredential? = nil) {
         stored = initial
     }
 
-    func loadResult() -> CredentialLoadResult { stored.map(CredentialLoadResult.found) ?? .notFound }
+    /// Arms the next (and every subsequent) `loadResult()` call to report a read failure with
+    /// `message` instead of `stored`'s actual contents. Pass `nil` to clear it.
+    func setLoadError(_ message: String?) {
+        loadError = message
+    }
+
+    /// Arms the next `clear()` call to throw `error` instead of succeeding. Pass `nil` to clear
+    /// it.
+    func setClearError(_ error: (any Error)?) {
+        clearError = error
+    }
+
+    func loadResult() -> CredentialLoadResult {
+        if let loadError { return .error(loadError) }
+        return stored.map(CredentialLoadResult.found) ?? .notFound
+    }
     func save(_ credential: DeviceCredential) { stored = credential }
-    func clear() { stored = nil }
+    func clear() throws {
+        if let clearError { throw clearError }
+        stored = nil
+    }
 }
 
 extension Data {

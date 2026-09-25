@@ -6,7 +6,9 @@ import SwiftUI
 /// then one piece of state this view already owns, not something a push/pop stack has to be
 /// read back out of.
 struct OnboardingView: View {
-    private enum Step { case macSetup, hostAddress, pairingCode }
+    /// Internal (not private) so OnboardingViewTests can drive `previousStep(_:)` via
+    /// `@testable import`.
+    enum Step { case macSetup, hostAddress, pairingCode }
 
     @Environment(SessionStore.self) private var store
     @State private var step: Step = .macSetup
@@ -18,18 +20,46 @@ struct OnboardingView: View {
         BridgeClient.parseBaseURL(store.hostText) != nil
     }
 
+    /// C2-001: SessionStore.hostText defaults to `BridgeClient.defaultBaseURL`
+    /// ("http://localhost:8787") until something else is stored under its UserDefaults key. On
+    /// a physical Watch that default is never a real Mac, so it must not silently pass the
+    /// gate as a valid host. Compares against the *default* value rather than rejecting
+    /// loopback outright, because CoreScreensUITests launches with
+    /// `-dev.agentremote.watch.host <AGENTREMOTE_UI_BRIDGE>` (often itself a loopback address,
+    /// e.g. "http://localhost:8799") via the UserDefaults argument domain -- that value already
+    /// overrides the stored default before onboarding ever renders, so it differs from
+    /// `defaultBaseURL` and still passes here.
+    static func canAdvanceFromHostStep(host: String) -> Bool {
+        guard let parsed = BridgeClient.parseBaseURL(host) else { return false }
+        return parsed.absoluteString != BridgeClient.defaultBaseURL.absoluteString
+    }
+
+    private var canAdvanceFromHostStep: Bool {
+        Self.canAdvanceFromHostStep(host: store.hostText)
+    }
+
+    /// Back navigation from each step, extracted as a pure function so it can be unit tested
+    /// without driving the view through SwiftUI.
+    static func previousStep(_ step: Step) -> Step {
+        switch step {
+        case .macSetup: return .macSetup
+        case .hostAddress: return .macSetup
+        case .pairingCode: return .hostAddress
+        }
+    }
+
     var body: some View {
         NavigationStack {
             switch step {
             case .macSetup: macSetupStep
             case .hostAddress: hostAddressStep
-                .toolbar { backButton { step = .macSetup } }
+                .toolbar { backButton { step = Self.previousStep(step) } }
             case .pairingCode:
                 // Reused as-is: a successful pair() flips store.paired and RootView swaps this
                 // whole view out for the TabView, so PairingView's own dismiss() has nothing
                 // left to dismiss.
                 PairingView()
-                    .toolbar { backButton { step = .hostAddress } }
+                    .toolbar { backButton { step = Self.previousStep(step) } }
             }
         }
     }
@@ -86,7 +116,7 @@ struct OnboardingView: View {
                         step = .pairingCode
                     }
                 }
-                .disabled(isConnecting || !isHostValid)
+                .disabled(isConnecting || !canAdvanceFromHostStep)
                 .accessibilityIdentifier("onboarding-next-2")
                 if isConnecting {
                     ProgressView()

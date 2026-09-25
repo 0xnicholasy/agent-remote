@@ -188,8 +188,9 @@ enum PairingLookup: Sendable, Equatable {
     case paired
     case notPaired
     /// The credential lookup itself failed to read (a Keychain error), as opposed to finding
-    /// no credential (E-002).
-    case checkFailed
+    /// no credential (E-002). Carries a short, user-safe description of the failure (OSStatus /
+    /// decode-failure summary -- never key material) so callers can surface it (C2-003).
+    case checkFailed(String)
 }
 
 /// The calls `SessionStore` makes on the bridge client. Lets tests substitute a fake client
@@ -236,9 +237,11 @@ actor BridgeClient: BridgeClientProtocol {
     private let encoder = JSONEncoder()
     private let credentialStore: any CredentialStore
     private var credential: DeviceCredential?
-    /// Set when the credential lookup at init failed to read (rather than finding nothing), so
-    /// `pairingLookup()` returning `.notPaired` is not mistaken for "genuinely unpaired" (E-002).
-    private var credentialLoadFailed = false
+    /// Set to the load failure's description when the credential lookup failed to read (rather
+    /// than finding nothing), so `pairingLookup()` returning `.notPaired` is not mistaken for
+    /// "genuinely unpaired" (E-002), and the description can be surfaced via `.checkFailed`
+    /// (C2-003).
+    private var credentialLoadError: String?
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
@@ -248,9 +251,9 @@ actor BridgeClient: BridgeClientProtocol {
             self.credential = credential
         case .notFound:
             self.credential = nil
-        case .error:
+        case .error(let message):
             self.credential = nil
-            self.credentialLoadFailed = true
+            self.credentialLoadError = message
         }
         let configuration = URLSessionConfiguration.ephemeral
         // Long polls hold the connection open for up to 30 seconds, so the request
@@ -275,7 +278,7 @@ actor BridgeClient: BridgeClientProtocol {
     /// `isPaired()`/`pairingCheckFailed()` awaits used to allow.
     func pairingLookup() -> PairingLookup {
         if credential != nil { return .paired }
-        if credentialLoadFailed { return .checkFailed }
+        if let credentialLoadError { return .checkFailed(credentialLoadError) }
         return .notPaired
     }
 
@@ -283,19 +286,19 @@ actor BridgeClient: BridgeClientProtocol {
     /// lookup in the same actor call. Lets a Retry after a transient read error actually clear
     /// `.checkFailed` instead of replaying the same cached failure forever; actor isolation
     /// keeps this write, and the read that reports it, serialized with every other access to
-    /// `credential` and `credentialLoadFailed`.
+    /// `credential` and `credentialLoadError`.
     @discardableResult
     func reloadCredential() -> PairingLookup {
         switch credentialStore.loadResult() {
         case .found(let credential):
             self.credential = credential
-            self.credentialLoadFailed = false
+            self.credentialLoadError = nil
         case .notFound:
             self.credential = nil
-            self.credentialLoadFailed = false
-        case .error:
+            self.credentialLoadError = nil
+        case .error(let message):
             self.credential = nil
-            self.credentialLoadFailed = true
+            self.credentialLoadError = message
         }
         return pairingLookup()
     }
@@ -306,7 +309,7 @@ actor BridgeClient: BridgeClientProtocol {
     func clearCredential() throws {
         try credentialStore.clear()
         credential = nil
-        credentialLoadFailed = false
+        credentialLoadError = nil
     }
 
     /// Kept for `BridgeClientAuthTests`, which exercises pairing directly against the concrete

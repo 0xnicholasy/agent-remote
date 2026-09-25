@@ -569,4 +569,59 @@ final class BridgeClientAuthTests: XCTestCase {
             XCTFail("expected BridgeError.commandResponseUnreadable, got \(error)")
         }
     }
+
+    // MARK: - Credential load failure (C2-004)
+    //
+    // `InMemoryCredentialStore` previously could not produce `.error`, so these paths were only
+    // ever exercised against `FakeBridgeClient` in SessionStoreDecisionTests, never against the
+    // real `BridgeClient` actor.
+
+    func testPairingLookupReportsCheckFailedOnCredentialLoadError() async {
+        let credentialStore = InMemoryCredentialStore()
+        credentialStore.setLoadError("Keychain read failed (OSStatus -25300).")
+        let client = BridgeClient(credentialStore: credentialStore)
+
+        let lookup = await client.pairingLookup()
+
+        XCTAssertEqual(lookup, PairingLookup.checkFailed("Keychain read failed (OSStatus -25300)."))
+    }
+
+    /// A Retry (`reloadCredential()`) after the store's read recovers must clear `.checkFailed`
+    /// and report `.paired`, not keep replaying the cached failure.
+    func testReloadCredentialClearsCheckFailedOnceStoreRecovers() async {
+        let credentialStore = InMemoryCredentialStore()
+        credentialStore.setLoadError("Keychain read failed (OSStatus -25300).")
+        let client = BridgeClient(credentialStore: credentialStore)
+
+        let initialLookup = await client.pairingLookup()
+        XCTAssertEqual(initialLookup, .checkFailed("Keychain read failed (OSStatus -25300)."))
+
+        credentialStore.setLoadError(nil)
+        credentialStore.save(makeCredential())
+
+        let reloaded = await client.reloadCredential()
+        XCTAssertEqual(reloaded, .paired, "reloadCredential() must re-read the store, not just recheck the cached failure")
+
+        let followUpLookup = await client.pairingLookup()
+        XCTAssertEqual(followUpLookup, .paired)
+    }
+
+    /// A keychain-delete failure during `clearCredential()` must surface to the caller (V2-001)
+    /// rather than be silently swallowed, so `SessionStore.clearPairing()` can keep the user on
+    /// `PairingCheckFailedView` instead of reporting a clear that never happened.
+    func testClearCredentialThrowsOnStoreDeleteFailure() async {
+        struct DeleteFailed: Error, Equatable {}
+        let credentialStore = InMemoryCredentialStore(makeCredential())
+        credentialStore.setClearError(DeleteFailed())
+        let client = BridgeClient(credentialStore: credentialStore)
+
+        do {
+            try await client.clearCredential()
+            XCTFail("expected clearCredential() to throw when the store's delete fails")
+        } catch is DeleteFailed {
+            // expected
+        } catch {
+            XCTFail("expected DeleteFailed, got \(error)")
+        }
+    }
 }
