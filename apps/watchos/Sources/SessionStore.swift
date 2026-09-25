@@ -23,6 +23,100 @@ enum StatusKind: Equatable {
     case authFailed
 }
 
+/// The outcome of one approve, deny or answer sent from this Watch. Every send ends in one of
+/// these, so the Watch never leaves an action looking done when it is not.
+enum ActionOutcome: Equatable {
+    case sending
+    /// The bridge accepted the command.
+    case acknowledged
+    /// Refused because the card was already decided, cancelled or superseded elsewhere.
+    case noLongerValid
+    case expired
+    /// No verdict reached the Watch; the card stays and the same choice can be sent again.
+    case offline
+    /// The bridge cannot say whether the command took effect.
+    case indeterminate
+    /// Any other failure; the card stays for a retry.
+    case failed
+    /// The bridge is rate limiting this device; the card stays and the same choice can be
+    /// sent again, same as offline.
+    case rateLimited
+    /// This Watch's credential is missing, rejected or revoked; retrying will not help until
+    /// it is paired again.
+    case authRequired
+    /// The bridge's device policy does not allow this Watch that action or project; retrying
+    /// the same command will be refused again.
+    case notAllowed
+
+    var label: String {
+        switch self {
+        case .sending: "Sending..."
+        case .acknowledged: "Sent"
+        case .noLongerValid: "No longer valid"
+        case .expired: "Expired"
+        case .offline: "Not sent: offline. Tap again to retry."
+        case .indeterminate: "Outcome unknown. Check at the desk."
+        case .failed: "Not sent. Tap again to retry."
+        case .rateLimited: "Bridge is busy. Tap again in a moment."
+        case .authRequired: "Not sent: this Watch needs to be paired again."
+        case .notAllowed: "Not allowed from this Watch."
+        }
+    }
+
+    /// Status line for outcomes that remove the card, since the card can no longer show them.
+    var statusText: String? {
+        switch self {
+        case .noLongerValid: "Request no longer valid"
+        case .expired: "Decision expired before it reached the bridge"
+        case .indeterminate: "Outcome unknown; check at the desk"
+        case .authRequired: "Not authorized: pair this Watch again"
+        case .notAllowed: "This Watch is not allowed to do that"
+        default: nil
+        }
+    }
+
+    static func classify(_ error: any Error) -> ActionOutcome {
+        switch error {
+        case BridgeError.decisionExpired: return .expired
+        case BridgeError.commandIndeterminate: return .indeterminate
+        case BridgeError.interactionNotPending, BridgeError.commandIdConflict: return .noLongerValid
+        // Pre-typed 409 bodies, such as a stale approval binding.
+        case BridgeError.http(let status, _) where status == 409: return .noLongerValid
+        case BridgeError.rateLimited: return .rateLimited
+        case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
+        // Static device policy: the same command will be refused again until re-enrolled.
+        case BridgeError.actionNotAllowed, BridgeError.projectNotAllowed: return .notAllowed
+        case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
+        default: return .failed
+        }
+    }
+
+    private static let offlineCodes: Set<URLError.Code> = [
+        .notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotConnectToHost,
+        .cannotFindHost, .dnsLookupFailed, .dataNotAllowed, .internationalRoamingOff,
+    ]
+}
+
+private enum DecisionCard {
+    case approval(String)
+    case question(String)
+
+    var id: String {
+        switch self {
+        case .approval(let id), .question(let id): id
+        }
+    }
+}
+
+private struct UnconfirmedSend {
+    let payload: CommandPayload
+    let sessionId: String
+    let commandId: String
+    /// Body timestamp sent with `commandId`; a retry must resend it unchanged so the bridge's
+    /// body digest for that commandId matches (see `BridgeClientProtocol.send`).
+    let timestamp: String
+}
+
 /// Whether what the Watch shows matches the bridge (docs/durability-v0.md, "Client recovery").
 /// `current` only after a page has been applied, so the Watch never claims to be up to date
 /// on the strength of a cursor it has not checked against the bridge.
@@ -75,6 +169,11 @@ final class SessionStore {
     private(set) var statusLine = "Not connected"
     private(set) var statusKind: StatusKind = .notConnected
     private(set) var isSending = false
+    /// What happened to the last approve, deny or answer sent from this Watch, and which card
+    /// it was for, so a newer card never shows an older card's outcome.
+    private(set) var actionOutcome: ActionOutcome?
+    @ObservationIgnored private var actionOutcomeCardId: String?
+    @ObservationIgnored private var unconfirmedSend: UnconfirmedSend?
     private(set) var paired = false
     private(set) var pairingError: String?
 
@@ -98,6 +197,10 @@ final class SessionStore {
     /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
     /// meaningful against the bridge that issued it.
     @ObservationIgnored private var knownBridgeId: String?
+    /// The base URL the client is currently pointed at, tracked so reconnect() can tell whether
+    /// it is reconnecting to the same bridge (retry an offline send) or a different one (a new
+    /// bridge/pairing, where the old commandId must not be reused).
+    @ObservationIgnored private var connectedHostURL: URL
 
     /// `client` is injectable so tests can substitute a fake in place of a real `BridgeClient`.
     init(client: (any BridgeClientProtocol)? = nil, speaker: Speaker = Speaker(), defaults: UserDefaults = .standard) {
@@ -107,6 +210,7 @@ final class SessionStore {
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
         knownBridgeId = defaults.string(forKey: SessionStore.bridgeIdKey)
+        connectedHostURL = url
         self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
     }
@@ -147,25 +251,37 @@ final class SessionStore {
         // Before the await below: the old host's "Current" must not stay on screen while the
         // cursor and session it described are being discarded.
         syncState = .syncing
-        if let url = BridgeClient.parseBaseURL(hostText) {
-            await client.setBaseURL(url)
+        let newURL = BridgeClient.parseBaseURL(hostText)
+        // Same host means the same bridge/pairing: an offline send's commandId is still safe to
+        // reuse once the replayed card reappears, so keep it instead of minting a new one on
+        // retry. A different (or unparseable) host is a different bridge/session space, so the
+        // pending send is dropped along with everything else discardLocalView() clears below.
+        let sameBridge = newURL != nil && newURL == connectedHostURL
+        if let newURL {
+            await client.setBaseURL(newURL)
+            connectedHostURL = newURL
         }
         resetCursor()
         setKnownBridgeId(nil)
         // A new host means a different bridge and session space: drop the old binding and
         // its state, or every event from the new bridge's session would be silently
         // dropped by the cross-session guard in apply() until relaunch.
-        discardLocalView()
+        discardLocalView(preservingUnconfirmedSend: sameBridge)
         start()
     }
 
     /// Clears the session binding and its pending UI state. Shared by reconnect(), the terminal
     /// event branches in apply(), and the bridge-restart path in pollLoop() so a session that no
     /// longer has a live bridge behind it never leaves a stuck card or a dangling binding.
-    private func resetSessionState() {
+    private func resetSessionState(preservingUnconfirmedSend: Bool = false) {
         sessionId = nil
         pendingApproval = nil
         pendingQuestion = nil
+        if !preservingUnconfirmedSend {
+            unconfirmedSend = nil
+        }
+        actionOutcome = nil
+        actionOutcomeCardId = nil
     }
 
     private func pollLoop(generation: Int) async {
@@ -281,8 +397,8 @@ final class SessionStore {
     /// Drops everything the Watch built from events it can no longer trust: the session
     /// binding, any pending card, the transcript and the turn pill. Shared by the bridge-change
     /// and truncated-cursor paths in pollLoop().
-    private func discardLocalView() {
-        resetSessionState()
+    private func discardLocalView(preservingUnconfirmedSend: Bool = false) {
+        resetSessionState(preservingUnconfirmedSend: preservingUnconfirmedSend)
         transcript.removeAll()
         turnState = .idle
         lastQuestion = nil
@@ -380,6 +496,11 @@ final class SessionStore {
             speaker.speak(payload.spokenSummary ?? payload.title)
         case .approvalResolved(let payload):
             pendingApproval = nil
+            // The transcript line below now carries the outcome, so a "Sent" banner left from
+            // this or an earlier send must not reappear under it. Only when this resolution is
+            // for the card the outcome belongs to: an unrelated approval/question id resolving
+            // must not wipe a still-current card's outcome.
+            if actionOutcomeCardId == payload.approvalId { clearOutcome() }
             let title = lastApproval?.binding.approvalId == payload.approvalId ? lastApproval?.title : nil
             append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
         case .questionRequested(let payload):
@@ -389,6 +510,7 @@ final class SessionStore {
             speaker.speak(payload.spokenSummary ?? payload.text)
         case .questionAnswered(let payload):
             pendingQuestion = nil
+            if actionOutcomeCardId == payload.questionId { clearOutcome() }
             let label = lastQuestion?.options.first { $0.id == payload.answer }?.label
             append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
@@ -467,83 +589,146 @@ final class SessionStore {
     }
 
     func approve() async {
-        guard !isSending, let request = pendingApproval else { return }
-        isSending = true
-        defer { isSending = false }
-        do {
-            try await perform(.approvalAccept(ApprovalAcceptPayload(binding: request.binding)), sessionId: request.binding.sessionId)
-            // A newer approval could have arrived (via the poll loop) while this send was in
-            // flight; only clear the card if it's still the one this call answered.
-            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
-        } catch BridgeError.http(let status, _) where status == 409 {
-            // Only touch the card/status if a newer approval hasn't already replaced this one,
-            // or a still-valid card's status line would be stomped with a stale-request message.
-            if pendingApproval?.binding.approvalId == request.binding.approvalId {
-                pendingApproval = nil
-                statusLine = "Request no longer valid"
-                statusKind = .requestInvalid
-            }
-        } catch {
-            report(error)
-        }
+        guard let request = pendingApproval else { return }
+        await decide(
+            .approvalAccept(ApprovalAcceptPayload(binding: request.binding)),
+            sessionId: request.binding.sessionId,
+            card: .approval(request.binding.approvalId)
+        )
     }
 
     func reject() async {
-        guard !isSending, let request = pendingApproval else { return }
-        isSending = true
-        defer { isSending = false }
-        let payload = ApprovalRejectPayload(binding: request.binding, reason: "Denied from the Watch")
-        do {
-            try await perform(.approvalReject(payload), sessionId: request.binding.sessionId)
-            if pendingApproval?.binding.approvalId == request.binding.approvalId { pendingApproval = nil }
-        } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingApproval?.binding.approvalId == request.binding.approvalId {
-                pendingApproval = nil
-                statusLine = "Request no longer valid"
-                statusKind = .requestInvalid
-            }
-        } catch {
-            report(error)
-        }
+        guard let request = pendingApproval else { return }
+        await decide(
+            .approvalReject(ApprovalRejectPayload(binding: request.binding, reason: "Denied from the Watch")),
+            sessionId: request.binding.sessionId,
+            card: .approval(request.binding.approvalId)
+        )
     }
 
     func answer(optionId: String) async {
-        guard !isSending, let question = pendingQuestion, let target = sessionId else { return }
-        isSending = true
-        defer { isSending = false }
-        let payload = QuestionAnswerPayload(questionId: question.questionId, optionId: optionId)
-        do {
-            try await perform(.questionAnswer(payload), sessionId: target)
-            // A newer question could have arrived while this send was in flight; only clear
-            // the card if it's still the one this call answered.
-            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
-        } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingQuestion?.questionId == question.questionId {
-                pendingQuestion = nil
-                statusLine = "Request no longer valid"
-                statusKind = .requestInvalid
-            }
-        } catch {
-            report(error)
-        }
+        guard let question = pendingQuestion, let target = sessionId else { return }
+        await decide(
+            .questionAnswer(QuestionAnswerPayload(questionId: question.questionId, optionId: optionId)),
+            sessionId: target,
+            card: .question(question.questionId)
+        )
     }
 
     func answer(text: String) async {
-        guard !isSending, let question = pendingQuestion, let target = sessionId else { return }
+        guard let question = pendingQuestion, let target = sessionId else { return }
+        await decide(
+            .questionAnswer(QuestionAnswerPayload(questionId: question.questionId, text: text)),
+            sessionId: target,
+            card: .question(question.questionId)
+        )
+    }
+
+    /// Sends a decision for a pending card and records its outcome.
+    ///
+    /// A send that fails without reaching a verdict (no connection, lost response, rate limit,
+    /// or any other indeterminate failure) keeps the card and remembers the command id.
+    /// Repeating the same choice reuses that id, so if the first send did land the bridge
+    /// returns its recorded outcome instead of refusing the retry as no longer pending, or
+    /// double-applying it. A different choice gets a fresh id.
+    private func decide(_ payload: CommandPayload, sessionId: String, card: DecisionCard) async {
+        guard !isSending else { return }
         isSending = true
         defer { isSending = false }
-        let payload = QuestionAnswerPayload(questionId: question.questionId, text: text)
+        // Bumped by reconnect(); if it moves while the send is in flight, this call's response
+        // belongs to a bridge binding that has since been discarded, so it must not resurrect
+        // a card or status line for it (mirrors the guard in createSession()).
+        let generation = pollGeneration
+        let commandId: String
+        let timestamp: String
+        if let unconfirmed = unconfirmedSend, unconfirmed.payload == payload, unconfirmed.sessionId == sessionId {
+            commandId = unconfirmed.commandId
+            timestamp = unconfirmed.timestamp
+        } else {
+            commandId = UUID().uuidString
+            timestamp = BridgeClient.timestamp()
+        }
+        setOutcome(.sending, for: card)
         do {
-            try await perform(.questionAnswer(payload), sessionId: target)
-            if pendingQuestion?.questionId == question.questionId { pendingQuestion = nil }
-        } catch BridgeError.http(let status, _) where status == 409 {
-            if pendingQuestion?.questionId == question.questionId {
-                pendingQuestion = nil
-                statusLine = "Request no longer valid"
-                statusKind = .requestInvalid
+            try await client.send(payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp)
+            guard generation == pollGeneration else { return }
+            unconfirmedSend = nil
+            // If the resolution event already removed the card, its transcript line shows the
+            // outcome and a "Sent" banner would only linger under it.
+            guard isCurrent(card) else {
+                if actionOutcomeCardId == card.id { clearOutcome() }
+                return
             }
+            setOutcome(.acknowledged, for: card)
+            clearCard(card)
         } catch {
-            report(error)
+            guard generation == pollGeneration else { return }
+            unconfirmedSend = nil
+            let outcome = ActionOutcome.classify(error)
+            switch outcome {
+            case .offline, .failed, .rateLimited:
+                // Keep the card so the choice can be retried, and remember the command id: the
+                // send may have reached the bridge even though its outcome did not reach the
+                // Watch, so a retry must reuse it rather than mint a fresh one (which the bridge
+                // would treat as a distinct command).
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
+                unconfirmedSend = UnconfirmedSend(
+                    payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
+                )
+                setOutcome(outcome, for: card)
+                if outcome == .failed { report(error) }
+            case let terminal:
+                // A newer card can have replaced this one while the send was in flight (same
+                // guard the offline/failed/rateLimited branch above already applies). Bail out
+                // before touching the outcome slot or the status line: this stale send's outcome
+                // must not land on the new card's outcome slot (wrong id) or stomp whatever
+                // status the new card has already set. Still clear the .sending placeholder this
+                // call wrote at the top if it's still ours, or it would linger forever.
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
+                setOutcome(terminal, for: card)
+                clearCard(card)
+                statusLine = terminal.statusText ?? statusLine
+                statusKind = terminal == .authRequired ? .authFailed : .requestInvalid
+            }
+        }
+    }
+
+    /// The outcome to show on the card with this approval or question id, if the last send was
+    /// for it.
+    func outcome(forCard id: String) -> ActionOutcome? {
+        actionOutcomeCardId == id ? actionOutcome : nil
+    }
+
+    private func clearOutcome() {
+        actionOutcome = nil
+        actionOutcomeCardId = nil
+    }
+
+    private func setOutcome(_ outcome: ActionOutcome, for card: DecisionCard) {
+        actionOutcomeCardId = card.id
+        actionOutcome = outcome
+    }
+
+    private func isCurrent(_ card: DecisionCard) -> Bool {
+        switch card {
+        case .approval(let id): pendingApproval?.binding.approvalId == id
+        case .question(let id): pendingQuestion?.questionId == id
+        }
+    }
+
+    /// A newer card could have arrived (via the poll loop) while the send was in flight; only
+    /// clear the one this call answered.
+    private func clearCard(_ card: DecisionCard) {
+        guard isCurrent(card) else { return }
+        switch card {
+        case .approval: pendingApproval = nil
+        case .question: pendingQuestion = nil
         }
     }
 

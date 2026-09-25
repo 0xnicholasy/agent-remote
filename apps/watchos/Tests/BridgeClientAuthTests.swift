@@ -68,6 +68,109 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
     func stop() {
         close(listenSocket)
     }
+
+    /// Same as `respondOnce`, but also hands the raw request bytes (headers + body) to
+    /// `onRequest` before replying, so a test can inspect exactly what the client sent.
+    func respondOnce(statusLine: String, body: String, onRequest: @escaping @Sendable (Data) -> Void) {
+        queue.async { [listenSocket] in
+            guard let clientSocket = Self.acceptAndReadRequest(listenSocket: listenSocket, onRequest: onRequest) else { return }
+            defer { close(clientSocket) }
+            let response = "\(statusLine)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+            _ = response.withCString { write(clientSocket, $0, strlen($0)) }
+        }
+    }
+
+    /// Accepts one connection, captures its request, then closes without ever writing a
+    /// response -- simulating the connection-lost failure mode a retry has to survive, as
+    /// opposed to a decoded HTTP error response.
+    func dropConnectionOnce(onRequest: @escaping @Sendable (Data) -> Void) {
+        queue.async { [listenSocket] in
+            guard let clientSocket = Self.acceptAndReadRequest(listenSocket: listenSocket, onRequest: onRequest) else { return }
+            close(clientSocket)
+        }
+    }
+
+    private static func acceptAndReadRequest(listenSocket: Int32, onRequest: (Data) -> Void) -> Int32? {
+        let clientSocket = accept(listenSocket, nil, nil)
+        guard clientSocket >= 0 else { return nil }
+
+        var requestData = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let terminator = Data("\r\n\r\n".utf8)
+        while requestData.range(of: terminator) == nil {
+            let n = read(clientSocket, &buffer, buffer.count)
+            if n <= 0 { break }
+            requestData.append(contentsOf: buffer[0..<n])
+        }
+
+        // Headers are in hand; keep reading until the declared Content-Length worth of
+        // body has arrived too, so the caller sees the whole request, not just headers.
+        if let headerEnd = requestData.range(of: terminator) {
+            let headerText = String(decoding: requestData[..<headerEnd.lowerBound], as: UTF8.self)
+            let contentLength = headerText
+                .split(separator: "\r\n")
+                .first { $0.lowercased().hasPrefix("content-length:") }
+                .flatMap { line -> Int? in
+                    let parts = line.split(separator: ":", maxSplits: 1)
+                    guard parts.count == 2 else { return nil }
+                    return Int(parts[1].trimmingCharacters(in: .whitespaces))
+                } ?? 0
+            var bodyBytesSoFar = requestData.count - headerEnd.upperBound
+            while bodyBytesSoFar < contentLength {
+                let n = read(clientSocket, &buffer, buffer.count)
+                if n <= 0 { break }
+                requestData.append(contentsOf: buffer[0..<n])
+                bodyBytesSoFar += n
+            }
+        }
+
+        onRequest(requestData)
+        return clientSocket
+    }
+}
+
+/// Thread-safe box for values written from `LoopbackHTTPServer`'s background queue and read
+/// back on the test's task after the corresponding `await` completes.
+private final class RequestCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bodies: [Data] = []
+
+    func record(_ data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        bodies.append(data)
+    }
+
+    func requestBody(at index: Int) -> [String: Any]? {
+        lock.lock()
+        let raw = bodies[safe: index]
+        lock.unlock()
+        guard let raw, let range = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let bodyData = raw[range.upperBound...]
+        return (try? JSONSerialization.jsonObject(with: Data(bodyData))) as? [String: Any]
+    }
+
+    /// Lowercased header name -> value, parsed from the same captured raw request bytes.
+    func requestHeaders(at index: Int) -> [String: String]? {
+        lock.lock()
+        let raw = bodies[safe: index]
+        lock.unlock()
+        guard let raw, let range = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let headerText = String(decoding: raw[..<range.lowerBound], as: UTF8.self)
+        var headers: [String: String] = [:]
+        for line in headerText.split(separator: "\r\n").dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
+        }
+        return headers
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
 }
 
 /// Covers the client-side pieces of M3 slice 1 that do not need a live bridge: signed-request
@@ -161,6 +264,8 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 410, code: "decision_expired", message: ""), .decisionExpired)
         XCTAssertEqual(BridgeError.from(status: 409, code: "command_id_conflict", message: ""), .commandIdConflict)
         XCTAssertEqual(BridgeError.from(status: 429, code: "rate_limited", message: ""), .rateLimited)
+        XCTAssertEqual(BridgeError.from(status: 409, code: "command_indeterminate", message: ""), .commandIndeterminate)
+        XCTAssertEqual(BridgeError.from(status: 409, code: "interaction_not_pending", message: ""), .interactionNotPending)
         // The user-facing copy must not promise a wait the poll loop's ~15s
         // backoff (SessionStore) does not actually do -- no "minutes" language here.
         XCTAssertEqual(
@@ -235,5 +340,209 @@ final class BridgeClientAuthTests: XCTestCase {
         let pairedAfterFailure = await client.isPaired()
         XCTAssertFalse(pairedAfterFailure, "a rejected pairing code must not enroll the device")
         XCTAssertNil(credentialStore.load(), "no credential may be persisted on a failed pair()")
+    }
+
+    /// Covers E-12: `send()` must forward the caller-supplied commandId in the request body
+    /// verbatim -- the bridge keys its idempotency check on this exact field
+    /// (bridge/src/state/commands.ts / bridge/src/server.ts).
+    func testSendForwardsTheCallersCommandId() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"accepted":true}"#, onRequest: capture.record)
+
+        _ = try await client.send(
+            .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+            sessionId: "sess_demo",
+            commandId: "cmd_fixed_1234",
+            timestamp: "2026-09-25T00:00:00.000Z"
+        )
+
+        let sent = try XCTUnwrap(capture.requestBody(at: 0), "expected a captured JSON request body")
+        XCTAssertEqual(sent["commandId"] as? String, "cmd_fixed_1234")
+        XCTAssertEqual(sent["timestamp"] as? String, "2026-09-25T00:00:00.000Z")
+    }
+
+    /// Covers E-04 / E-20: a retry that resends the same commandId must resend the same body
+    /// timestamp too -- the bridge's idempotency check hashes the whole request body
+    /// (bridge/src/server.ts: `bodyDigest = sha256(rawBody)`), so a differing timestamp on retry
+    /// would change the digest and get rejected as `command_id_conflict` even though it is the
+    /// same logical command. The caller owns the timestamp (SessionStore keeps it alongside the
+    /// commandId in `unconfirmedSend`); `send()` must put exactly what it was given in the body.
+    func testRetryOfTheSameCommandIdReusesTheSameTimestamp() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
+
+        // First attempt: the connection drops before any HTTP response arrives -- the "offline"
+        // failure mode (ActionOutcome.classify / SessionStore.decide) that makes the caller
+        // retry with the same commandId, as opposed to a decoded HTTP error response.
+        server.dropConnectionOnce(onRequest: capture.record)
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_retry_5678",
+                timestamp: timestamp
+            )
+            XCTFail("expected the dropped connection to throw")
+        } catch {
+            // expected: no response was ever sent
+        }
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"accepted":true}"#, onRequest: capture.record)
+        _ = try await client.send(
+            .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+            sessionId: "sess_demo",
+            commandId: "cmd_retry_5678",
+            timestamp: timestamp
+        )
+
+        let first = try XCTUnwrap(capture.requestBody(at: 0))
+        let second = try XCTUnwrap(capture.requestBody(at: 1))
+        XCTAssertEqual(first["commandId"] as? String, "cmd_retry_5678")
+        XCTAssertEqual(second["commandId"] as? String, "cmd_retry_5678")
+        XCTAssertEqual(first["timestamp"] as? String, timestamp, "the body timestamp must be the one passed in")
+        XCTAssertEqual(
+            second["timestamp"] as? String,
+            timestamp,
+            "a same-commandId retry must resend the original timestamp, not mint a new one"
+        )
+    }
+
+    /// Covers E-04 (re-fix): a decoded HTTP error (as opposed to a dropped connection) that
+    /// SessionStore.decide retries with the same commandId -- e.g. a generic 500, or a 429
+    /// "rate_limited" -- must also carry the same body timestamp on retry; `send()` must not
+    /// rewrite it on either the failed or the retried attempt.
+    func testRetryAfterDecodedHTTPErrorReusesTheSameTimestamp() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
+
+        server.respondOnce(
+            statusLine: "HTTP/1.1 500 Internal Server Error",
+            body: #"{"error":"internal"}"#,
+            onRequest: capture.record
+        )
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_retry_5xx",
+                timestamp: timestamp
+            )
+            XCTFail("expected the decoded 500 response to throw")
+        } catch BridgeError.http(let status, _) {
+            XCTAssertEqual(status, 500)
+        }
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"accepted":true}"#, onRequest: capture.record)
+        _ = try await client.send(
+            .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+            sessionId: "sess_demo",
+            commandId: "cmd_retry_5xx",
+            timestamp: timestamp
+        )
+
+        let first = try XCTUnwrap(capture.requestBody(at: 0))
+        let second = try XCTUnwrap(capture.requestBody(at: 1))
+        XCTAssertEqual(first["commandId"] as? String, "cmd_retry_5xx")
+        XCTAssertEqual(second["commandId"] as? String, "cmd_retry_5xx")
+        XCTAssertEqual(first["timestamp"] as? String, timestamp, "the body timestamp must be the one passed in")
+        XCTAssertEqual(
+            second["timestamp"] as? String,
+            timestamp,
+            "a same-commandId retry after a decoded HTTP error must resend the original timestamp"
+        )
+    }
+
+    /// Covers E-30: a proxy-level failure (a 502 with an HTML body, not the bridge's own JSON
+    /// error shape) must still classify on the HTTP status. Before the fix, `send()` decoded the
+    /// response body into `CommandResponse` before ever looking at the status code, so a non-JSON
+    /// body on a >=300 response threw a raw `DecodingError` instead of `BridgeError.http`, losing
+    /// the status entirely.
+    func testSendOnNonJSONErrorBodySurfacesTheHTTPStatus() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+
+        server.respondOnce(
+            statusLine: "HTTP/1.1 502 Bad Gateway",
+            body: "<html><body>502 Bad Gateway</body></html>",
+            onRequest: capture.record
+        )
+
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_bad_gateway",
+                timestamp: BridgeClient.timestamp()
+            )
+            XCTFail("expected the non-JSON 502 body to throw a status-based error")
+        } catch BridgeError.http(let status, _) {
+            XCTAssertEqual(status, 502)
+        } catch {
+            XCTFail("expected BridgeError.http(502, _), got \(error)")
+        }
+    }
+
+    /// Investigates E-15: a `stale_request` (401) is rejected by `verifyEnvelope`
+    /// (bridge/src/auth/verify.ts:341-343) purely on the `X-AgentRemote-Timestamp` *header*,
+    /// checked before the command idempotency store is ever consulted (bridge/src/server.ts:714).
+    /// `signedRequest` mints that header's timestamp fresh on every call (see
+    /// `testSigningIsFreshPerRequest` above) independently of the caller-supplied body
+    /// `timestamp`, which only feeds the request *body*'s redundant field used solely to keep the
+    /// idempotency digest stable (bridge/src/server.ts:710, `bodyDigest = sha256(rawBody)`). Since
+    /// a stale_request rejection never reaches that digest check, retrying with the same
+    /// commandId cannot resend "the same stale timestamp" to the check that produced the 401: the
+    /// header is rebuilt fresh, and the retry succeeds once it is back inside the skew window.
+    func testRetryAfterStaleRequestGetsAFreshHeaderTimestampAndSucceeds() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
+        let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
+
+        server.respondOnce(
+            statusLine: "HTTP/1.1 401 Unauthorized",
+            body: #"{"error":"stale_request"}"#,
+            onRequest: capture.record
+        )
+        do {
+            _ = try await client.send(
+                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+                sessionId: "sess_demo",
+                commandId: "cmd_stale_9012",
+                timestamp: timestamp
+            )
+            XCTFail("expected the decoded stale_request response to throw")
+        } catch BridgeError.staleRequest {
+            // expected
+        }
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"accepted":true}"#, onRequest: capture.record)
+        _ = try await client.send(
+            .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
+            sessionId: "sess_demo",
+            commandId: "cmd_stale_9012",
+            timestamp: timestamp
+        )
+
+        let firstHeaders = try XCTUnwrap(capture.requestHeaders(at: 0))
+        let secondHeaders = try XCTUnwrap(capture.requestHeaders(at: 1))
+        XCTAssertNotEqual(
+            firstHeaders["x-agentremote-timestamp"],
+            secondHeaders["x-agentremote-timestamp"],
+            "a retry after stale_request must carry a freshly minted header timestamp, not the rejected one"
+        )
+        let secondBody = try XCTUnwrap(capture.requestBody(at: 1))
+        XCTAssertEqual(secondBody["timestamp"] as? String, timestamp, "the body timestamp stays the one passed in")
     }
 }

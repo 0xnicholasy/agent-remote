@@ -118,6 +118,11 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case decisionExpired
     case commandIdConflict
     case rateLimited
+    /// The bridge stopped while this command was running and cannot say whether it took effect.
+    case commandIndeterminate
+    /// The approval or question is no longer waiting for an answer (already decided, expired,
+    /// cancelled or superseded).
+    case interactionNotPending
 
     var description: String {
         switch self {
@@ -134,6 +139,8 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .decisionExpired: "That approval or question already expired."
         case .commandIdConflict: "That command was already sent with different contents."
         case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
+        case .commandIndeterminate: "The bridge cannot tell whether that command took effect."
+        case .interactionNotPending: "That request is no longer waiting for an answer."
         }
     }
 
@@ -151,6 +158,8 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "decision_expired": .decisionExpired
         case "command_id_conflict": .commandIdConflict
         case "rate_limited": .rateLimited
+        case "command_indeterminate": .commandIndeterminate
+        case "interaction_not_pending": .interactionNotPending
         default: .http(status: status, message: message)
         }
     }
@@ -167,8 +176,21 @@ protocol BridgeClientProtocol: Sendable {
     func pair(code: String, deviceName: String) async throws
     func isPaired() async -> Bool
     func events(after: Int, wait: Int) async throws -> EventsPage
+    /// `commandId` is the idempotency key: resending the same payload with the same id gets the
+    /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
+    /// the request body; the bridge's idempotency check hashes the entire body
+    /// (bridge/src/server.ts: `bodyDigest = sha256(rawBody)`), so a retry that resends the same
+    /// commandId must pass the same timestamp or be rejected as `command_id_conflict`.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse
+}
+
+extension BridgeClientProtocol {
+    /// Mints a fresh commandId and timestamp: for commands that are never retried.
+    @discardableResult
+    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
+        try await send(payload, sessionId: sessionId, commandId: UUID().uuidString, timestamp: BridgeClient.timestamp())
+    }
 }
 
 /// Talks to the Mac Agent Bridge over the HTTP long-poll baseline. One instance per app.
@@ -270,24 +292,21 @@ actor BridgeClient: BridgeClientProtocol {
         return try decoder.decode(SessionsResponse.self, from: data).sessions
     }
 
-    /// Submits one command, minting a fresh idempotency key for it.
+    /// Submits one command under the caller's idempotency key and body timestamp.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse {
         let command = Command(
-            commandId: UUID().uuidString,
+            commandId: commandId,
             sessionId: sessionId,
-            timestamp: BridgeClient.timestamp(),
+            timestamp: timestamp,
             payload: payload
         )
         let body = try encoder.encode(command)
         var request = try signedRequest(method: "POST", url: baseURL.appending(path: "/v1/commands"), body: body)
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         let (data, response) = try await urlSession.data(for: request)
-        let decoded = try decoder.decode(CommandResponse.self, from: data)
-        if let status = (response as? HTTPURLResponse)?.statusCode, status >= 300 {
-            throw BridgeError.from(status: status, code: decoded.error, message: decoded.error ?? "unknown error")
-        }
-        return decoded
+        try Self.checkStatus(response, data: data)
+        return try decoder.decode(CommandResponse.self, from: data)
     }
 
     private func get(_ url: URL) async throws -> Data {

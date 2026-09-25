@@ -86,7 +86,7 @@ Slice 2 status (2026-09-20): duplicate commands, expired decisions, unauthorized
 Dependencies: M1 delivery decision and M3 control guarantees.
 
 - [ ] Build onboarding, Mac pairing, project authorization, and a Mac control surface.
-- [ ] Present clear sending, acknowledged, rejected, expired, and offline outcomes.
+- [x] 2026-09-25 (branch `feat/watch-action-outcomes`): every approve, deny or answer ends in one visible outcome on the Watch (`ActionOutcome`): sending, acknowledged, no longer valid (`interaction_not_pending`, stale 409, `command_id_conflict`), expired (`decision_expired`), offline (URL transport errors), outcome unknown (`command_indeterminate`, previously shown as "no longer valid"), or failed. Offline keeps the card and a repeat of the same choice reuses its `commandId`. Simulator and unit tests only; offline behaviour on a physical Watch is part of the M5 device scenarios.
 - [ ] Provide sufficient exact context for a risky or long action, or direct the user to review it at the desk. A spoken summary alone is not authorization context.
 - [ ] Finish the glanceable conversation/status experience, reviewed dictation, foreground speech, and prominent cancel behavior.
 
