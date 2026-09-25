@@ -69,3 +69,7 @@ on the same cursor.
 - The Watch UI test reads `AGENTREMOTE_UI_BRIDGE`, `AGENTREMOTE_UI_PAIR_CODE` and `AGENTREMOTE_UI_SHOT_DIR` through xcodebuild's `TEST_RUNNER_` prefix. Setting them inline (`TEST_RUNNER_X=... xcodebuild ...`) in the agent shell left the test skipped; `export` them first, then run xcodebuild. Scheme `EnvironmentVariables` did not reach the UI test runner either.
 - An unsigned watchOS simulator app cannot write to the keychain (`-34018`, errSecMissingEntitlement), so pairing fails there. Simulator builds are signed ad hoc in `project.yml` for this reason.
 - Check who owns a port before reusing it: 8787 was another project's dev server. The scratch bridge runs with `PORT=8799`.
+
+## 2026-09-25 headless harden runs
+
+- `claude -p "/harden-and-ship-pr N"` exits with "Background tasks still running after 600s; terminating" when a background task (an xcodebuild run) outlives the print-mode wait ceiling, leaving a held lock and uncommitted fixes. Launch headless harden runs with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`.
