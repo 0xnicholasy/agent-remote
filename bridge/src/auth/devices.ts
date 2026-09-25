@@ -2,11 +2,23 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { atomicWriteFileSync } from "./persist";
+import { atomicWriteFileSync, withFileLock } from "./persist";
 
 // touch() coalesces persists to at most once per this interval; see the comment on touch() for
 // why an on-disk lastSeenAt lagging by up to this much is safe.
 const LAST_SEEN_PERSIST_INTERVAL_MS = 60_000;
+
+// devices.json.lock defaults, per the "Device registry" section of docs/pairing-v0.md. The 2 s
+// default suits the one-shot admin CLI. The bridge runs on a single event loop and the lock wait is
+// synchronous, so it passes BRIDGE_LOCK_TIMEOUT_MS instead: the CLI holds the lock only for one
+// reload + write (milliseconds), so a short bound is plenty and never stalls every other request.
+const DEFAULT_LOCK_TIMEOUT_MS = 2000;
+export const BRIDGE_LOCK_TIMEOUT_MS = 250;
+
+export interface DeviceRegistryOptions {
+  /** How long a mutating call waits for devices.json.lock before failing. */
+  lockTimeoutMs?: number;
+}
 
 /** `mtimeMs`+`size` of the backing file as last observed by this registry, or `null` when the
  * file did not exist at that observation. Cheap to compare against a fresh `statSync` without
@@ -52,7 +64,7 @@ export class DeviceRegistry {
   private readonly filePath: string | undefined;
   // Last-seen stamp of the backing file, so a read path can tell "someone else wrote this since
   // we last looked" from "nothing changed" with one statSync, per the "Device registry" section:
-  // a separate `AGENTREMOTE_REVOKE` process writes devices.json directly, and a long-running
+  // a separate `bun run bridge revoke` process writes devices.json directly, and a long-running
   // bridge must notice that write without a restart. undefined means "never checked yet".
   private knownStamp: FileStamp | null | undefined;
   // `lastSeenAt` as last actually written to (or read from) disk, in epoch milliseconds, keyed by
@@ -64,15 +76,35 @@ export class DeviceRegistry {
   // no entry, which makes the next touch persist.
   private readonly persistedLastSeenAtMs = new Map<string, number>();
 
-  constructor(filePath?: string) {
+  private readonly lockTimeoutMs: number;
+
+  constructor(filePath?: string, options: DeviceRegistryOptions = {}) {
     this.filePath = filePath;
+    this.lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
   }
 
   /** Loads from `filePath`, creating an empty registry when the file does not exist. */
-  static load(filePath: string): DeviceRegistry {
-    const registry = new DeviceRegistry(filePath);
+  static load(filePath: string, options: DeviceRegistryOptions = {}): DeviceRegistry {
+    const registry = new DeviceRegistry(filePath, options);
     registry.reloadIfChanged();
     return registry;
+  }
+
+  /**
+   * Runs a reload -> mutate -> persist sequence under `${filePath}.lock`, the cross-process lock
+   * the admin CLI also takes. The reload MUST happen inside `fn`: a reload done before the lock
+   * could predate another process's rename, and our later rename would then silently undo that
+   * write (resurrecting a revoked device or re-granting a denied project). In-memory registries
+   * have no file to race on and run `fn` directly.
+   *
+   * The lock is never taken over (see persist.ts's `withFileLock`); a lock left by a crashed
+   * writer is only ever cleared at bridge startup, by `clearLockIfHolderDead`.
+   */
+  private locked<T>(fn: () => T, timeoutMs: number = this.lockTimeoutMs): T {
+    if (this.filePath === undefined) {
+      return fn();
+    }
+    return withFileLock(`${this.filePath}.lock`, fn, timeoutMs);
   }
 
   /** Re-reads the backing file only when its `statSync` stamp differs from `knownStamp`, i.e.
@@ -137,19 +169,21 @@ export class DeviceRegistry {
    * process never serves a device as registered whose record did not reach disk.
    */
   register(record: DeviceRecord): void {
-    this.reloadIfChanged();
-    const previous = this.devices.get(record.deviceId);
-    this.devices.set(record.deviceId, record);
-    try {
-      this.persist();
-    } catch (cause) {
-      if (previous === undefined) {
-        this.devices.delete(record.deviceId);
-      } else {
-        this.devices.set(record.deviceId, previous);
+    this.locked(() => {
+      this.reloadIfChanged();
+      const previous = this.devices.get(record.deviceId);
+      this.devices.set(record.deviceId, record);
+      try {
+        this.persist();
+      } catch (cause) {
+        if (previous === undefined) {
+          this.devices.delete(record.deviceId);
+        } else {
+          this.devices.set(record.deviceId, previous);
+        }
+        throw cause;
       }
-      throw cause;
-    }
+    });
   }
 
   get(deviceId: string): DeviceRecord | undefined {
@@ -173,19 +207,59 @@ export class DeviceRegistry {
    * (and this one after a restart) still treats the device as live.
    */
   revoke(deviceId: string, now: Date): void {
-    this.reloadIfChanged();
-    const record = this.devices.get(deviceId);
-    if (record === undefined) {
-      return;
-    }
-    const previousRevokedAt = record.revokedAt;
-    record.revokedAt = now.toISOString();
-    try {
-      this.persist();
-    } catch (cause) {
-      record.revokedAt = previousRevokedAt;
-      throw cause;
-    }
+    this.locked(() => {
+      this.reloadIfChanged();
+      const record = this.devices.get(deviceId);
+      if (record === undefined) {
+        return;
+      }
+      const previousRevokedAt = record.revokedAt;
+      record.revokedAt = now.toISOString();
+      try {
+        this.persist();
+      } catch (cause) {
+        record.revokedAt = previousRevokedAt;
+        throw cause;
+      }
+    });
+  }
+
+  /**
+   * Replaces `allowedProjects` with a deduped, sorted copy of `projects`. Reloads first and
+   * rolls back on a failed persist, for the same reasons as `revoke` above: an operator command
+   * (the CLI's `projects allow`/`projects deny`) writes devices.json directly, and a caller must
+   * never observe a device as authorized for a project set that did not reach disk.
+   *
+   * The reload only protects *other* records from the whole-map rewrite; this device's array is
+   * overwritten wholesale with `projects`. A caller that derives `projects` from a `get()` made
+   * outside the lock races another writer and loses one of the two changes, so read-modify-write
+   * callers (add one project, remove one project) must use `updateAllowedProjects` instead.
+   */
+  setAllowedProjects(deviceId: string, projects: string[]): void {
+    this.updateAllowedProjects(deviceId, () => projects);
+  }
+
+  /**
+   * Read-modify-write on `allowedProjects` under the file lock: `update` receives the array as
+   * reloaded from disk inside the lock, and its result is stored deduped and sorted. Same
+   * unknown-device no-op and rollback-on-failed-persist contract as `setAllowedProjects`.
+   */
+  updateAllowedProjects(deviceId: string, update: (current: readonly string[]) => string[]): void {
+    this.locked(() => {
+      this.reloadIfChanged();
+      const record = this.devices.get(deviceId);
+      if (record === undefined) {
+        return;
+      }
+      const previousAllowedProjects = record.allowedProjects;
+      record.allowedProjects = [...new Set(update(previousAllowedProjects))].sort();
+      try {
+        this.persist();
+      } catch (cause) {
+        record.allowedProjects = previousAllowedProjects;
+        throw cause;
+      }
+    });
   }
 
   /**
@@ -217,16 +291,32 @@ export class DeviceRegistry {
     // frequent than it, so the on-disk lastSeenAt would freeze at the first write forever.
     const persistedAtMs = this.persistedLastSeenAtMs.get(deviceId);
     if (persistedAtMs === undefined || now.getTime() - persistedAtMs >= LAST_SEEN_PERSIST_INTERVAL_MS) {
-      this.reloadIfChanged();
-      const fresh = this.devices.get(deviceId);
-      if (fresh === undefined) {
-        return;
-      }
-      fresh.lastSeenAt = now.toISOString();
+      // Best-effort and non-blocking: touch runs on every authenticated request, so it makes one
+      // lock attempt (timeout 0, no wait) and a busy lock (an operator command mid-write) skips
+      // this write rather than stalling the event loop; the next touch past the interval retries.
+      let acquired = false;
       try {
-        this.persist();
+        this.locked(() => {
+          acquired = true;
+          this.reloadIfChanged();
+          const fresh = this.devices.get(deviceId);
+          if (fresh === undefined) {
+            return;
+          }
+          fresh.lastSeenAt = now.toISOString();
+          try {
+            this.persist();
+          } catch (cause) {
+            console.warn(`Agent Remote bridge: failed to persist lastSeenAt for device ${deviceId}`, cause);
+          }
+        }, 0);
       } catch (cause) {
-        console.warn(`Agent Remote bridge: failed to persist lastSeenAt for device ${deviceId}`, cause);
+        // Errors from inside the lock (a corrupt file on reload) propagate as before; failing to
+        // take the lock at all (timeout, or an unwritable state dir) just skips this write.
+        if (acquired) {
+          throw cause;
+        }
+        console.warn(`Agent Remote bridge: skipped persisting lastSeenAt for device ${deviceId}`, cause);
       }
     }
   }

@@ -91,6 +91,9 @@ cd protocol/swift && swift test
 The Watch project is defined in `apps/watchos/project.yml`; its deployment target is a prototype
 choice rather than a compatibility commitment.
 
+To pair a Watch to a running bridge, manage paired devices, and authorize projects, see
+[Onboarding](docs/onboarding.md).
+
 ## Documentation
 
 - [Product direction](docs/product-vision.md)

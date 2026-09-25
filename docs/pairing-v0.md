@@ -1,6 +1,6 @@
 # Pairing and request authentication, version 0
 
-Last updated: 2026-09-20
+Last updated: 2026-09-25
 
 This document is the normative contract for M3 slice 1: how a device enrolls with a bridge, and
 how every subsequent request proves it came from an enrolled device. The bridge (TypeScript) and
@@ -203,6 +203,15 @@ holds `deviceId`, `deviceName`, `keyId`, the device key as hex, `pairedAt`, `all
 The file holds live credentials. It is written atomically (temp file then rename) so a crash
 mid-write cannot truncate the registry.
 
+Every reload -> mutate -> write of `devices.json` (register, revoke, project allow/deny, the
+throttled `lastSeenAt` write) runs under an exclusive `devices.json.lock` holding the writer's pid;
+the bridge and the operator CLI both honour it, so neither can overwrite the other's write with a
+stale copy. The lock is never taken over: a lock that exists is held, full stop. The CLI waits up
+to 2 s and the bridge up to 250 ms, then fails; the `lastSeenAt` write does not wait and just
+skips. A lock left behind by a writer that crashed mid-write is removed automatically the next
+time the bridge starts, if the pid it names is no longer running; otherwise remove it by hand — the
+error names the pid and says whether that pid is still running.
+
 A newly paired device is granted every action, and every project the bridge currently exposes. The
 registry format carries per-device narrowing so a Mac control surface can tighten it later (M4)
 without another protocol change.
@@ -214,7 +223,7 @@ revoked this" apart from "this Watch was never paired".
 The in-process registry checks the backing file's modification time and size on every lookup
 (`get`, `list`) and re-reads the file only when that stamp has changed since it was last observed
 — one cheap `statSync`, no re-parse, unless something else actually wrote the file. This is what
-lets `AGENTREMOTE_REVOKE` (below) take effect on a bridge that is already running: the operator
+lets `bun run bridge revoke` (below) take effect on a bridge that is already running: the operator
 command is a separate one-shot process writing `devices.json` directly, and the running bridge
 picks up that write on its next authenticated request instead of needing a restart, which would
 otherwise kill every live session.
@@ -228,20 +237,34 @@ failedAttempts }` — a live, 5-minute credential in clear text, not a hash — 
 registry's threat model: anything that can read the state directory can enroll a device until the
 code expires or burns.
 
-This is what lets `AGENTREMOTE_PAIR=1` (below) work against a bridge that is already running: the
+This is what lets `bun run bridge pair` (below) work against a bridge that is already running: the
 operator command and the bridge process both read and write the same file, instead of the operator
 command minting a code only its own one-shot process ever knew about.
 
 ### Operator commands
 
-The bridge process reads no interactive input, so operator actions are environment-triggered at
-startup and logged:
+The bridge process reads no interactive input, so operator actions are a separate CLI
+(`bun run bridge <command>`, bridge/src/cli.ts) that edits `devices.json`/`pairing.json` in the
+state directory directly, the same files the running bridge reads. It never opens a journal or
+takes `bridge.lock`, so it is safe to run alongside a live bridge process, and works against an
+already-running bridge — no restart, so no live sessions are killed — because state is shared
+through those files rather than held in one process's memory:
 
-- `AGENTREMOTE_PAIR=1` mints a fresh pairing code into `pairing.json`, prints it and its expiry,
-  and exits. It works against an already-running bridge — no restart, so no live sessions are
-  killed — because the code is shared through that file rather than held in one process's memory.
-- `AGENTREMOTE_REVOKE=<deviceId>` marks that device revoked and exits.
-- `AGENTREMOTE_LIST_DEVICES=1` prints the registry (no key material) and exits.
+- `bun run bridge pair` mints a fresh pairing code into `pairing.json`, prints it, the host:port to
+  enter in Watch Settings, and its expiry, then waits (poll every ~1s) for a device to pair or the
+  code to expire/be used up. `--no-wait` prints the code and exits without waiting.
+- `bun run bridge devices` prints the registry (no key material); `--json` for machine-readable
+  output.
+- `bun run bridge revoke <deviceId>` marks that device revoked and exits.
+- `bun run bridge projects list` prints the current project ids (from `AGENTREMOTE_PROJECT_DIRS`
+  or `cwd`) and each device's `allowedProjects`.
+- `bun run bridge projects allow <deviceId> <prj_id|/abs/path>` adds a project to a device's
+  `allowedProjects` (accepts an absolute path in place of a `prj_` id); refuses an id that is not
+  a current project unless `--force`.
+- `bun run bridge projects deny <deviceId> <prj_id|/abs/path>` removes a project from a device's
+  `allowedProjects`. An empty `allowedProjects` means the device is allowed no project at all — the
+  command-authorization check in the "Device registry" section above treats "not in the list" as a
+  403 regardless of whether the list is empty or just missing the one project asked for.
 
 ## Development bypass
 

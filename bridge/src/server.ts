@@ -5,7 +5,6 @@ import path from "node:path";
 import Ajv2020 from "ajv/dist/2020";
 import addFormats from "ajv-formats";
 import {
-  digest,
   type AgentEvent,
   type AgentEventEnvelope,
   type AgentEventPayloadMap,
@@ -30,9 +29,10 @@ import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, ty
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
 import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "./auth/pairing";
-import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
-import { atomicWriteFileSync } from "./auth/persist";
+import { BRIDGE_LOCK_TIMEOUT_MS, DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
+import { atomicWriteFileSync, clearLockIfHolderDead } from "./auth/persist";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
+import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
 import { CommandJournal } from "./state/commands";
 import { EventLog } from "./state/event-log";
 import { InteractionRegistry } from "./state/interactions";
@@ -97,7 +97,7 @@ export interface CreateBridgeOptions {
   devicesFilePath?: string;
   /** Explicit path for the persisted live pairing code; defaults to alongside `devicesFilePath`
    * as `pairing.json`. Persisting it (rather than keeping it in the bridge process's memory
-   * only) is what lets `AGENTREMOTE_PAIR=1` mint a code the already-running bridge can see. */
+   * only) is what lets `bun run bridge pair` mint a code the already-running bridge can see. */
   pairingCodeFilePath?: string;
   /** Clock used for pairing TTL, signature skew, nonce TTL and device timestamps. Production
    * uses the real clock; tests pass a fixed one for determinism. */
@@ -152,15 +152,11 @@ function isValidProviderId(value: string): value is ValidProviderId {
   return (VALID_PROVIDER_IDS as readonly string[]).includes(value);
 }
 
-// Derives a stable project id from an absolute directory: the basename for readability, plus
-// a digest suffix of the full path so two projects sharing a basename (e.g. two checkouts
-// both named "app") never collide.
-export function projectIdFor(dir: string): string {
-  const base = dir.split("/").filter((part) => part.length > 0).at(-1) ?? "project";
-  const slug = base.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
-  const suffix = digest(dir).replace("sha256:", "").slice(0, 8);
-  return `prj_${slug}_${suffix}`;
-}
+// Re-exported so existing importers (server.test.ts, the CLI) keep resolving it from here /
+// projects.ts respectively without a behavior change; the implementation now lives in
+// projects.ts alongside resolveProjectIds, which the CLI needs without pulling in this module's
+// HTTP server and journal/lock machinery.
+export { projectIdFor };
 
 // `unknown` is genuinely the right type here: this helper serialises whatever a route hands
 // it, including error shapes that are not part of the protocol, and it only ever passes the
@@ -193,7 +189,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const authEnabled = options.authEnabled ?? process.env.AGENTREMOTE_AUTH !== "off";
 
   const devicesFilePath = options.devicesFilePath ?? path.join(resolveStateDir(), "devices.json");
-  const registry = options.registry ?? DeviceRegistry.load(devicesFilePath);
+  // Short lock bound: the devices.json.lock wait is synchronous and would block the event loop.
+  const registry =
+    options.registry ?? DeviceRegistry.load(devicesFilePath, { lockTimeoutMs: BRIDGE_LOCK_TIMEOUT_MS });
   const SKEW_MS = 120_000; // 120 seconds in either direction, per docs/pairing-v0.md.
 
   // Durable bridge state lives next to the device registry, per docs/durability-v0.md. The same
@@ -286,6 +284,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
             "Stop that process before starting a new one against the same state directory.",
         );
       }
+    }
+    // The one race-free moment to clear a devices.json.lock orphaned by a crashed writer: this
+    // process holds bridge.lock, so no other bridge exists, and a live CLI's lock is left alone.
+    if (clearLockIfHolderDead(`${devicesFilePath}.lock`)) {
+      console.warn(`Agent Remote bridge: removed devices.json.lock left by a dead process`);
     }
     let lockReleased = false;
     releaseLock = (): void => {
@@ -503,35 +506,32 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 
   let provider: SeedableProvider;
   let seedProjectId: string;
+  let resolvedProjects: Project[];
   if (providerId === "claude") {
-    // A blank or whitespace-only value is treated the same as unset, so a stray
-    // `AGENTREMOTE_PROJECT_DIRS=` in the environment falls back to cwd instead of leaving
-    // projects empty and crashing seedSession's later "unknown projectId" lookup. The same
-    // fallback applies when the value parses to zero usable directories (e.g. all commas or
-    // whitespace-only entries), so that case cannot crash startup either.
-    const rawDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
-    const parsedDirs =
-      rawDirs === undefined
-        ? []
-        : rawDirs
-            .split(",")
-            .map((dir) => dir.trim())
-            .filter((dir) => dir.length > 0);
-    for (const dir of parsedDirs) {
-      if (!path.isAbsolute(dir)) {
-        throw new Error(`AGENTREMOTE_PROJECT_DIRS must contain only absolute paths, got: "${dir}"`);
-      }
-    }
-    const dirs = parsedDirs.length > 0 ? parsedDirs : [process.cwd()];
-    const projects: Project[] = dirs.map((dir) => ({ id: projectIdFor(dir), name: dir.split("/").filter((p) => p.length > 0).at(-1) ?? dir, path: dir }));
+    // `resolveProjectIds` throws `AGENTREMOTE_PROJECT_DIRS must contain only absolute paths` for
+    // a non-absolute entry, and falls back to `process.cwd()` when the variable is unset, blank,
+    // or parses to zero usable directories, so seedSession's later "unknown projectId" lookup
+    // never sees an empty project list. See projects.ts for the shared resolution logic.
+    const projects: Project[] = resolveProjectIds(process.env, process.cwd());
     const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
     provider = createClaudeProvider(host, { projects });
     seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
+    resolvedProjects = projects;
   } else {
     provider = new MockProvider(host, options.mockProviderOptions);
     seedProjectId = "prj_demo";
+    resolvedProjects = [{ id: "prj_demo", name: "demo", path: process.cwd() }];
   }
   emittedProviderId = provider.id;
+
+  // The bridge is the sole writer of projects.json: the CLI reads it to show the RUNNING
+  // bridge's project list instead of re-resolving its own (possibly different) environment.
+  // Only written when there is a real state dir to persist into (mirrors bridgeIdFilePath /
+  // pairingCodeFilePath above).
+  const projectsFilePath = journalPath(bridgeProjectsFileName);
+  if (projectsFilePath !== undefined) {
+    atomicWriteFileSync(projectsFilePath, JSON.stringify(resolvedProjects));
+  }
 
   const seedTimestamp = now().toISOString();
   const session: Session = {
@@ -1195,54 +1195,37 @@ export function assertAuthBypassAllowed(params: {
   );
 }
 
-/** Prints a fresh pairing code and its expiry, per the "Operator commands" section of
- * docs/pairing-v0.md. The code is persisted to `<stateDir>/pairing.json` (the same path
- * `createBridge` uses), so this one-shot process's mint reaches an already-running bridge —
- * re-pairing a device no longer requires restarting the bridge and killing live sessions. */
-export function runPairOperatorCommand(stateDir: string = resolveStateDir(), now: Date = new Date()): void {
-  const store = new PairingCodeStore(path.join(stateDir, "pairing.json"));
-  const code = store.mint(now);
-  const PAIRING_TTL_MS = 5 * 60 * 1000;
-  const expiresAt = new Date(now.getTime() + PAIRING_TTL_MS).toISOString();
-  console.log(`Pairing code: ${formatPairingCode(code)} (expires ${expiresAt})`);
-}
-
-/** `AGENTREMOTE_REVOKE=<deviceId>`: marks a device revoked in the persisted registry and exits. */
-export function runRevokeOperatorCommand(deviceId: string, stateDir: string = resolveStateDir(), now: Date = new Date()): void {
-  const registry = DeviceRegistry.load(path.join(stateDir, "devices.json"));
-  if (registry.get(deviceId) === undefined) {
-    console.log(`No such device: ${deviceId}`);
-    return;
+// The legacy one-shot operator env vars (AGENTREMOTE_PAIR / AGENTREMOTE_REVOKE /
+// AGENTREMOTE_LIST_DEVICES) used to short-circuit this block before a bridge ever started.
+// Now that those commands live in cli.ts (see the comment below), leaving one of those vars set
+// no longer does anything except silently start a full bridge instead of running the one-shot
+// the operator asked for -- a state that looks fine on the surface (the bridge starts, no error)
+// but is not what was requested. Checked first, before createBridge, so it fails loudly instead.
+export function legacyOperatorEnvError(env: NodeJS.ProcessEnv): string | undefined {
+  const replacements: Record<string, string> = {
+    AGENTREMOTE_PAIR: "bun run bridge pair",
+    AGENTREMOTE_REVOKE: "bun run bridge revoke <deviceId>",
+    AGENTREMOTE_LIST_DEVICES: "bun run bridge devices",
+  };
+  const setVars = Object.keys(replacements).filter((name) => env[name] !== undefined);
+  if (setVars.length === 0) {
+    return undefined;
   }
-  registry.revoke(deviceId, now);
-  console.log(`Revoked device: ${deviceId}`);
-}
-
-/** `AGENTREMOTE_LIST_DEVICES=1`: prints the registry, deliberately never printing key material. */
-export function runListDevicesOperatorCommand(stateDir: string = resolveStateDir()): void {
-  const registry = DeviceRegistry.load(path.join(stateDir, "devices.json"));
-  const devices = registry.list().map((record) => ({
-    deviceId: record.deviceId,
-    deviceName: record.deviceName,
-    keyId: record.keyId,
-    pairedAt: record.pairedAt,
-    allowedProjects: record.allowedProjects,
-    allowedActions: record.allowedActions,
-    revokedAt: record.revokedAt,
-    lastSeenAt: record.lastSeenAt,
-  }));
-  console.log(JSON.stringify(devices, null, 2));
+  const details = setVars.map((name) => `${name} (use \`${replacements[name]}\` instead)`).join(", ");
+  return `${details}. unset it to start the bridge.`;
 }
 
 if (import.meta.main) {
-  // Operator commands are one-shot: read the env var, act, exit. They never start the server.
-  if (process.env.AGENTREMOTE_PAIR === "1") {
-    runPairOperatorCommand();
-  } else if (process.env.AGENTREMOTE_REVOKE !== undefined && process.env.AGENTREMOTE_REVOKE.length > 0) {
-    runRevokeOperatorCommand(process.env.AGENTREMOTE_REVOKE);
-  } else if (process.env.AGENTREMOTE_LIST_DEVICES === "1") {
-    runListDevicesOperatorCommand();
-  } else {
+  // Operator commands (pair/devices/revoke/projects) live in cli.ts now: they edit
+  // devices.json/pairing.json directly the same way this block always has, but never open a
+  // journal or take bridge.lock, and must not import this module (see cli.ts's header comment).
+  {
+    const legacyEnvError = legacyOperatorEnvError(process.env);
+    if (legacyEnvError !== undefined) {
+      console.error(legacyEnvError);
+      process.exit(2);
+    }
+
     const authEnabled = process.env.AGENTREMOTE_AUTH !== "off";
     const bridge = createBridge();
     const { hostname, warnNoAuth } = resolveBindHost(bridge.provider.id, process.env.AGENTREMOTE_HOST);

@@ -22,14 +22,17 @@ import { SessionLimitError, TurnInProgressError, UnknownSessionError } from "@ag
 import {
   assertAuthBypassAllowed,
   createBridge,
+  legacyOperatorEnvError,
   projectIdFor,
   resolveBindHost,
   type Bridge,
   type CreateBridgeOptions,
 } from "./server";
+import { readBridgeProjects, resolveProjectIds } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { deriveDeviceKey, pairingProof } from "./auth/pairing";
 import { signRequest } from "./auth/verify";
+import { runCli, type CliDeps } from "./cli";
 
 let bridge: Bridge;
 
@@ -1117,6 +1120,13 @@ describe("projectIdFor", () => {
     expect(first).toMatch(/^prj_app_[0-9a-f]{8}$/);
     expect(second).toMatch(/^prj_app_[0-9a-f]{8}$/);
   });
+
+  test("equivalent paths normalize to the same id", () => {
+    const base = projectIdFor("/a/b");
+    expect(projectIdFor("/a/b/")).toBe(base);
+    expect(projectIdFor("/a/x/../b")).toBe(base);
+    expect(projectIdFor("/a//b")).toBe(base);
+  });
 });
 
 describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
@@ -1196,6 +1206,11 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
     } finally {
       restoreEnv();
     }
+  });
+
+  test("a relative-path entry throws, naming the bad entry", () => {
+    const env = { AGENTREMOTE_PROVIDER: "claude", AGENTREMOTE_PROJECT_DIRS: "/repos/one,relative/two" };
+    expect(() => resolveProjectIds(env, process.cwd())).toThrow("relative/two");
   });
 });
 
@@ -1779,6 +1794,117 @@ describe("pairing", () => {
     );
     expect(afterRevoke.status).toBe(403);
     expect(await afterRevoke.json()).toEqual({ error: "device_revoked" });
+  });
+
+  // Same shape as the revoke regression above, but for the CLI's `projects deny`: a separate
+  // process editing devices.json directly must be visible to a running bridge without a restart.
+  test("projects deny run via the CLI over the same devices file is enforced without a bridge restart", async () => {
+    const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_eeeeeeeeeeeeeeee";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await bridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+
+    const createCommand: Command = {
+      commandId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: "prj_demo", provider: "mock" },
+    };
+    const beforeDeny = await bridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createCommand, deviceId, deviceKey }),
+    );
+    expect(beforeDeny.status).toBe(200);
+
+    const cliDeps: CliDeps = {
+      stateDir,
+      now: () => FIXED_NOW,
+      stdout: () => {},
+      stderr: () => {},
+      sleep: () => Promise.resolve(),
+      health: () => Promise.resolve(null),
+      env: {},
+      cwd: process.cwd(),
+    };
+    const cliExitCode = await runCli(["projects", "deny", deviceId, "prj_demo"], cliDeps);
+    expect(cliExitCode).toBe(0);
+
+    const afterDeny = await bridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: { ...createCommand, commandId: "ffffffff-ffff-4fff-8fff-ffffffffffff" },
+        deviceId,
+        deviceKey,
+      }),
+    );
+    expect(afterDeny.status).toBe(403);
+    expect(await afterDeny.json()).toEqual({ error: "project_not_allowed" });
+  });
+
+  // Grant direction of the regression above: a device paired without a project (denied by the
+  // CLI's `projects deny`, or simply never granted it) must see `session.create` for that
+  // project start succeeding the moment a separate `projects grant` edits devices.json, with no
+  // bridge restart in between.
+  test("projects grant run against the same devices file is enforced without a bridge restart", async () => {
+    const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const deviceId = "dev_ffffffffffffffff";
+    const deviceName = "Watch";
+    const nonce = randomBytes(16).toString("hex");
+    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
+
+    const pairResponse = await bridge.fetch(
+      new Request("http://bridge.local/v1/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+      }),
+    );
+    expect(pairResponse.status).toBe(200);
+    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+
+    // Stands in for `bun run bridge projects deny <deviceId> prj_demo`: a separate registry
+    // instance over the same file strips the project the pairing flow granted by default.
+    const operatorRegistry = DeviceRegistry.load(devicesFilePath);
+    operatorRegistry.setAllowedProjects(deviceId, []);
+
+    const createCommand: Command = {
+      commandId: "aaaaaaaa-0000-4000-8000-000000000000",
+      sessionId: "ses_placeholder",
+      type: "session.create",
+      timestamp: FIXED_NOW.toISOString(),
+      payload: { projectId: "prj_demo", provider: "mock" },
+    };
+    const beforeGrant = await bridge.fetch(
+      signedRequest({ method: "POST", pathWithQuery: "/v1/commands", body: createCommand, deviceId, deviceKey }),
+    );
+    expect(beforeGrant.status).toBe(403);
+    expect(await beforeGrant.json()).toEqual({ error: "project_not_allowed" });
+
+    // Stands in for `bun run bridge projects grant <deviceId> prj_demo`.
+    operatorRegistry.setAllowedProjects(deviceId, ["prj_demo"]);
+
+    const afterGrant = await bridge.fetch(
+      signedRequest({
+        method: "POST",
+        pathWithQuery: "/v1/commands",
+        body: { ...createCommand, commandId: "bbbbbbbb-0000-4000-8000-000000000000" },
+        deviceId,
+        deviceKey,
+      }),
+    );
+    expect(afterGrant.status).toBe(200);
   });
 });
 
@@ -2511,6 +2637,37 @@ describe("single-writer state dir lock", () => {
 
     fresh?.close();
   });
+
+  test("startup removes a devices.json.lock left by a dead process but leaves one naming a live pid", () => {
+    const deadLockDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    const liveLockDir = mkdtempSync(join(tmpdir(), "agentremote-lock-test-"));
+    try {
+      // No real process can hold this pid; it is well past any platform's max pid.
+      writeFileSync(join(deadLockDir, "devices.json.lock"), "999999999", "utf8");
+      writeFileSync(join(liveLockDir, "devices.json.lock"), String(process.pid), "utf8");
+
+      const deadLockBridge = createBridge({
+        devicesFilePath: join(deadLockDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+      const liveLockBridge = createBridge({
+        devicesFilePath: join(liveLockDir, "devices.json"),
+        authEnabled: false,
+        now: () => FIXED_NOW,
+      });
+      try {
+        expect(existsSync(join(deadLockDir, "devices.json.lock"))).toBe(false);
+        expect(existsSync(join(liveLockDir, "devices.json.lock"))).toBe(true);
+      } finally {
+        deadLockBridge.close();
+        liveLockBridge.close();
+      }
+    } finally {
+      rmSync(deadLockDir, { recursive: true, force: true });
+      rmSync(liveLockDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("retained events of a reused session id", () => {
@@ -2683,5 +2840,76 @@ describe("retained events of a reused session id", () => {
     // retained event belongs to project A and stays withheld. Authorizing it against the live
     // session instead of its own stamp is exactly the hole this closes.
     expect(page.events.some((event) => event.sessionId === first)).toBe(false);
+  });
+});
+
+describe("bridge-written projects.json", () => {
+  let stateDir: string;
+  let devicesFilePath: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "agentremote-projects-test-"));
+    devicesFilePath = join(stateDir, "devices.json");
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  test("starting the bridge with a state dir writes projects.json whose ids match the served projects", async () => {
+    const localBridge = createBridge({ devicesFilePath, authEnabled: false, now: () => FIXED_NOW });
+    try {
+      const response = await localBridge.fetch(new Request("http://bridge.local/v1/projects"));
+      const served = (await response.json()) as { projects: Project[] };
+
+      const written = readBridgeProjects(stateDir);
+      expect(written?.map((project) => project.id)).toEqual(served.projects.map((project) => project.id));
+    } finally {
+      localBridge.close();
+    }
+  });
+
+  test("readBridgeProjects returns undefined when projects.json does not exist", () => {
+    expect(readBridgeProjects(stateDir)).toBeUndefined();
+  });
+
+  test("readBridgeProjects throws, naming the file path, on corrupt JSON", () => {
+    const projectsFilePath = join(stateDir, "projects.json");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(projectsFilePath, "not json");
+
+    expect(() => readBridgeProjects(stateDir)).toThrow(projectsFilePath);
+  });
+
+  test("readBridgeProjects throws on a well-formed JSON value that is not an array of {id, name, path}", () => {
+    const projectsFilePath = join(stateDir, "projects.json");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(projectsFilePath, JSON.stringify([{ id: "prj_demo" }]));
+
+    expect(() => readBridgeProjects(stateDir)).toThrow(projectsFilePath);
+  });
+});
+
+describe("legacyOperatorEnvError", () => {
+  test("returns undefined when none of the legacy operator env vars are set", () => {
+    expect(legacyOperatorEnvError({})).toBeUndefined();
+  });
+
+  test("AGENTREMOTE_PAIR names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_PAIR: "" });
+    expect(message).toContain("AGENTREMOTE_PAIR");
+    expect(message).toContain("bun run bridge pair");
+  });
+
+  test("AGENTREMOTE_REVOKE names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_REVOKE: "dev_x" });
+    expect(message).toContain("AGENTREMOTE_REVOKE");
+    expect(message).toContain("bun run bridge revoke <deviceId>");
+  });
+
+  test("AGENTREMOTE_LIST_DEVICES names the var and its replacement command", () => {
+    const message = legacyOperatorEnvError({ AGENTREMOTE_LIST_DEVICES: "1" });
+    expect(message).toContain("AGENTREMOTE_LIST_DEVICES");
+    expect(message).toContain("bun run bridge devices");
   });
 });

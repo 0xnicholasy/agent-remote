@@ -86,16 +86,17 @@ Slice 2 status (2026-09-20): duplicate commands, expired decisions, unauthorized
 Dependencies: M1 delivery decision and M3 control guarantees.
 
 - [ ] Build onboarding, Mac pairing, project authorization, and a Mac control surface.
+  - 2026-09-25 (branch `feat/bridge-admin-cli`): the operator env-var one-shots (`AGENTREMOTE_PAIR`/`AGENTREMOTE_REVOKE`/`AGENTREMOTE_LIST_DEVICES`) are replaced by a CLI (`bun run bridge pair|devices|revoke|projects list|allow|deny`, bridge/src/cli.ts) and `docs/onboarding.md` walks install through pairing. Watch-side onboarding screens (guided pairing UI, project picker) remain.
 - [x] 2026-09-25 (branch `feat/watch-action-outcomes`): every approve, deny or answer ends in one visible outcome on the Watch (`ActionOutcome`): sending, acknowledged, no longer valid (`interaction_not_pending`, stale 409, `command_id_conflict`), expired (`decision_expired`), offline (URL transport errors), outcome unknown (`command_indeterminate`, previously shown as "no longer valid"), or failed. Offline keeps the card and a repeat of the same choice reuses its `commandId`. Simulator and unit tests only; offline behaviour on a physical Watch is part of the M5 device scenarios.
 - [x] 2026-09-25 (branch `fix/watch-outcome-followups`, PR #18 backlog C3-06 and C3-07): a success status with an unreadable command reply is `commandResponseUnreadable` and reads "Reply unreadable. Tap again to confirm." instead of "Not sent"; the card stays and the retry reuses the command id. `cancel()` now keeps the command id and body timestamp of a cancel whose outcome was lost, so tapping Cancel again replays the bridge's recorded outcome instead of sending a second cancel.
-- [ ] Provide sufficient exact context for a risky or long action, or direct the user to review it at the desk. A spoken summary alone is not authorization context.
+- [x] Provide sufficient exact context for a risky or long action, or direct the user to review it at the desk. A spoken summary alone is not authorization context.
   Plan (2026-09-25, branch `feat/watch-approval-context`):
   1. [x] Schema + TS + Swift bindings: optional `titleFidelity` (`exact` | `truncated` | `summary`) and `fullLength` on `approval.requested`; shared `requiresDeskReview` (anything but `exact` is desk-only). Same JSON vector tested on both sides.
   2. [x] Claude provider: `title` is always the exact action (Bash command, file path, or tool name + input) up to 200 chars; the SDK's own title moves to `spokenSummary`; set fidelity and `fullLength`.
   3. [x] Mock provider: `exact` on normal actions, plus one scripted long action for a desk-only card.
   4. [x] Bridge: interaction record carries `deskOnly`; `approval.accept` on a desk-only approval returns 403 `review_at_desk`; reject still works.
   5. [x] Watch: desk-only card shows Deny only and "Review at the Mac before allowing"; `approve()` refuses desk-only; `review_at_desk` maps to "Not allowed".
-  6. [ ] Docs, tests (bun + XCTest), simulator screenshot of a desk-only card. (docs and unit tests done; simulator screenshot left to the parent session, which owns the UI test run.)
+  6. [x] Docs, tests (bun + XCTest), simulator screenshot of a desk-only card. (desk-only simulator screenshot captured 2026-09-25 before PR #20 merged.)
 - [ ] Finish the glanceable conversation/status experience, reviewed dictation, foreground speech, and prominent cancel behavior.
   - [x] 2026-09-25 (branch `feat/watch-reviewed-dictation-cancel`): dictated text is shown in full with its destination ("New prompt" or "Answer to: <question>") before Send; the conversation page shows a confirmed "Stop turn" button while a turn is thinking, running or waiting. Simulator only; dictation itself still needs physical hardware (M1).
 

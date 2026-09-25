@@ -13,6 +13,7 @@
     "test": "bun test",
     "typecheck": "bun run --filter '*' typecheck",
     "check": "bun run typecheck && bun test",
-    "dev": "bun run --cwd bridge dev"
+    "dev": "bun run --cwd bridge dev",
+    "bridge": "bun run --cwd bridge cli"
   }
 }
