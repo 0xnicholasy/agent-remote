@@ -50,6 +50,11 @@ enum ActionOutcome: Equatable {
     /// The bridge's device policy does not allow this Watch that action or project; retrying
     /// the same command will be refused again.
     case notAllowed
+    /// The desk-only gate (M4) refused this approval: the exact action was never shown to this
+    /// Watch, so it cannot be allowed here. Kept distinct from `.notAllowed` so the message
+    /// stays actionable ("review at the Mac") whether the refusal was caught locally in
+    /// `approve()` (a stale-card race) or returned by the bridge as `review_at_desk`.
+    case reviewAtDesk
 
     var label: String {
         switch self {
@@ -64,6 +69,7 @@ enum ActionOutcome: Equatable {
         case .rateLimited: "Bridge is busy. Tap again in a moment."
         case .authRequired: "Not sent: this Watch needs to be paired again."
         case .notAllowed: "Not allowed from this Watch."
+        case .reviewAtDesk: "Review at the Mac before allowing."
         }
     }
 
@@ -75,6 +81,7 @@ enum ActionOutcome: Equatable {
         case .indeterminate: "Outcome unknown; check at the desk"
         case .authRequired: "Not authorized: pair this Watch again"
         case .notAllowed: "This Watch is not allowed to do that"
+        case .reviewAtDesk: "This approval must be reviewed at the Mac before it can be allowed"
         default: nil
         }
     }
@@ -91,6 +98,10 @@ enum ActionOutcome: Equatable {
         case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
         // Static device policy: the same command will be refused again until re-enrolled.
         case BridgeError.actionNotAllowed, BridgeError.projectNotAllowed: return .notAllowed
+        // Desk-only gate (M4): retrying approve() for this approval is refused again every time.
+        // Its own case (not .notAllowed) so the Watch keeps the actionable "review at the Mac"
+        // message instead of the generic device-policy refusal text.
+        case BridgeError.reviewAtDesk: return .reviewAtDesk
         case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
         default: return .failed
         }
@@ -598,6 +609,18 @@ final class SessionStore {
 
     func approve() async {
         guard let request = pendingApproval else { return }
+        // Desk-only gate (M4): the exact action was not shown, so nothing is sent. The bridge
+        // would refuse this with `review_at_desk` anyway; refusing here as well means a Watch
+        // that somehow rendered an Allow button for this card (it should not, per
+        // `ChoiceCardView`) still cannot use it to authorize an action it never displayed.
+        // Surface the refusal through the same outcome slot decide() uses, so a stale-card race
+        // (pendingApproval flips to a desk-only card between the button being shown and this
+        // call running) still leaves the user something to see instead of a silent no-op. The
+        // card itself stays -- nothing was sent, so nothing was decided.
+        guard !request.requiresDeskReview else {
+            setOutcome(.reviewAtDesk, for: .approval(request.binding.approvalId))
+            return
+        }
         await decide(
             .approvalAccept(ApprovalAcceptPayload(binding: request.binding)),
             sessionId: request.binding.sessionId,
@@ -688,6 +711,15 @@ final class SessionStore {
                 )
                 setOutcome(outcome, for: card)
                 if outcome == .failed { report(error) }
+            case .reviewAtDesk:
+                // The bridge refused this as desk-only, same as the local guard in approve()
+                // (~line 620): the approval is still pending there, so the card -- and the Deny
+                // button -- must stay. Only the outcome slot changes.
+                guard isCurrent(card) else {
+                    if actionOutcomeCardId == card.id { clearOutcome() }
+                    return
+                }
+                setOutcome(.reviewAtDesk, for: card)
             case let terminal:
                 // A newer card can have replaced this one while the send was in flight (same
                 // guard the offline/failed/rateLimited branch above already applies). Bail out

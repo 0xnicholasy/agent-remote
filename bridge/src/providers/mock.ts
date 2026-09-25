@@ -17,6 +17,10 @@ import {
 
 export { ApprovalBindingMismatchError, InteractionPendingError, type ProviderHost } from "@agentremote/protocol";
 
+/** Mirrors `ClaudeProvider`'s `ACTION_TEXT_MAX_LENGTH`. Not exported from the protocol package
+ * (it is a provider display choice, not a wire contract), so kept in sync here by hand. */
+const ACTION_TEXT_MAX_LENGTH = 200;
+
 interface PendingApproval {
   binding: ApprovalBinding;
   turnId: string;
@@ -130,13 +134,21 @@ export class MockProvider implements AgentProvider {
     this.host.emit(sessionId, "command.output", { executionId, stream: "stdout", chunk: "4 pass, 0 fail\n" });
     this.host.emit(sessionId, "command.completed", { executionId, exitCode: 0, durationMs: 120 });
 
-    const action = "git push origin main";
+    // Scripted trigger for a desk-only card: a prompt containing "desk" (case-insensitive)
+    // scripts a long action whose exact text does not fit the display limit, so the simulator
+    // can exercise the Watch's desk-only path without a real long-running agent action.
+    const wantsDeskOnlyCard = /desk/i.test(text);
+    const action = wantsDeskOnlyCard
+      ? `git push origin main --force-with-lease --push-option=ci.skip --push-option=deploy.notify=${"a".repeat(240)}`
+      : "git push origin main";
+    const truncated = action.length > ACTION_TEXT_MAX_LENGTH;
+    const title = wantsDeskOnlyCard ? action.slice(0, ACTION_TEXT_MAX_LENGTH - 1) + "…" : action;
     const binding: ApprovalBinding = {
       approvalId: `apr_${randomUUID()}`,
       sessionId,
       turnId,
       toolCallId: `tc_${++this.counter}`,
-      actionDigest: digest(action),
+      actionDigest: digest(title),
       expiresAt: new Date(this.now().getTime() + this.ttlMs).toISOString(),
     };
     const expiryTimer = this.armApprovalExpiry(sessionId, binding.approvalId);
@@ -144,9 +156,15 @@ export class MockProvider implements AgentProvider {
     this.host.emit(sessionId, "approval.requested", {
       binding,
       kind: "command",
-      title: `Run ${action}`,
-      detail: "Pushes the committed work to the shared branch.",
-      spokenSummary: "Claude wants to push to origin main. Allow or deny?",
+      title,
+      detail: wantsDeskOnlyCard
+        ? "Long scripted action for the desk-only card (mock provider)."
+        : "Pushes the committed work to the shared branch.",
+      spokenSummary: wantsDeskOnlyCard
+        ? "Claude wants to run a long command. Review at the Mac."
+        : "Claude wants to push to origin main. Allow or deny?",
+      titleFidelity: wantsDeskOnlyCard ? "truncated" : "exact",
+      ...(truncated ? { fullLength: action.length } : {}),
     });
   }
 

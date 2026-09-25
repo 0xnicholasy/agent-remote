@@ -62,15 +62,28 @@ final class CoreScreensUITests: XCTestCase {
 
         button("Deny").tap()
         XCTAssertTrue(button("Allow").waitForNonExistence(timeout: 15))
-        // The mock provider's approval title is always "Run git push origin main", so the
+        // The mock provider's approval title is always "git push origin main", so the
         // resolution line SessionStore.resolutionLine renders is deterministic regardless of
         // the prompt text sent above.
         XCTAssertTrue(
-            app.staticTexts.matching(NSPredicate(format: "label == %@", "Denied: Run git push origin main")).firstMatch
+            app.staticTexts.matching(NSPredicate(format: "label == %@", "Denied: git push origin main")).firstMatch
                 .waitForExistence(timeout: 5),
             "expected the transcript to show the deny resolution line"
         )
         shot("3-after-deny")
+
+        // A prompt containing "desk" makes the mock provider script a long, truncated action,
+        // which is desk-only: the card must offer Deny and the review line, never Allow.
+        try await sendPrompt("desk: run the long action", sessionId: sessionId)
+        XCTAssertTrue(
+            app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Review at the Mac before allowing")).firstMatch
+                .waitForExistence(timeout: 15),
+            "expected the desk-only review line"
+        )
+        XCTAssertFalse(button("Allow").exists, "a desk-only card must not offer Allow")
+        shot("3b-desk-only")
+        button("Deny").tap()
+        XCTAssertTrue(button("Deny").waitForNonExistence(timeout: 15))
 
         app.swipeUp()
         XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render")

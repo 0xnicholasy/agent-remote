@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentEvent, ApprovalBinding, ApprovalDecision, QuestionOutcome } from "@agentremote/protocol";
+import type {
+  AgentEvent,
+  ApprovalBinding,
+  ApprovalDecision,
+  QuestionOutcome,
+  TitleFidelity,
+} from "@agentremote/protocol";
 
 import { InteractionRegistry } from "./interactions";
 
@@ -19,14 +25,23 @@ function binding(overrides: Partial<ApprovalBinding> = {}): ApprovalBinding {
   };
 }
 
-function approvalRequested(sessionId: string, overrides: Partial<ApprovalBinding> = {}): AgentEvent {
+function approvalRequested(
+  sessionId: string,
+  overrides: Partial<ApprovalBinding> = {},
+  titleFidelity?: TitleFidelity,
+): AgentEvent {
   return {
     eventId: ++eventId,
     sessionId,
     provider: "mock",
     type: "approval.requested",
     timestamp: NOW.toISOString(),
-    payload: { binding: binding({ sessionId, ...overrides }), kind: "command", title: "Run it" },
+    payload: {
+      binding: binding({ sessionId, ...overrides }),
+      kind: "command",
+      title: "Run it",
+      ...(titleFidelity === undefined ? {} : { titleFidelity }),
+    },
   };
 }
 
@@ -95,6 +110,7 @@ describe("InteractionRegistry", () => {
       sessionId: "ses_a",
       state: "resolved",
       expiresAt: binding().expiresAt,
+      deskOnly: true,
     });
   });
 
@@ -192,5 +208,41 @@ describe("InteractionRegistry", () => {
     const expiresAt = new Date(NOW.getTime() + 30_000).toISOString();
     registry.observe(questionRequested("ses_a", "qst_1", expiresAt));
     expect(registry.get("qst_1")?.expiresAt).toBe(expiresAt);
+  });
+
+  test("deskOnly is true for truncated or absent titleFidelity, false for exact", () => {
+    const registry = new InteractionRegistry();
+
+    registry.observe(approvalRequested("ses_a", { approvalId: "apr_absent" }));
+    expect(registry.get("apr_absent")?.deskOnly).toBe(true);
+
+    registry.observe(approvalRequested("ses_a", { approvalId: "apr_truncated" }, "truncated"));
+    expect(registry.get("apr_truncated")?.deskOnly).toBe(true);
+
+    registry.observe(approvalRequested("ses_a", { approvalId: "apr_summary" }, "summary"));
+    expect(registry.get("apr_summary")?.deskOnly).toBe(true);
+
+    registry.observe(approvalRequested("ses_a", { approvalId: "apr_exact" }, "exact"));
+    expect(registry.get("apr_exact")?.deskOnly).toBe(false);
+  });
+
+  test("deskOnly survives a rebuild from the event log", () => {
+    const events: AgentEvent[] = [
+      approvalRequested("ses_a", { approvalId: "apr_exact" }, "exact"),
+      approvalRequested("ses_a", { approvalId: "apr_desk" }, "truncated"),
+    ];
+
+    const registry = new InteractionRegistry();
+    registry.rebuild(events);
+
+    expect(registry.get("apr_exact")?.deskOnly).toBe(false);
+    expect(registry.get("apr_desk")?.deskOnly).toBe(true);
+
+    // A fresh registry rebuilt from the same log, mirroring a bridge restart, must land on the
+    // same derived values rather than something stored independently of the log.
+    const restarted = new InteractionRegistry();
+    restarted.rebuild(events);
+    expect(restarted.get("apr_exact")?.deskOnly).toBe(false);
+    expect(restarted.get("apr_desk")?.deskOnly).toBe(true);
   });
 });

@@ -258,6 +258,93 @@ describe("bridge HTTP surface", () => {
     expect(response.status).toBe(409);
   });
 
+  test("approval.accept on a desk-only approval is refused with 403 and the provider is never called", async () => {
+    // "desk" in the prompt is MockProvider's scripted trigger for a desk-only card (see mock.ts).
+    await post({
+      commandId: "d0000000-0000-4000-8000-000000000001",
+      sessionId: bridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "review this at the desk" },
+    });
+    const initialEvents = await eventsAfter(0);
+    const requested = approvalRequested(initialEvents);
+    expect(requested.titleFidelity).toBe("truncated");
+    const binding = pendingBinding(initialEvents);
+    const before = initialEvents.length;
+
+    const response = await post({
+      commandId: "d0000000-0000-4000-8000-000000000002",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding },
+    });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "review_at_desk", interactionId: binding.approvalId });
+    // No approval.resolved and no journal side effect: the provider was never invoked.
+    const after = await eventsAfter(before);
+    expect(after.some((event) => event.type === "approval.resolved")).toBe(false);
+  });
+
+  test("a desk-only approval past its expiresAt is refused with 410, not 403 review_at_desk", async () => {
+    // "desk" in the prompt is MockProvider's scripted trigger for a desk-only card (see mock.ts).
+    await post({
+      commandId: "d0000000-0000-4000-8000-000000000005",
+      sessionId: bridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "review this at the desk" },
+    });
+    const initialEvents = await eventsAfter(0);
+    const requested = approvalRequested(initialEvents);
+    expect(requested.titleFidelity).toBe("truncated");
+    const binding = pendingBinding(initialEvents);
+    const expired = { ...binding, expiresAt: new Date(Date.now() - 1000).toISOString() };
+
+    const response = await post({
+      commandId: "d0000000-0000-4000-8000-000000000006",
+      sessionId: bridge.session.id,
+      type: "approval.accept",
+      timestamp: new Date().toISOString(),
+      payload: { binding: expired },
+    });
+
+    // Expiry is checked before the desk-only gate, so a past-deadline desk-only approval reads
+    // as expired, not as a desk-only refusal.
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "decision_expired" });
+  });
+
+  test("approval.reject still works on a desk-only approval", async () => {
+    await post({
+      commandId: "d0000000-0000-4000-8000-000000000003",
+      sessionId: bridge.session.id,
+      type: "prompt.send",
+      timestamp: new Date().toISOString(),
+      payload: { text: "review this at the desk" },
+    });
+    const binding = pendingBinding(await eventsAfter(0));
+    const before = (await eventsAfter(0)).length;
+
+    const response = await post({
+      commandId: "d0000000-0000-4000-8000-000000000004",
+      sessionId: bridge.session.id,
+      type: "approval.reject",
+      timestamp: new Date().toISOString(),
+      payload: { binding },
+    });
+
+    expect(response.status).toBe(200);
+    const emitted = await eventsAfter(before);
+    const resolved = emitted.find((event) => event.type === "approval.resolved");
+    if (resolved === undefined || resolved.type !== "approval.resolved") {
+      throw new Error("no approval.resolved event was emitted");
+    }
+    expect(resolved.payload.decision).toBe("rejected");
+  });
+
   test("prompt.send while an approval is pending is refused with 409 and emits no new turn.started", async () => {
     await post(promptCommand("cccccccc-cccc-4ccc-8ccc-cccccccccccc"));
     const before = await eventsAfter(0);

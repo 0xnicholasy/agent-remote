@@ -172,3 +172,72 @@ private let approvalAcceptJSON = """
     }
     #expect(withoutOutcomePayload.outcome == nil)
 }
+
+// MARK: - titleFidelity
+
+/// Same fixed JSON vector as the TypeScript package's index.test.ts (`titleFidelityVector`), with
+/// `titleFidelity` substituted per case. Kept identical on both sides so a wire-format bug that
+/// only one side would tolerate cannot hide.
+private func titleFidelityJSON(_ fidelity: String?) -> String {
+    let fidelityLine = fidelity.map { ",\n    \"titleFidelity\": \"\($0)\"" } ?? ""
+    return """
+    {
+      "eventId": 46,
+      "sessionId": "ses_01",
+      "provider": "mock",
+      "type": "approval.requested",
+      "timestamp": "2026-09-14T10:19:00.000Z",
+      "payload": {
+        "binding": {
+          "approvalId": "apr_01",
+          "sessionId": "ses_01",
+          "turnId": "trn_01",
+          "toolCallId": "tc_01",
+          "actionDigest": "sha256:6f1c0b1e6b4f0a2d",
+          "expiresAt": "2026-09-14T10:20:00.000Z"
+        },
+        "kind": "command",
+        "title": "Run git push origin main"\(fidelityLine)
+      }
+    }
+    """
+}
+
+private func decodeApprovalRequest(_ fidelity: String?) throws -> ApprovalRequest {
+    let event = try JSONDecoder().decode(AgentEvent.self, from: Data(titleFidelityJSON(fidelity).utf8))
+    guard case .approvalRequested(let request) = event.payload else {
+        Issue.record("expected an approval.requested payload")
+        throw CocoaError(.coderReadCorrupt)
+    }
+    return request
+}
+
+@Test func requiresDeskReviewIsFailClosedWhenTitleFidelityIsAbsent() throws {
+    let request = try decodeApprovalRequest(nil)
+    #expect(request.titleFidelity == nil)
+    #expect(request.requiresDeskReview == true)
+}
+
+@Test func requiresDeskReviewIsFalseOnlyForExact() throws {
+    let request = try decodeApprovalRequest("exact")
+    #expect(request.titleFidelity == .exact)
+    #expect(request.requiresDeskReview == false)
+}
+
+@Test func requiresDeskReviewIsTrueForTruncated() throws {
+    let request = try decodeApprovalRequest("truncated")
+    #expect(request.titleFidelity == .truncated)
+    #expect(request.requiresDeskReview == true)
+}
+
+@Test func requiresDeskReviewIsTrueForSummary() throws {
+    let request = try decodeApprovalRequest("summary")
+    #expect(request.titleFidelity == .summary)
+    #expect(request.requiresDeskReview == true)
+}
+
+@Test func unknownTitleFidelityFallsBackToSummaryAndRequiresDeskReview() throws {
+    let request = try decodeApprovalRequest("bogus")
+    #expect(request.titleFidelity == .summary)
+    #expect(request.requiresDeskReview == true)
+}

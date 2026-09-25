@@ -72,6 +72,13 @@ export interface ApprovalBinding {
 
 export type ApprovalKind = "command" | "file.write" | "network" | "other";
 
+/**
+ * How closely `title` matches the exact action. "exact": the full action text, unmodified.
+ * "truncated": the exact action text cut to fit the display limit. "summary": not the exact
+ * action text. Absent is treated as desk-only, the same as "summary" (fail closed).
+ */
+export type TitleFidelity = "exact" | "truncated" | "summary";
+
 export interface ApprovalRequest {
   binding: ApprovalBinding;
   kind: ApprovalKind;
@@ -80,6 +87,19 @@ export interface ApprovalRequest {
   detail?: string;
   /** Short plain sentence the bridge composes for text-to-speech. */
   spokenSummary?: string;
+  /** How closely `title` matches the exact action. Absent means desk-only. */
+  titleFidelity?: TitleFidelity;
+  /** Length in characters of the untruncated action text, set alongside "truncated". */
+  fullLength?: number;
+}
+
+/**
+ * Whether the Watch must refuse Allow and direct the user to review the action at the desk
+ * instead. True whenever `titleFidelity` is anything but "exact", including when it is absent
+ * (fail closed): a spoken summary is not authorization context.
+ */
+export function requiresDeskReview(payload: Pick<ApprovalRequest, "titleFidelity">): boolean {
+  return payload.titleFidelity !== "exact";
 }
 
 /**

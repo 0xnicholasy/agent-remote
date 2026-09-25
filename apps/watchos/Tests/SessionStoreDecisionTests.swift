@@ -187,13 +187,54 @@ final class SessionStoreDecisionTests: XCTestCase {
                     "expiresAt": "2026-09-17T00:05:00.000Z"
                 },
                 "kind": "command",
-                "title": "Run git push origin main"
+                "title": "Run git push origin main",
+                "titleFidelity": "exact"
             }
         }
         """)
         store.apply(approvalRequested)
 
         XCTAssertNotNil(store.pendingApproval, "setup should leave a pending approval card")
+        return (store, client)
+    }
+
+    /// Builds a store already bound to "sess_1" with a pending, desk-only approval card (M4):
+    /// its `approval.requested` carries no `titleFidelity`, the fail-closed default.
+    private func makeStoreWithPendingDeskOnlyApproval(
+        defaults: UserDefaults? = nil
+    ) async throws -> (SessionStore, FakeBridgeClient) {
+        let client = FakeBridgeClient()
+        let defaults = defaults ?? freshDefaults()
+        let store = SessionStore(client: client, defaults: defaults)
+
+        let started = try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """)
+        store.apply(started)
+
+        let approvalRequested = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_1", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_1", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main --force-with-lease…"
+            }
+        }
+        """)
+        store.apply(approvalRequested)
+
+        XCTAssertNotNil(store.pendingApproval, "setup should leave a pending approval card")
+        XCTAssertEqual(store.pendingApproval?.requiresDeskReview, true, "setup should be desk-only")
         return (store, client)
     }
 
@@ -1010,7 +1051,8 @@ final class SessionStoreDecisionTests: XCTestCase {
                     "expiresAt": "2026-09-17T00:05:00.000Z"
                 },
                 "kind": "command",
-                "title": "Run git push origin main"
+                "title": "Run git push origin main",
+                "titleFidelity": "exact"
             }
         }
         """))
@@ -1483,6 +1525,116 @@ final class SessionStoreDecisionTests: XCTestCase {
             XCTAssertEqual(store.statusLine, ActionOutcome.notAllowed.statusText)
             XCTAssertEqual(store.statusKind, .requestInvalid)
         }
+    }
+
+    /// M4: approve() must refuse to send anything for a desk-only approval (no `titleFidelity`,
+    /// fail closed) -- the card was never shown the exact action, so there is nothing here to
+    /// authorize. The card stays, and no command reaches the client at all.
+    func testApproveSendsNothingForDeskOnlyApproval() async throws {
+        let (store, client) = try await makeStoreWithPendingDeskOnlyApproval()
+
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 0, "approve() must not send anything for a desk-only approval")
+        XCTAssertNotNil(store.pendingApproval, "the card must stay in place")
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+    }
+
+    /// R-001 regression: approve() must not silently no-op the desk-only guard -- it has to
+    /// surface a visible outcome on the current card, e.g. for a stale-card race where the
+    /// card the user tapped Allow on was replaced by a desk-only one before this call ran.
+    func testApproveSurfacesOutcomeForDeskOnlyGuard() async throws {
+        let (store, client) = try await makeStoreWithPendingDeskOnlyApproval()
+
+        await store.approve()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 0)
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .reviewAtDesk)
+    }
+
+    /// M4: reject() is unaffected by the desk-only gate -- declining an action the user cannot
+    /// verify is always safe, so it must still reach the bridge.
+    func testRejectStillSendsForDeskOnlyApproval() async throws {
+        let (store, client) = try await makeStoreWithPendingDeskOnlyApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+
+        await store.reject()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 1)
+        if case .approvalReject = calls[0].payload {} else {
+            XCTFail("expected an approval.reject command")
+        }
+        XCTAssertNil(store.pendingApproval)
+        XCTAssertEqual(store.actionOutcome, .acknowledged)
+    }
+
+    /// R-002 regression: the bridge's `review_at_desk` refusal (e.g. if a stale client somehow
+    /// did send approve() for a desk-only approval) gets its own outcome, not the generic
+    /// `.notAllowed`, so the Watch can still say "review at the Mac" -- while remaining terminal
+    /// and not retryable, same as a static policy refusal.
+    func testReviewAtDeskClassifiesDistinctlyFromNotAllowed() async throws {
+        XCTAssertEqual(ActionOutcome.classify(BridgeError.reviewAtDesk), .reviewAtDesk)
+        XCTAssertNotEqual(ActionOutcome.reviewAtDesk, .notAllowed)
+        XCTAssertNotNil(ActionOutcome.reviewAtDesk.statusText, "status text exists for callers that do clear the card on it")
+    }
+
+    /// R-005 regression: unlike a static policy refusal, the bridge's `review_at_desk` for a
+    /// command that did reach it (decide()'s catch path) leaves the approval pending there, not
+    /// decided -- so the card, and the Deny button on it, must stay, exactly like the local
+    /// desk-only guard in approve().
+    func testBridgeReviewAtDeskKeepsCardAndDenyAvailable() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.reviewAtDesk))
+
+        await store.approve()
+
+        XCTAssertNotNil(store.pendingApproval, "the approval is still pending on the bridge; Deny must stay available")
+        XCTAssertEqual(store.actionOutcome, .reviewAtDesk)
+        XCTAssertEqual(store.outcome(forCard: "appr_1"), .reviewAtDesk)
+    }
+
+    /// R-007 regression: decide()'s `.reviewAtDesk` case must apply the same stale-card guard
+    /// as the offline/failed/rateLimited branch above it. If a newer `approval.requested`
+    /// replaces the pending card while a stale send is still resolving to review_at_desk, the
+    /// stale response must not stamp its outcome onto the new card's slot (wrong id) nor leave
+    /// a dangling outcome for the id that is gone.
+    func testStaleCardReviewAtDeskDoesNotSetOutcomeOnNewerCard() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.reviewAtDesk))
+        await client.gateSendCall(1)
+
+        let approveTask = Task { await store.approve() }
+        // Give approve() a chance to reach the gated send before the newer card arrives.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let newerApprovalRequested = try decodeEvent("""
+        {
+            "eventId": 3, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "appr_2", "sessionId": "sess_1", "turnId": "turn_1",
+                    "toolCallId": "tool_2", "actionDigest": "digest",
+                    "expiresAt": "2026-09-17T00:05:00.000Z"
+                },
+                "kind": "command",
+                "title": "Run git push origin main --force",
+                "titleFidelity": "exact"
+            }
+        }
+        """)
+        store.apply(newerApprovalRequested)
+
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_2", "the newer card must survive the stale review_at_desk response")
+        XCTAssertNil(store.outcome(forCard: "appr_1"), "the stale card is gone; nothing should keep its outcome set")
+        XCTAssertNil(store.outcome(forCard: "appr_2"), "the newer card's outcome slot must not be stomped by the stale response")
     }
 
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a

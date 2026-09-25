@@ -172,6 +172,21 @@ public struct CommandCompletedPayload: Codable, Hashable, Sendable {
     public var durationMs: Int?
 }
 
+/// How closely `title` matches the exact action. `.exact`: the full action text, unmodified.
+/// `.truncated`: the exact action text cut to fit the display limit. `.summary`: not the exact
+/// action text. An unrecognized wire value decodes as `.summary` (fail closed, same as absent).
+public enum TitleFidelity: String, Codable, Sendable {
+    case exact
+    case truncated
+    case summary
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        self = TitleFidelity(rawValue: raw) ?? .summary
+    }
+}
+
 public struct ApprovalRequest: Codable, Hashable, Sendable {
     public var binding: ApprovalBinding
     public var kind: ApprovalKind
@@ -179,6 +194,17 @@ public struct ApprovalRequest: Codable, Hashable, Sendable {
     public var detail: String?
     /// Short plain sentence the bridge composes for text-to-speech.
     public var spokenSummary: String?
+    /// How closely `title` matches the exact action. Nil means desk-only.
+    public var titleFidelity: TitleFidelity?
+    /// Length in characters of the untruncated action text, set alongside `.truncated`.
+    public var fullLength: Int?
+
+    /// Whether the Watch must refuse Allow and direct the user to review the action at the desk
+    /// instead. True whenever `titleFidelity` is anything but `.exact`, including nil (fail
+    /// closed): a spoken summary is not authorization context.
+    public var requiresDeskReview: Bool {
+        titleFidelity != .exact
+    }
 }
 
 public struct ApprovalResolvedPayload: Codable, Hashable, Sendable {

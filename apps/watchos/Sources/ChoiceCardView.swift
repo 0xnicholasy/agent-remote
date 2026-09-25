@@ -31,8 +31,18 @@ struct ChoiceCardView: View {
             }
             if approval != nil {
                 Button("Deny", role: .destructive) { Task { await store.reject() } }
-                Button("Allow") { Task { await store.approve() } }
-                    .tint(.green)
+                // A desk-only approval (M4): the exact action was not shown, so Allow is omitted
+                // entirely rather than shown disabled — there is nothing on this card the user
+                // could be authorizing.
+                if approval?.requiresDeskReview == false {
+                    Button("Allow") { Task { await store.approve() } }
+                        .tint(.green)
+                }
+            }
+            if let approval, approval.requiresDeskReview {
+                Text(deskReviewCaption(for: approval))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
             }
             if let question {
                 ForEach(question.options, id: \.id) { option in
@@ -62,5 +72,13 @@ struct ChoiceCardView: View {
     private var prompt: String {
         if let approval { return approval.title }
         return question?.text ?? ""
+    }
+
+    /// "Review at the Mac before allowing", with a "(N chars, M shown)" suffix when the request
+    /// carries `fullLength`, so a truncated card also says how much of the action is hidden.
+    private func deskReviewCaption(for approval: ApprovalRequest) -> String {
+        let base = "Review at the Mac before allowing"
+        guard let fullLength = approval.fullLength else { return base }
+        return "\(base) (\(fullLength) chars, \(approval.title.count) shown)"
     }
 }

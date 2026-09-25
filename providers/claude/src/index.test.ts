@@ -1280,6 +1280,58 @@ describe("ClaudeProvider", () => {
     expect(requested?.payload).toMatchObject({ title: "rm -rf /tmp/x" });
   });
 
+  test("the SDK's own title becomes spokenSummary, never title, and fidelity is exact", async () => {
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: "ls" }, callOpts({ title: "Run ls" }));
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run ls");
+    await delay();
+
+    const requested = events.find((event) => event.type === "approval.requested");
+    expect(requested?.payload).toMatchObject({
+      title: "ls",
+      spokenSummary: "Run ls",
+      titleFidelity: "exact",
+    });
+  });
+
+  test("a 300-char command is truncated in title, with fullLength set and fidelity truncated", async () => {
+    const longCommand = "echo ".repeat(60); // 300 chars, over ACTION_TEXT_MAX_LENGTH (200)
+    expect(longCommand.length).toBe(300);
+    const queryFn: QueryFn = ((args) => {
+      async function* gen(): AsyncGenerator<SDKMessage, void> {
+        await readPrompt(args.prompt as AsyncIterable<SDKUserMessage>);
+        await args.options!.canUseTool!("Bash", { command: longCommand }, callOpts());
+        yield fakeResult("done");
+      }
+      return asQuery(gen()).query;
+    }) as QueryFn;
+
+    const { host, events } = createHost();
+    const provider = new ClaudeProvider(host, { projects: [project("p1", "/tmp/p1")], query: queryFn });
+    const session = await provider.createSession("p1");
+
+    await provider.sendPrompt(session.id, "run it");
+    await delay();
+
+    const requested = events.find((event) => event.type === "approval.requested");
+    expect(requested?.payload).toMatchObject({
+      titleFidelity: "truncated",
+      fullLength: 300,
+    });
+    expect((requested?.payload as { title: string }).title.length).toBe(200);
+  });
+
   test("a generator that ends mid-turn without a result is treated as an abnormal teardown (R-031)", async () => {
     const queryFn: QueryFn = ((args) => {
       async function* gen(): AsyncGenerator<SDKMessage, void> {

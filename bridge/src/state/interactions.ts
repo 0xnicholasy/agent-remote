@@ -1,4 +1,4 @@
-import type { AgentEvent } from "@agentremote/protocol";
+import { requiresDeskReview, type AgentEvent } from "@agentremote/protocol";
 
 /** Hard ceiling on tracked interaction records, oldest terminal record dropped first. A pending
  * record is never evicted (an interaction still awaiting a decision must stay resolvable), the
@@ -32,6 +32,12 @@ export interface InteractionRecord {
   /** Set for an approval from its binding's `expiresAt`, and for a question that carries a TTL
    * in `question.requested.payload.expiresAt`. Absent when the request carried no deadline. */
   expiresAt?: string;
+  /** True for an approval whose `approval.requested` requires desk review (anything but an
+   * exact `titleFidelity`, per `requiresDeskReview`, fail closed). Derived from the logged event
+   * rather than stored independently, so it is restored correctly by `rebuild`. Absent for a
+   * question, and for an approval seen only via a later event (no `approval.requested` observed
+   * for it), since desk-only-ness can only be read off the request itself. */
+  deskOnly?: boolean;
 }
 
 /**
@@ -73,6 +79,7 @@ export class InteractionRegistry {
           sessionId: event.sessionId,
           state: "pending",
           expiresAt,
+          deskOnly: requiresDeskReview(event.payload),
         });
         return;
       }
