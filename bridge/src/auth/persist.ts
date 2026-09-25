@@ -18,6 +18,13 @@ const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 export class FileLockTimeoutError extends Error {}
 
 /**
+ * Thrown when `fn` succeeded (the write persisted) but the lock file could not be removed
+ * afterward. Distinct from `FileLockTimeoutError` so callers know the change already landed and
+ * only the lock's cleanup needs manual attention.
+ */
+export class FileLockReleaseError extends Error {}
+
+/**
  * Writes `data` to `filePath` atomically (temp file then rename), with the file left at mode
  * 0600 and its parent directory created 0700 if missing. Shared by every piece of persisted
  * auth state (`DeviceRegistry`, `PairingCodeStore`) so they agree on the same on-disk safety
@@ -84,19 +91,40 @@ export function withFileLock<T>(lockPath: string, fn: () => T, timeoutMs: number
     }
     Atomics.wait(sleepCell, 0, 0, Math.max(1, Math.min(LOCK_RETRY_INTERVAL_MS, deadline - Date.now())));
   }
+  let result: T;
   try {
-    return fn();
-  } finally {
+    result = fn();
+  } catch (fnError) {
     try {
       unlinkSync(lockPath);
-    } catch (error) {
-      // ENOENT: someone removed our lock by hand; nothing left to release. Anything else means a
-      // lock we cannot remove, which would wedge every later writer, so it must surface.
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
+    } catch (releaseError) {
+      // fn already failed; never let a release failure replace or mask that error. ENOENT means
+      // someone removed our lock by hand, which is fine either way.
+      if ((releaseError as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          `Agent Remote bridge: failed to remove lock ${lockPath} after a failed write: ` +
+            `${(releaseError as Error).message}`,
+        );
       }
     }
+    throw fnError;
   }
+  try {
+    unlinkSync(lockPath);
+  } catch (error) {
+    // ENOENT: someone removed our lock by hand; nothing left to release. Anything else means a
+    // lock we cannot remove, which would wedge every later writer, so it must surface -- but fn's
+    // write already landed, so say that explicitly instead of just rethrowing the raw unlink error.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new FileLockReleaseError(
+        `${lockPath} could not be removed after the write completed (the change DID persist): ` +
+          `${(error as Error).message}. Remove the lock by hand before the next write, or restart ` +
+          "the bridge.",
+        { cause: error },
+      );
+    }
+  }
+  return result;
 }
 
 function readLockPid(lockPath: string): number | null {

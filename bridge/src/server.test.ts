@@ -28,7 +28,7 @@ import {
   type Bridge,
   type CreateBridgeOptions,
 } from "./server";
-import { readBridgeProjects } from "./projects";
+import { readBridgeProjects, resolveProjectIds } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { deriveDeviceKey, pairingProof } from "./auth/pairing";
 import { signRequest } from "./auth/verify";
@@ -1206,6 +1206,11 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
     } finally {
       restoreEnv();
     }
+  });
+
+  test("a relative-path entry throws, naming the bad entry", () => {
+    const env = { AGENTREMOTE_PROVIDER: "claude", AGENTREMOTE_PROJECT_DIRS: "/repos/one,relative/two" };
+    expect(() => resolveProjectIds(env, process.cwd())).toThrow("relative/two");
   });
 });
 

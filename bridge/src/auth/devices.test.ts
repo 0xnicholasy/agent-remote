@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./devices";
+import { FileLockReleaseError, withFileLock } from "./persist";
 
 const dirs: string[] = [];
 
@@ -551,6 +552,65 @@ describe("DeviceRegistry", () => {
     expect(readFileSync(filePath, "utf8")).not.toBe(before);
     expect(existsSync(lockPath)).toBe(true);
   });
+
+  // F-41: when fn's write already succeeded, a release failure must say so explicitly (not throw
+  // the raw unlink error), so the caller does not read a persisted write as a failed one. Root can
+  // write through a 0o500 directory, so this regression only reproduces as a non-root user.
+  test.skipIf(process.getuid?.() === 0)(
+    "a release failure after a successful write throws FileLockReleaseError and preserves the write",
+    () => {
+      const dir = tempDir();
+      const lockPath = join(dir, "test.lock");
+      const markerPath = join(dir, "marker");
+      let thrown: unknown;
+      try {
+        withFileLock(
+          lockPath,
+          () => {
+            writeFileSync(markerPath, "ok", "utf8");
+            chmodSync(dir, 0o500);
+          },
+          0,
+        );
+      } catch (error) {
+        thrown = error;
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+      expect(thrown).toBeInstanceOf(FileLockReleaseError);
+      expect((thrown as Error).message).toContain(lockPath);
+      expect((thrown as Error).message).toContain("persist");
+      expect(existsSync(markerPath)).toBe(true);
+      expect(existsSync(lockPath)).toBe(true);
+    },
+  );
+
+  // F-41: when fn itself throws, that error must win over any release failure, not get replaced
+  // by the unlink error.
+  test.skipIf(process.getuid?.() === 0)(
+    "a release failure after fn throws still propagates fn's own error",
+    () => {
+      const dir = tempDir();
+      const lockPath = join(dir, "test.lock");
+      let thrown: unknown;
+      try {
+        withFileLock(
+          lockPath,
+          () => {
+            chmodSync(dir, 0o500);
+            throw new Error("boom");
+          },
+          0,
+        );
+      } catch (error) {
+        thrown = error;
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+      expect((thrown as Error).message).toBe("boom");
+      expect(existsSync(lockPath)).toBe(true);
+    },
+  );
 
   // C1-02: registry A has already loaded devices.json when registry B (standing in for the CLI)
   // revokes; B's write is injected at the moment A goes to take devices.json.lock for its touch
