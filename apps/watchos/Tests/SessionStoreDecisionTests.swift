@@ -518,6 +518,101 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
     }
 
+    /// R-001: a double-tap while the first cancel is still in flight must not send a second,
+    /// distinct cancel command -- cancel() is guarded by the same `isSending` flag as decide().
+    func testConcurrentCancelSendsOnlyOneCommand() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let firstCancel = Task { await store.cancel() }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(store.isSending)
+
+        // A second tap while the first is still in flight must be a no-op.
+        await store.cancel()
+
+        await client.openSendGate()
+        await firstCancel.value
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 1, "a concurrent cancel must not send a second, distinct command")
+        XCTAssertFalse(store.isSending)
+    }
+
+    /// R-002: cancel()'s response can land after reconnect() has already bumped pollGeneration
+    /// and discarded the binding it was cancelling. The stale generation's outcome must not
+    /// write status state or leave a retryable command id behind for a session the new
+    /// generation knows nothing about (mirrors the guard in decide()/createSession()).
+    func testCancelDoesNotWriteStateAfterConcurrentReconnect() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(URLError(.timedOut)))
+        await client.gateSendCall(1)
+
+        let cancelTask = Task { await store.cancel() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        let statusLineAfterReconnect = store.statusLine
+        let statusKindAfterReconnect = store.statusKind
+
+        await client.openSendGate()
+        await cancelTask.value
+
+        XCTAssertEqual(store.statusLine, statusLineAfterReconnect, "a stale generation's cancel failure must not write the status line")
+        XCTAssertEqual(store.statusKind, statusKindAfterReconnect)
+
+        // Bind a new session under the new generation: a cancel for it must mint a fresh
+        // command id instead of replaying the stale generation's cancel.
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 10, "sessionId": "sess_2", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:03.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId, "a stale generation's cancel must not leave a retryable command id for a new session")
+    }
+
+    /// R-003: an unreadable reply (commandResponseUnreadable) keeps the pending cancel and a
+    /// retry reuses the same command id and timestamp (same rule as decide()'s C3-06).
+    func testCancelUnreadableReplyRetriesWithSameCommandId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.commandResponseUnreadable))
+
+        await store.cancel()
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(calls[0].timestamp, calls[1].timestamp)
+    }
+
+    /// R-004: a terminal (non-retryable) cancel failure clears the pending cancel, so the next
+    /// cancel mints a fresh command id instead of replaying the terminal one.
+    func testCancelTerminalFailureDoesNotKeepRetryPath() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+
+        await store.cancel()
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNotEqual(calls[0].commandId, calls[1].commandId, "a terminal cancel failure must not keep a retryable command id")
+    }
+
     /// A different choice after an offline send is a different command, so it must not reuse
     /// the id (the bridge would refuse it as a conflict).
     func testOfflineThenDifferentChoiceUsesNewCommandId() async throws {

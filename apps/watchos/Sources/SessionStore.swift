@@ -745,14 +745,23 @@ final class SessionStore {
     /// sending a second, distinct cancel (same rule as `decide`).
     func cancel() async {
         guard let target = sessionId else { return }
+        guard !isSending else { return }
+        isSending = true
+        defer { isSending = false }
+        // Bumped by reconnect(); if it moves while the send is in flight, this call's response
+        // belongs to a bridge binding that has since been discarded, so it must not resurrect
+        // state for it (mirrors the guard in decide()/createSession()).
+        let generation = pollGeneration
         let payload = CommandPayload.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch"))
         let retry = unconfirmedCancel?.sessionId == target ? unconfirmedCancel : nil
         let commandId = retry?.commandId ?? UUID().uuidString
         let timestamp = retry?.timestamp ?? BridgeClient.timestamp()
         do {
             try await client.send(payload, sessionId: target, commandId: commandId, timestamp: timestamp)
+            guard generation == pollGeneration else { return }
             unconfirmedCancel = nil
         } catch {
+            guard generation == pollGeneration else { return }
             switch ActionOutcome.classify(error) {
             case .offline, .failed, .rateLimited, .unconfirmed:
                 unconfirmedCancel = UnconfirmedSend(
