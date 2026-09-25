@@ -653,6 +653,37 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertTrue(store.awaitingLocalTurnStart, "a cancel failure must not end the wait for this Watch's own turn")
     }
 
+    /// R-016: cancel() has no turnState precondition of its own -- it can be called with no turn
+    /// tracked as cancelable. A failed cancel while idle (turn already completed) must go through
+    /// report()'s status-only path and leave turnState untouched, since report() no longer writes
+    /// turnState at all.
+    func testCancelFailureWhileIdleDoesNotChangeTurnState() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.completed",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertEqual(store.turnState, .completed)
+        XCTAssertFalse(store.canCancelTurn)
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await store.cancel()
+
+        XCTAssertEqual(store.turnState, .completed, "a failed cancel while idle must not invent a turn or an error state")
+        XCTAssertEqual(store.statusKind, .error)
+    }
+
     /// R-017: dictation with no session whose session creation fails sent nothing, so it must
     /// report false rather than claiming the text went somewhere.
     func testSubmitDictationReturnsFalseWhenSessionCreationFails() async throws {
@@ -683,6 +714,72 @@ final class SessionStoreDecisionTests: XCTestCase {
         await store.sendPrompt("go")
         XCTAssertFalse(store.awaitingLocalTurnStart)
         XCTAssertEqual(store.stopTurnTarget, .unknown)
+    }
+
+    /// R-016/R-022: a failed sendPrompt() must roll back all of its own optimistic turn state --
+    /// not just awaitingLocalTurnStart -- so the UI does not keep showing a turn in progress for
+    /// a send that never reached the bridge. rollBackLocalTurn() is sendPrompt's own undo, not
+    /// report()'s, so this must hold even though report() no longer touches turnState at all.
+    func testSendPromptFailureResetsTurnStateAndStopTurn() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        let firstSend = await store.sendPrompt("go")
+
+        XCTAssertFalse(firstSend)
+        XCTAssertEqual(store.turnState, .error)
+        XCTAssertFalse(store.canCancelTurn)
+        XCTAssertNil(store.currentTurnId)
+        XCTAssertEqual(store.stopTurnTarget, .unknown)
+        XCTAssertEqual(store.statusKind, .error)
+
+        await client.setSendResult(.success(CommandResponse()))
+        let secondSend = await store.sendPrompt("go again")
+        XCTAssertTrue(secondSend, "a later, successful send must not be blocked by the earlier failure's leftover state")
+    }
+
+    /// R-016: a turnStarted that lands while sendPrompt()'s send is still in flight is
+    /// authoritative and must win over a failure that arrives after it -- rollBackLocalTurn()
+    /// only undoes the wait it started, and that wait was already resolved by the event.
+    func testSendPromptFailureAfterTurnStartedKeepsEventState() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        await client.gateSendCall(1)
+        let sendTask = Task { await store.sendPrompt("go") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "turn.started",
+            "payload": { "turnId": "turn_1" }
+        }
+        """))
+        XCTAssertFalse(store.awaitingLocalTurnStart, "turnStarted already resolved the wait")
+
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+        await client.openSendGate()
+        _ = await sendTask.value
+
+        XCTAssertEqual(store.turnState, .thinking, "turn.started's turnState must survive a send failure that lands after it")
+        XCTAssertEqual(store.currentTurnId, 2)
+        XCTAssertTrue(store.canCancelTurn)
     }
 
     /// R-007: `.pendingLocal` must stay current through the very turnStarted that resolves it,
@@ -1990,6 +2087,54 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, statusKindAfterReconnect)
     }
 
+    /// R-024: decide()'s "the send itself succeeded" early return (`guard generation ==
+    /// pollGeneration else { return true }`) must still report true through answer(text:) even
+    /// though a concurrent reconnect() means no local outcome/card state gets touched -- callers
+    /// like submitDictation() must not treat a send that reached the bridge as failed.
+    func testDecideSuccessAfterConcurrentReconnectStillReturnsTrue() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(text: "yes please") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.sessionId)
+        XCTAssertNil(store.pendingQuestion, "reconnect() must have already discarded the old card")
+
+        await client.openSendGate()
+        let sent = await answerTask.value
+
+        XCTAssertTrue(sent, "the send reached the bridge; a stale generation must not turn that into a reported failure")
+        XCTAssertNil(store.actionOutcome, "a stale generation's response must not resurrect an outcome for a discarded card")
+        XCTAssertNil(store.outcome(forCard: "q_1"))
+    }
+
+    /// R-024 twin: the catch-path early return (`guard generation == pollGeneration else {
+    /// return false }`) must still report false through answer(text:) after a concurrent
+    /// reconnect(), and must not write any outcome for the discarded binding.
+    func testDecideFailureAfterConcurrentReconnectStillReturnsFalse() async throws {
+        let (store, client) = try await makeStoreWithPendingQuestion()
+        await client.setSendResult(.failure(BridgeError.decisionExpired))
+        await client.gateSendCall(1)
+
+        let answerTask = Task { await store.answer(text: "yes please") }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.gateEventsCall(1)
+        await store.reconnect()
+        XCTAssertNil(store.pendingQuestion, "reconnect() must have already discarded the old card")
+
+        await client.openSendGate()
+        let sent = await answerTask.value
+
+        XCTAssertFalse(sent)
+        XCTAssertNil(store.actionOutcome, "a stale generation's failure must not record an outcome")
+        XCTAssertNil(store.outcome(forCard: "q_1"))
+    }
+
     /// Covers E-05: action_not_allowed / project_not_allowed come from static device policy, so
     /// the same command can never succeed on retry. They must classify as a terminal outcome,
     /// not the generic retryable `.failed`.
@@ -2202,6 +2347,36 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertEqual(store.sessionId, "sess_1")
         XCTAssertNotNil(store.pendingApproval, "a recoverable error must not clear an unrelated pending card")
+        XCTAssertEqual(store.turnState, .waiting, "the pending approval's turnState must survive the recoverable error")
+        XCTAssertTrue(store.canCancelTurn, "a turn tracked as cancelable must not be hidden by a recoverable error")
+    }
+
+    /// R-023 twin: a recoverable, non-fatal error that arrives with no turn currently tracked as
+    /// cancelable is the one case apply(.error) still turns into an error pill -- there is no
+    /// running turn whose Stop button this would hide.
+    func testRecoverableErrorWithNoTurnShowsErrorPill() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 1, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_demo", "resumed": false }
+        }
+        """))
+
+        let recoverableError = try decodeEvent("""
+        {
+            "eventId": 2, "sessionId": "sess_1", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "error",
+            "payload": { "code": "boom", "message": "recoverable boom", "fatal": false }
+        }
+        """)
+        store.apply(recoverableError)
+
+        XCTAssertEqual(store.sessionId, "sess_1", "a non-fatal error must keep the session bound")
+        XCTAssertEqual(store.turnState, .error)
+        XCTAssertFalse(store.canCancelTurn)
     }
 
     /// Regression for R-019: a failed decide() send (e.g. a network hiccup rejecting reject())

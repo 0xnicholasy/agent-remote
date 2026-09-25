@@ -11,6 +11,8 @@ struct DictateView: View {
     /// Captured once, the first time the sheet appears, so the review screen keeps naming the
     /// destination the user actually reviewed even if the store's live state moves on.
     @State private var destination: SessionStore.DictationDestination?
+    /// Set when a Send fails or is refused, and shown until the text changes or a Send succeeds.
+    @State private var sendError: String?
 
     var body: some View {
         ScrollView {
@@ -36,6 +38,11 @@ struct DictateView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                if let sendError {
+                    Text(sendError)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
                 Button("Send") {
                     guard let destination else { return }
                     let outgoing = trimmed
@@ -45,8 +52,11 @@ struct DictateView: View {
                         // dictated text in place so the user can retry instead of losing it.
                         let sent = await store.submitDictation(outgoing, expecting: destination)
                         if sent {
+                            sendError = nil
                             text = ""
                             dismiss()
+                        } else {
+                            sendError = failureMessage(for: destination)
                         }
                     }
                 }
@@ -57,6 +67,20 @@ struct DictateView: View {
         .onAppear {
             if destination == nil { destination = store.dictationDestination }
         }
+        .onChange(of: text) { sendError = nil }
+    }
+
+    /// Priority mirrors what the user is most likely to act on: a per-card outcome (e.g. the
+    /// question was answered or superseded elsewhere) beats the store's generic status line,
+    /// which beats a bare fallback.
+    private func failureMessage(for destination: SessionStore.DictationDestination) -> String {
+        if case .answer(let questionId, _) = destination, let outcome = store.outcome(forCard: questionId) {
+            return outcome.label
+        }
+        if store.statusKind == .error {
+            return store.statusLine
+        }
+        return "Not sent. Try again."
     }
 
     private var trimmed: String {

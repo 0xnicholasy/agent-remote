@@ -577,9 +577,10 @@ final class SessionStore {
             // Only a fatal error ends the session; a recoverable one keeps the binding so
             // in-flight events for it are still applied. Turn tracking (currentTurnId) and
             // turnState must only be cleared/overwritten here when there is no turn currently
-            // tracked as cancelable -- otherwise a recoverable error report (failed decide,
-            // cancel, or a network hiccup) would hide the Stop-turn button while the
-            // server-side turn may still be running.
+            // tracked as cancelable -- otherwise a recoverable error event (arriving on the
+            // stream while a turn is still running) would hide the Stop-turn button. This is
+            // the event stream's own rule, independent of report(), which no longer touches
+            // turnState at all.
             if payload.fatal {
                 turnState = .error
                 resetSessionState()
@@ -657,9 +658,10 @@ final class SessionStore {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
             return true
         } catch {
-            // Only this send's own failure ends the wait for its turn; report() is shared with
-            // decide() and cancel(), whose failures must not clear it.
-            awaitingLocalTurnStart = false
+            // Only this send's own failure ends the wait for its turn; rollBackLocalTurn() is
+            // scoped to sendPrompt's own optimistic state, unlike report() which is shared with
+            // decide() and cancel() and must not touch turnState.
+            rollBackLocalTurn()
             report(error)
             return false
         }
@@ -969,14 +971,20 @@ final class SessionStore {
     }
 
     private func report(_ error: any Error) {
-        // A failed decide()/cancel() send, or any other recoverable local/network error, must
-        // not hide the Stop-turn button while the server-side turn may still be running: only
-        // overwrite turnState into .error when there is no turn currently tracked as
-        // cancelable.
-        if !canCancelTurn {
-            turnState = .error
-        }
+        // report() is status-only; the turn-state consequence of a failure belongs to the
+        // caller that made the optimistic write (sendPrompt via rollBackLocalTurn) or to the
+        // event stream.
         statusLine = "\(error)"
         statusKind = .error
+    }
+
+    /// Sole owner of the undo for sendPrompt()'s optimistic turn state. A turnStarted that landed
+    /// during the send already cleared `awaitingLocalTurnStart` and is authoritative, so it wins.
+    private func rollBackLocalTurn() {
+        guard awaitingLocalTurnStart else { return }
+        awaitingLocalTurnStart = false
+        localResolvedTurnId = nil
+        currentTurnId = nil
+        turnState = .error
     }
 }
