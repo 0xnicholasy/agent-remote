@@ -686,7 +686,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
         },
       };
       const claudeBridge = createBridge(options);
-      stub.current!.sendPromptError = new UnknownSessionError("unknown session: " + claudeBridge.session.id);
+      stub.current!.sendPromptError = new UnknownSessionError(`unknown session: ${claudeBridge.session.id}`);
 
       const response = await claudeBridge.fetch(
         new Request("http://bridge.local/v1/commands", {
@@ -703,7 +703,7 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       );
       expect(response.status).toBe(404);
       const body = (await response.json()) as { error: string };
-      expect(body.error).toBe("unknown session: " + claudeBridge.session.id);
+      expect(body.error).toBe(`unknown session: ${claudeBridge.session.id}`);
     } finally {
       restoreProviderEnv();
     }
@@ -721,14 +721,14 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
         },
       };
       const claudeBridge = createBridge(options);
-      stub.current!.cancelError = new UnknownSessionError("unknown session: " + claudeBridge.session.id);
+      stub.current!.cancelError = new UnknownSessionError(`unknown session: ${claudeBridge.session.id}`);
 
       const response = await claudeBridge.fetch(
         new Request(`http://bridge.local/v1/sessions/${claudeBridge.session.id}/cancel`, { method: "POST" }),
       );
       expect(response.status).toBe(404);
       const body = (await response.json()) as { error: string };
-      expect(body.error).toBe("unknown session: " + claudeBridge.session.id);
+      expect(body.error).toBe(`unknown session: ${claudeBridge.session.id}`);
     } finally {
       restoreProviderEnv();
     }

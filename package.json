@@ -12,8 +12,12 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "bun run --filter '*' typecheck",
-    "check": "bun run typecheck && bun test",
+    "lint": "biome lint",
+    "check": "bun run lint && bun run typecheck && bun test",
     "dev": "bun run --cwd bridge dev",
     "bridge": "bun run --cwd bridge cli"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14"
   }
 }

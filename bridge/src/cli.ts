@@ -475,7 +475,7 @@ async function runProjectsAllow(args: string[], deps: CliDeps): Promise<number> 
   const ok = await applyVerified(
     deps,
     (fresh) => fresh.updateAllowedProjects(deviceId, (current) => [...current, projectId]),
-    (record) => record !== undefined && record.allowedProjects.includes(projectId),
+    (record) => record?.allowedProjects.includes(projectId) === true,
     deviceId,
   );
   if (!ok) {
