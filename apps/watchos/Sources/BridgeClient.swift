@@ -177,15 +177,19 @@ protocol BridgeClientProtocol: Sendable {
     func isPaired() async -> Bool
     func events(after: Int, wait: Int) async throws -> EventsPage
     /// `commandId` is the idempotency key: resending the same payload with the same id gets the
-    /// bridge's recorded outcome instead of running the command again.
+    /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
+    /// the request body; the bridge's idempotency check hashes the entire body
+    /// (bridge/src/server.ts: `bodyDigest = sha256(rawBody)`), so a retry that resends the same
+    /// commandId must pass the same timestamp or be rejected as `command_id_conflict`.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse
 }
 
 extension BridgeClientProtocol {
+    /// Mints a fresh commandId and timestamp: for commands that are never retried.
     @discardableResult
     func send(_ payload: CommandPayload, sessionId: String) async throws -> CommandResponse {
-        try await send(payload, sessionId: sessionId, commandId: UUID().uuidString)
+        try await send(payload, sessionId: sessionId, commandId: UUID().uuidString, timestamp: BridgeClient.timestamp())
     }
 }
 
@@ -199,19 +203,6 @@ actor BridgeClient: BridgeClientProtocol {
     private let encoder = JSONEncoder()
     private let credentialStore: any CredentialStore
     private var credential: DeviceCredential?
-    /// Timestamp already minted for a commandId whose round trip hasn't completed yet, so a
-    /// retry that resends the same commandId reuses it instead of minting a new one. The bridge's
-    /// idempotency check hashes the entire request body (bridge/src/server.ts: `bodyDigest =
-    /// sha256(rawBody)`, compared against the journaled digest for that commandId), so a fresh
-    /// timestamp on retry would change the digest and get rejected as `command_id_conflict` even
-    /// though it's the same logical command.
-    private var commandTimestamps: [String: String] = [:]
-    /// Insertion order of `commandTimestamps` keys, oldest first, so the cache can evict the
-    /// oldest entry once it holds `commandTimestampCap` of them. SessionStore only ever retries
-    /// its single most recent unconfirmed send, so an entry this old belongs to a card that was
-    /// abandoned or changed and will never be resent.
-    private var commandTimestampOrder: [String] = []
-    static let commandTimestampCap = 16
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
@@ -301,82 +292,25 @@ actor BridgeClient: BridgeClientProtocol {
         return try decoder.decode(SessionsResponse.self, from: data).sessions
     }
 
-    /// Submits one command, minting a fresh idempotency key for it.
+    /// Submits one command under the caller's idempotency key and body timestamp.
     @discardableResult
-    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse {
-        let timestamp = commandTimestamps[commandId] ?? BridgeClient.timestamp()
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse {
         let command = Command(
             commandId: commandId,
             sessionId: sessionId,
             timestamp: timestamp,
             payload: payload
         )
-        // A throw before the request leaves the Watch (encoding, `.notPaired`) never reached the
-        // bridge, so there is no body digest to match on retry: drop any cached timestamp instead
-        // of leaking it.
-        let body: Data
-        var request: URLRequest
-        do {
-            body = try encoder.encode(command)
-            request = try signedRequest(method: "POST", url: baseURL.appending(path: "/v1/commands"), body: body)
-        } catch {
-            forgetCommandTimestamp(commandId)
-            throw error
-        }
-        rememberCommandTimestamp(timestamp, for: commandId)
+        let body = try encoder.encode(command)
+        var request = try signedRequest(method: "POST", url: baseURL.appending(path: "/v1/commands"), body: body)
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         let (data, response) = try await urlSession.data(for: request)
         let decoded = try decoder.decode(CommandResponse.self, from: data)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 200
-        // Forget this commandId's timestamp only once the command reaches a terminal outcome:
-        // success, or an error SessionStore.decide will not retry with the same commandId (it
-        // mints a fresh one next time). Errors SessionStore.decide *does* retry with the same
-        // commandId (generic failures, rate limiting) must keep the cached timestamp, or the
-        // retry would mint a new one and the bridge would see it as a distinct attempt.
-        if status < 300 || !BridgeClient.isRetryableWithSameCommandId(status: status, code: decoded.error) {
-            forgetCommandTimestamp(commandId)
-        }
         if status >= 300 {
             throw BridgeError.from(status: status, code: decoded.error, message: decoded.error ?? "unknown error")
         }
         return decoded
-    }
-
-    /// Number of commandIds with a cached timestamp. Exposed for tests.
-    func cachedCommandTimestampCount() -> Int {
-        commandTimestamps.count
-    }
-
-    private func rememberCommandTimestamp(_ timestamp: String, for commandId: String) {
-        if commandTimestamps.updateValue(timestamp, forKey: commandId) == nil {
-            commandTimestampOrder.append(commandId)
-        }
-        while commandTimestampOrder.count > BridgeClient.commandTimestampCap {
-            commandTimestamps.removeValue(forKey: commandTimestampOrder.removeFirst())
-        }
-    }
-
-    private func forgetCommandTimestamp(_ commandId: String) {
-        guard commandTimestamps.removeValue(forKey: commandId) != nil else { return }
-        commandTimestampOrder.removeAll { $0 == commandId }
-    }
-
-    /// Mirrors `SessionStore.ActionOutcome.classify`'s decision of which decoded HTTP errors get
-    /// retried with the same commandId (.offline, .failed, .rateLimited) versus which are
-    /// terminal (.expired, .indeterminate, .noLongerValid, .authRequired, .notAllowed).
-    static func isRetryableWithSameCommandId(status: Int, code: String?) -> Bool {
-        switch code {
-        case "decision_expired", "command_indeterminate", "interaction_not_pending", "command_id_conflict":
-            return false
-        case "unauthenticated", "device_revoked":
-            return false
-        // Static device policy (bridge/src/server.ts, "Command authorization"): the same command
-        // will be refused again until the device is re-enrolled with different permissions.
-        case "action_not_allowed", "project_not_allowed":
-            return false
-        default:
-            return status != 409
-        }
     }
 
     private func get(_ url: URL) async throws -> Data {

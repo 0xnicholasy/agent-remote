@@ -355,23 +355,27 @@ final class BridgeClientAuthTests: XCTestCase {
         _ = try await client.send(
             .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
             sessionId: "sess_demo",
-            commandId: "cmd_fixed_1234"
+            commandId: "cmd_fixed_1234",
+            timestamp: "2026-09-25T00:00:00.000Z"
         )
 
         let sent = try XCTUnwrap(capture.requestBody(at: 0), "expected a captured JSON request body")
         XCTAssertEqual(sent["commandId"] as? String, "cmd_fixed_1234")
+        XCTAssertEqual(sent["timestamp"] as? String, "2026-09-25T00:00:00.000Z")
     }
 
-    /// Covers E-04: a retry that resends the same commandId must resend the same timestamp too,
-    /// not a fresh one -- the bridge's idempotency check hashes the whole request body
+    /// Covers E-04 / E-20: a retry that resends the same commandId must resend the same body
+    /// timestamp too -- the bridge's idempotency check hashes the whole request body
     /// (bridge/src/server.ts: `bodyDigest = sha256(rawBody)`), so a differing timestamp on retry
     /// would change the digest and get rejected as `command_id_conflict` even though it is the
-    /// same logical command.
+    /// same logical command. The caller owns the timestamp (SessionStore keeps it alongside the
+    /// commandId in `unconfirmedSend`); `send()` must put exactly what it was given in the body.
     func testRetryOfTheSameCommandIdReusesTheSameTimestamp() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
         let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
 
         // First attempt: the connection drops before any HTTP response arrives -- the "offline"
         // failure mode (ActionOutcome.classify / SessionStore.decide) that makes the caller
@@ -381,7 +385,8 @@ final class BridgeClientAuthTests: XCTestCase {
             _ = try await client.send(
                 .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
                 sessionId: "sess_demo",
-                commandId: "cmd_retry_5678"
+                commandId: "cmd_retry_5678",
+                timestamp: timestamp
             )
             XCTFail("expected the dropped connection to throw")
         } catch {
@@ -392,31 +397,32 @@ final class BridgeClientAuthTests: XCTestCase {
         _ = try await client.send(
             .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
             sessionId: "sess_demo",
-            commandId: "cmd_retry_5678"
+            commandId: "cmd_retry_5678",
+            timestamp: timestamp
         )
 
         let first = try XCTUnwrap(capture.requestBody(at: 0))
         let second = try XCTUnwrap(capture.requestBody(at: 1))
         XCTAssertEqual(first["commandId"] as? String, "cmd_retry_5678")
         XCTAssertEqual(second["commandId"] as? String, "cmd_retry_5678")
+        XCTAssertEqual(first["timestamp"] as? String, timestamp, "the body timestamp must be the one passed in")
         XCTAssertEqual(
-            first["timestamp"] as? String,
             second["timestamp"] as? String,
+            timestamp,
             "a same-commandId retry must resend the original timestamp, not mint a new one"
         )
     }
 
     /// Covers E-04 (re-fix): a decoded HTTP error (as opposed to a dropped connection) that
     /// SessionStore.decide retries with the same commandId -- e.g. a generic 500, or a 429
-    /// "rate_limited" -- must also reuse the cached timestamp on retry. The old code removed
-    /// `commandTimestamps[commandId]` right after `decoder.decode` succeeded and before checking
-    /// `status >= 300`, so this case minted a fresh timestamp even though the caller resends the
-    /// same commandId.
+    /// "rate_limited" -- must also carry the same body timestamp on retry; `send()` must not
+    /// rewrite it on either the failed or the retried attempt.
     func testRetryAfterDecodedHTTPErrorReusesTheSameTimestamp() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
         let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
 
         server.respondOnce(
             statusLine: "HTTP/1.1 500 Internal Server Error",
@@ -427,7 +433,8 @@ final class BridgeClientAuthTests: XCTestCase {
             _ = try await client.send(
                 .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
                 sessionId: "sess_demo",
-                commandId: "cmd_retry_5xx"
+                commandId: "cmd_retry_5xx",
+                timestamp: timestamp
             )
             XCTFail("expected the decoded 500 response to throw")
         } catch BridgeError.http(let status, _) {
@@ -438,88 +445,28 @@ final class BridgeClientAuthTests: XCTestCase {
         _ = try await client.send(
             .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
             sessionId: "sess_demo",
-            commandId: "cmd_retry_5xx"
+            commandId: "cmd_retry_5xx",
+            timestamp: timestamp
         )
 
         let first = try XCTUnwrap(capture.requestBody(at: 0))
         let second = try XCTUnwrap(capture.requestBody(at: 1))
         XCTAssertEqual(first["commandId"] as? String, "cmd_retry_5xx")
         XCTAssertEqual(second["commandId"] as? String, "cmd_retry_5xx")
+        XCTAssertEqual(first["timestamp"] as? String, timestamp, "the body timestamp must be the one passed in")
         XCTAssertEqual(
-            first["timestamp"] as? String,
             second["timestamp"] as? String,
+            timestamp,
             "a same-commandId retry after a decoded HTTP error must resend the original timestamp"
         )
-    }
-
-    /// Covers E-05: the bridge's static device-policy refusals are terminal, so BridgeClient
-    /// must not treat them as same-commandId retryable, and must drop their cached timestamp.
-    func testPolicyRefusalsAreNotRetryableAndDropTheCachedTimestamp() async throws {
-        XCTAssertFalse(BridgeClient.isRetryableWithSameCommandId(status: 403, code: "action_not_allowed"))
-        XCTAssertFalse(BridgeClient.isRetryableWithSameCommandId(status: 403, code: "project_not_allowed"))
-
-        let server = LoopbackHTTPServer()
-        defer { server.stop() }
-        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
-        for (index, code) in ["action_not_allowed", "project_not_allowed"].enumerated() {
-            server.respondOnce(statusLine: "HTTP/1.1 403 Forbidden", body: #"{"error":"\#(code)"}"#)
-            do {
-                _ = try await client.send(
-                    .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
-                    sessionId: "sess_demo",
-                    commandId: "cmd_policy_\(index)"
-                )
-                XCTFail("expected the 403 \(code) to throw")
-            } catch {
-                // expected
-            }
-            let cached = await client.cachedCommandTimestampCount()
-            XCTAssertEqual(cached, 0, "a terminal \(code) must not leave a cached timestamp behind")
-        }
-    }
-
-    /// Covers E-17: a send that throws before any request leaves the Watch (not paired) must
-    /// not leave a cached timestamp behind.
-    func testNotPairedSendLeavesNoCachedTimestamp() async throws {
-        let client = BridgeClient(baseURL: URL(string: "http://127.0.0.1:1")!, credentialStore: InMemoryCredentialStore(nil))
-        do {
-            _ = try await client.send(
-                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
-                sessionId: "sess_demo",
-                commandId: "cmd_unpaired"
-            )
-            XCTFail("expected notPaired")
-        } catch BridgeError.notPaired {
-            // expected
-        }
-        let cached = await client.cachedCommandTimestampCount()
-        XCTAssertEqual(cached, 0)
-    }
-
-    /// Covers E-17: retryable failures for commandIds that are never resent (an abandoned or
-    /// changed card) must not grow the timestamp cache without limit.
-    func testAbandonedRetryableCommandTimestampsAreBounded() async throws {
-        let server = LoopbackHTTPServer()
-        defer { server.stop() }
-        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
-        for index in 0..<(BridgeClient.commandTimestampCap + 4) {
-            server.respondOnce(statusLine: "HTTP/1.1 500 Internal Server Error", body: #"{"error":"internal"}"#)
-            _ = try? await client.send(
-                .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
-                sessionId: "sess_demo",
-                commandId: "cmd_abandoned_\(index)"
-            )
-        }
-        let cached = await client.cachedCommandTimestampCount()
-        XCTAssertEqual(cached, BridgeClient.commandTimestampCap)
     }
 
     /// Investigates E-15: a `stale_request` (401) is rejected by `verifyEnvelope`
     /// (bridge/src/auth/verify.ts:341-343) purely on the `X-AgentRemote-Timestamp` *header*,
     /// checked before the command idempotency store is ever consulted (bridge/src/server.ts:714).
     /// `signedRequest` mints that header's timestamp fresh on every call (see
-    /// `testSigningIsFreshPerRequest` above) independently of `commandTimestamps[commandId]`,
-    /// which only feeds the request *body*'s redundant `timestamp` field used solely to keep the
+    /// `testSigningIsFreshPerRequest` above) independently of the caller-supplied body
+    /// `timestamp`, which only feeds the request *body*'s redundant field used solely to keep the
     /// idempotency digest stable (bridge/src/server.ts:710, `bodyDigest = sha256(rawBody)`). Since
     /// a stale_request rejection never reaches that digest check, retrying with the same
     /// commandId cannot resend "the same stale timestamp" to the check that produced the 401: the
@@ -529,6 +476,7 @@ final class BridgeClientAuthTests: XCTestCase {
         defer { server.stop() }
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore(makeCredential()))
         let capture = RequestCapture()
+        let timestamp = BridgeClient.timestamp()
 
         server.respondOnce(
             statusLine: "HTTP/1.1 401 Unauthorized",
@@ -539,7 +487,8 @@ final class BridgeClientAuthTests: XCTestCase {
             _ = try await client.send(
                 .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
                 sessionId: "sess_demo",
-                commandId: "cmd_stale_9012"
+                commandId: "cmd_stale_9012",
+                timestamp: timestamp
             )
             XCTFail("expected the decoded stale_request response to throw")
         } catch BridgeError.staleRequest {
@@ -550,7 +499,8 @@ final class BridgeClientAuthTests: XCTestCase {
         _ = try await client.send(
             .sessionCreate(SessionCreatePayload(projectId: "prj_demo", provider: "mock")),
             sessionId: "sess_demo",
-            commandId: "cmd_stale_9012"
+            commandId: "cmd_stale_9012",
+            timestamp: timestamp
         )
 
         let firstHeaders = try XCTUnwrap(capture.requestHeaders(at: 0))
@@ -560,5 +510,7 @@ final class BridgeClientAuthTests: XCTestCase {
             secondHeaders["x-agentremote-timestamp"],
             "a retry after stale_request must carry a freshly minted header timestamp, not the rejected one"
         )
+        let secondBody = try XCTUnwrap(capture.requestBody(at: 1))
+        XCTAssertEqual(secondBody["timestamp"] as? String, timestamp, "the body timestamp stays the one passed in")
     }
 }

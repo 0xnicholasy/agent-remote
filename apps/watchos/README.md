@@ -11,7 +11,7 @@ The current prototype is conversation-first. Its root view shows a transcript, a
 ## Current limitations
 
 - The prototype uses the mock provider and a hard-coded demo project. It does not yet pair with or authenticate a Mac, authorize projects, or control a real provider.
-- The Watch shows current, syncing, and disconnected. Each approve, deny, or answer ends in one visible outcome: sending, then sent, no longer valid, expired, offline, outcome unknown, or not sent. An offline send keeps the card; repeating the same choice reuses its command id, so a send that did land gets the recorded outcome instead of running twice. Delivery while the app is inactive is still unmeasured.
+- The Watch shows current, syncing, and disconnected. Each approve, deny, or answer ends in one visible outcome: sending, then sent, no longer valid, expired, offline, outcome unknown, not sent, bridge busy (rate limited), needs pairing again, or not allowed from this Watch. An offline send keeps the card; repeating the same choice reuses its command id, so a send that did land gets the recorded outcome instead of running twice. Delivery while the app is inactive is still unmeasured.
 - A stored event cursor is not session restoration. Snapshot/replay or materialized-state recovery, storage, rehydration, retention, and history policy are still design work.
 - The transcript is built from received events in memory. Full conversation replay requires the protocol and bridge to retain or reproduce user prompts as well as agent events; it is a future requirement, not implemented behavior.
 - Cancel is wired to the current prototype session, but durable lifecycle and isolation across concurrent sessions are not complete.

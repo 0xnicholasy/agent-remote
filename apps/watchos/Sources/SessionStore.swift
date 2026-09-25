@@ -84,7 +84,7 @@ enum ActionOutcome: Equatable {
         case BridgeError.http(let status, _) where status == 409: return .noLongerValid
         case BridgeError.rateLimited: return .rateLimited
         case BridgeError.notPaired, BridgeError.unauthenticated, BridgeError.deviceRevoked: return .authRequired
-        // Static device policy; must stay in step with BridgeClient.isRetryableWithSameCommandId.
+        // Static device policy: the same command will be refused again until re-enrolled.
         case BridgeError.actionNotAllowed, BridgeError.projectNotAllowed: return .notAllowed
         case let urlError as URLError where offlineCodes.contains(urlError.code): return .offline
         default: return .failed
@@ -112,6 +112,9 @@ private struct UnconfirmedSend {
     let payload: CommandPayload
     let sessionId: String
     let commandId: String
+    /// Body timestamp sent with `commandId`; a retry must resend it unchanged so the bridge's
+    /// body digest for that commandId matches (see `BridgeClientProtocol.send`).
+    let timestamp: String
 }
 
 /// Whether what the Watch shows matches the bridge (docs/durability-v0.md, "Client recovery").
@@ -617,14 +620,17 @@ final class SessionStore {
         // a card or status line for it (mirrors the guard in createSession()).
         let generation = pollGeneration
         let commandId: String
+        let timestamp: String
         if let unconfirmed = unconfirmedSend, unconfirmed.payload == payload, unconfirmed.sessionId == sessionId {
             commandId = unconfirmed.commandId
+            timestamp = unconfirmed.timestamp
         } else {
             commandId = UUID().uuidString
+            timestamp = BridgeClient.timestamp()
         }
         setOutcome(.sending, for: card)
         do {
-            try await client.send(payload, sessionId: sessionId, commandId: commandId)
+            try await client.send(payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp)
             guard generation == pollGeneration else { return }
             unconfirmedSend = nil
             setOutcome(.acknowledged, for: card)
@@ -640,7 +646,9 @@ final class SessionStore {
                 // Watch, so a retry must reuse it rather than mint a fresh one (which the bridge
                 // would treat as a distinct command).
                 guard isCurrent(card) else { return }
-                unconfirmedSend = UnconfirmedSend(payload: payload, sessionId: sessionId, commandId: commandId)
+                unconfirmedSend = UnconfirmedSend(
+                    payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
+                )
                 setOutcome(outcome, for: card)
                 if outcome == .failed { report(error) }
             case let terminal:

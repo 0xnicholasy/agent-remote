@@ -13,6 +13,7 @@ actor FakeBridgeClient: BridgeClientProtocol {
         let payload: CommandPayload
         let sessionId: String
         let commandId: String
+        let timestamp: String
     }
 
     private var sendResult: SendResult = .success(CommandResponse())
@@ -116,8 +117,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
         }
     }
 
-    func send(_ payload: CommandPayload, sessionId: String, commandId: String) async throws -> CommandResponse {
-        sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId, commandId: commandId))
+    func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse {
+        sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp))
         sendCallCount += 1
         let currentCall = sendCallCount
         if sendGateAtCall == currentCall {
@@ -372,6 +373,42 @@ final class SessionStoreDecisionTests: XCTestCase {
         let calls = await client.sentCalls
         XCTAssertEqual(calls.count, 2)
         XCTAssertNotEqual(calls[0].commandId, calls[1].commandId)
+    }
+
+    /// Covers E-20: the body timestamp lives with the command id in `unconfirmedSend`, so a
+    /// retry of the same choice resends both unchanged (the bridge's idempotency digest covers
+    /// the whole body), while a different choice mints a fresh command id (its timestamp is
+    /// minted alongside, but at millisecond resolution it can legitimately collide, so only
+    /// the id is asserted).
+    func testRetryReusesTimestampWithCommandIdAndNewChoiceMintsNewId() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.http(status: 500, message: "boom")))
+
+        await store.approve()
+        await store.approve()
+        await store.reject()
+
+        let calls = await client.sentCalls
+        XCTAssertEqual(calls.count, 3)
+        XCTAssertEqual(calls[0].commandId, calls[1].commandId)
+        XCTAssertEqual(calls[0].timestamp, calls[1].timestamp, "a same-choice retry must resend the original body timestamp")
+        XCTAssertNotEqual(calls[2].commandId, calls[1].commandId, "a different choice is a new command")
+    }
+
+    /// Covers E-24: an auth failure on a decision is terminal -- the card is cleared, the
+    /// status line shows the auth text and the store stops on `.authFailed` rather than keeping
+    /// the card for a retry that cannot succeed until the Watch is paired again.
+    func testAuthFailureOnDecisionClearsCardAndSetsAuthFailed() async throws {
+        let (store, client) = try await makeStoreWithPendingApproval()
+        await client.setSendResult(.failure(BridgeError.unauthenticated))
+
+        await store.approve()
+
+        XCTAssertNil(store.pendingApproval, "an auth failure must not keep the card for a retry")
+        XCTAssertEqual(store.actionOutcome, .authRequired)
+        XCTAssertEqual(store.statusKind, .authFailed)
+        XCTAssertEqual(store.statusLine, ActionOutcome.authRequired.statusText)
+        XCTAssertEqual(store.statusLine, "Not authorized: pair this Watch again")
     }
 
     /// The outcome belongs to the card it was sent for; a newer card starts with none.
