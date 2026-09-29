@@ -13,6 +13,11 @@ struct PairingView: View {
     /// link has no such step, so it leaves this nil and falls back to "Start again".
     var onFindMyMac: (() -> Void)?
 
+    /// True when reached from Settings: leaving the view cancels an unfinished handshake and
+    /// resets the phase, so the next visit starts fresh instead of showing stale options or
+    /// "Paired" (E-102). Onboarding leaves this false; its Back button already cancels.
+    var resetsOnDismiss = false
+
     var body: some View {
         ScrollView {
             content
@@ -21,6 +26,9 @@ struct PairingView: View {
         }
         .navigationTitle("Pair Watch")
         .task { await start() }
+        .onDisappear {
+            if resetsOnDismiss { Task { await store.dismissPairing() } }
+        }
         .onChange(of: scenePhase) {
             if scenePhase == .active {
                 store.resumePairingPollingIfNeeded()

@@ -461,6 +461,23 @@ final class SessionStore {
         }
     }
 
+    /// Leaves the pairing flow for good: cancels a non-terminal handshake and returns the phase
+    /// to `.idle` so the next PairingView can start a fresh one. Called when PairingView is
+    /// dismissed from Settings, and (from `reconnect()`) when the bridge host
+    /// changes. The success screen right after approval is unaffected because it is only reset
+    /// once the view goes away.
+    func dismissPairing() async {
+        switch pairingPhase {
+        case .starting, .choosing, .waitingForMac:
+            await cancelPairing()
+            // A new beginPairing() during the cancel's network await owns the phase now.
+            guard pairingPhase == .cancelled else { return }
+        default:
+            break
+        }
+        pairingPhase = .idle
+    }
+
     /// A network error during pairing status polling retries (1 s between attempts) for up to
     /// this long before finally giving up and showing a connection failure -- a dimmed screen or
     /// a momentary Wi-Fi blip must not strand the user on a silent "waiting" state. Instance-level
@@ -599,6 +616,11 @@ final class SessionStore {
         // retry. A different (or unparseable) host is a different bridge/session space, so the
         // pending send is dropped along with everything else discardLocalView() clears below.
         let sameBridge = newURL != nil && newURL == connectedHostURL
+        // The pairing phase (and any in-flight handshake) belongs to the old bridge: leaving
+        // `.approved`/`.choosing` in place would make PairingView refuse to start a fresh
+        // pairing against the new one (E-102). Cancelled against the old base URL, before the
+        // switch below.
+        if !sameBridge { await dismissPairing() }
         if let newURL {
             await client.setBaseURL(newURL)
             connectedHostURL = newURL

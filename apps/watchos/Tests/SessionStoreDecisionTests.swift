@@ -4219,4 +4219,78 @@ final class SessionStoreDecisionTests: XCTestCase {
             "an approvalId reused after discard must fall back to the decision alone"
         )
     }
+
+    /// E-102: an approved (or mid-handshake) phase belongs to the old bridge; switching the
+    /// host must return it to .idle so Settings > Pair Watch can start a fresh pairing.
+    func testHostChangeResetsApprovedPairingPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_h", code: 123)))
+        await client.setPollPairingResults([.success(.approved)])
+        await client.setPaired(true)
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else { return XCTFail("expected .choosing") }
+        await store.pick(correct)
+        for _ in 0 ..< 200 {
+            if store.pairingPhase == .approved { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .approved)
+
+        store.hostText = "http://192.168.7.7:8787"
+        await store.reconnect()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        XCTAssertTrue(store.pairingPhase.canRestart)
+    }
+
+    /// Reconnecting to the same host keeps the success screen (no reset without a host change).
+    func testSameHostReconnectKeepsPairingPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_s", code: 124)))
+        await store.beginPairing()
+        guard case .choosing = store.pairingPhase else { return XCTFail("expected .choosing") }
+        await store.reconnect()
+        guard case .choosing = store.pairingPhase else { return XCTFail("same host must not reset") }
+    }
+
+    /// E-102: a host change mid-handshake cancels it on the old bridge and frees the phase.
+    func testHostChangeCancelsInFlightHandshake() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_c", code: 222)))
+        await store.beginPairing()
+        store.hostText = "http://192.168.7.8:8787"
+        await store.reconnect()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_c"])
+    }
+
+    /// E-102: dismissing PairingView (Settings) mid-.choosing cancels and resets to .idle.
+    func testDismissPairingCancelsChoosingAndResets() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_d", code: 333)))
+        await store.beginPairing()
+        await store.dismissPairing()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_d"])
+    }
+
+    /// The success screen is left alone until the view is dismissed; a terminal phase then
+    /// resets without any cancel call.
+    func testDismissPairingResetsTerminalPhaseWithoutCancel() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_t", code: 444)))
+        await store.beginPairing()
+        await store.cancelPairing()
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+        await store.dismissPairing()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let count = await client.cancelPairingCallCount
+        XCTAssertEqual(count, 1)
+    }
 }

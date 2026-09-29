@@ -39,7 +39,7 @@ struct SettingsView: View {
                 }
                 Section("Pairing") {
                     LabeledContent("Device", value: store.paired ? "Paired" : "Not paired")
-                    NavigationLink("Pair Watch") { PairingView() }
+                    NavigationLink("Pair Watch") { PairingView(resetsOnDismiss: true) }
                 }
                 Section("Speech") {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
