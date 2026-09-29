@@ -232,41 +232,12 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
 
   deps.stdout("Pairing open for 2 minutes. On your Watch, open Agent Remote and tap Next.");
 
-  // Phase 1: wait for a Watch to reach /v1/pair/reveal (pending-pair.json appears) or the window
-  // to expire with no request at all.
-  let requestId: string | undefined;
-  let deviceId: string | undefined;
-  let code: number | undefined;
-  let pendingExpiresAt: string | undefined;
-  let deviceName: string | undefined;
-  for (;;) {
-    let pending: ReturnType<typeof readPendingPair>;
-    try {
-      pending = readPendingPair(deps.stateDir);
-    } catch (cause) {
-      deps.stderr(cause instanceof Error ? cause.message : String(cause));
-      return 1;
-    }
-    if (pending !== undefined) {
-      requestId = pending.requestId;
-      deviceId = pending.deviceId;
-      code = pending.code;
-      pendingExpiresAt = pending.expiresAt;
-      deviceName = pending.deviceName;
-      break;
-    }
-    if (deps.now().getTime() >= windowExpiresAt.getTime()) {
-      deps.stderr("Pairing window expired with no device requesting to pair.");
-      return 1;
-    }
-    await deps.sleep(POLL_INTERVAL_MS);
-  }
-
-  // From here on, this process has a decision (or is about to make one) recorded against
-  // requestId, in pending-pair.json. If the operator kills us with Ctrl-C before we reach one of
-  // our own exit paths below, clear it here too -- otherwise it sits there, decided, until it
-  // expires on its own, and blocks every pairing attempt in between (see /v1/pair/start's
-  // pairing_busy check).
+  // Installed before Phase 1 so Ctrl-C at any point closes the pairing window (the window lives
+  // exactly as long as this process) and clears any decided record this process made. No record
+  // exists yet during Phase 1, and clearing a missing record is a no-op. If the operator kills us
+  // with Ctrl-C after a decision is recorded, clearing it matters: otherwise it sits there,
+  // decided, until it expires on its own, and blocks every pairing attempt in between (see
+  // /v1/pair/start's pairing_busy check).
   const onSigint = (): void => {
     try {
       clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
@@ -279,6 +250,35 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
   };
   process.once("SIGINT", onSigint);
   try {
+    // Phase 1: wait for a Watch to reach /v1/pair/reveal (pending-pair.json appears) or the window
+    // to expire with no request at all.
+    let requestId: string | undefined;
+    let deviceId: string | undefined;
+    let code: number | undefined;
+    let pendingExpiresAt: string | undefined;
+    let deviceName: string | undefined;
+    for (;;) {
+      let pending: ReturnType<typeof readPendingPair>;
+      try {
+        pending = readPendingPair(deps.stateDir);
+      } catch (cause) {
+        deps.stderr(cause instanceof Error ? cause.message : String(cause));
+        return 1;
+      }
+      if (pending !== undefined) {
+        requestId = pending.requestId;
+        deviceId = pending.deviceId;
+        code = pending.code;
+        pendingExpiresAt = pending.expiresAt;
+        deviceName = pending.deviceName;
+        break;
+      }
+      if (deps.now().getTime() >= windowExpiresAt.getTime()) {
+        deps.stderr("Pairing window expired with no device requesting to pair.");
+        return 1;
+      }
+      await deps.sleep(POLL_INTERVAL_MS);
+    }
     try {
       // Phase 2: show the code prominently and spell out the order -- either order
       // (tap-then-confirm or confirm-then-tap) must actually work, since the operator may do

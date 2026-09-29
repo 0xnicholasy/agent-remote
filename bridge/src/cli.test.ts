@@ -235,11 +235,22 @@ describe("pair", () => {
   }, 15000);
 
   test("expires when the window passes with no device requesting to pair", async () => {
+    const baseline = process.listenerCount("SIGINT");
     const deps = makeDeps();
+    const inner = deps.sleep;
+    let listenersDuringPhase1: number | undefined;
+    deps.sleep = async (ms) => {
+      listenersDuringPhase1 ??= process.listenerCount("SIGINT");
+      await inner(ms);
+    };
     const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(1);
     expect(deps.stderrLines).toContain("Pairing window expired with no device requesting to pair.");
+    // The SIGINT handler is live during Phase 1, is removed on exit, and the window is closed.
+    expect(listenersDuringPhase1).toBe(baseline + 1);
+    expect(process.listenerCount("SIGINT")).toBe(baseline);
+    expect(readPairingWindow(stateDir)).toBeUndefined();
   });
 
   test("reports the request as gone when it disappears before the operator answers", async () => {
