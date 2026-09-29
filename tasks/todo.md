@@ -1,6 +1,6 @@
 # Agent Remote task board
 
-Last updated: 2026-09-24
+Last updated: 2026-09-29
 
 Agent Remote lets a user steer short coding-agent interruptions from an Apple Watch while the Mac remains the authority. The first release targets one real provider and one paired Mac on the local network: tap answers, approve or deny, send reviewed dictation, hear short foreground replies, see current/syncing/disconnected state, and cancel. It controls only sessions created through its bridge, not arbitrary terminal sessions that were already running.
 
@@ -24,6 +24,134 @@ Agent Remote lets a user steer short coding-agent interruptions from an Apple Wa
 - [x] 2026-09-25 (branch `chore/root-lint-typecheck`): root `bun run typecheck` runs every TypeScript workspace's `typecheck` (exits non-zero on a type error), and `bun run check` runs it then `bun test`. CONTRIBUTING points at them.
 - [x] 2026-09-25 (branch `chore/biome-lint`): Biome 2.5.14 lints the TypeScript workspaces with its recommended preset; `bun run lint` runs it and `bun run check` runs lint, typecheck, then tests. `noNonNullAssertion` is off (103 bounds-checked assertions); formatting is not enforced.
 - [ ] Keep related-project research (claude-watch, agent-watcher, codex-apple-watch, iOS-vibebuddy, and mimi-remote) bounded to concrete reuse or contribution questions. It does not block the release path.
+
+## Next tasks (planned 2026-09-29)
+
+Priority order A-F. Each task is independently mergeable. "Inferred" marks a claim taken from reading code or docs rather than running anything; "Unverified" marks an Apple platform claim not checked against a current source. Planned by fable; not yet critiqued by a second reviewer.
+
+Verified facts behind the plan:
+- `GET /v1/projects` and `GET /v1/sessions` already exist and are narrowed per device (`bridge/src/server.ts:1081-1094`). No endpoint reports the bridge's provider; `/v1/health` returns only `{ok, bridgeId}`. The Watch client has `sessions()` but no `projects()` (`apps/watchos/Sources/BridgeClient.swift:380`).
+- `GET /v1/events` already returns events for every session the device's `allowedProjects` covers (`server.ts:955-1009`), so multi-session needs no bridge change.
+- The Claude provider serializes `canUseTool`/`AskUserQuestion` per conversation through `interactionLock` (`providers/claude/src/index.ts:112-116`): one pending approval OR question per session. Several pending interactions only arise across sessions; ceiling `DEFAULT_MAX_SESSIONS = 8` (`index.ts:179`).
+- Blocker for A: with the claude provider the bridge seeds `ses_seed` without `session.started`, so the Watch's first Reply calls `createSession()` with `prj_demo`/`mock` and gets 400 `unknown provider: mock` (`server.ts:686`).
+- `apps/watchos/project.yml` sets `CODE_SIGNING_ALLOWED: NO` outside the simulator SDK, so there is no device build path today.
+
+### A. Watch drives real Claude (project choice + provider from the bridge)
+
+Goal: a paired Watch learns the bridge's provider and its authorized projects, the user picks a project, and `session.create` goes out with real values. Removes `SessionStore.projectId`/`provider`.
+Dependencies: none. Size: 1.5-2 days.
+Files: `protocol/typescript/src/index.ts`, `protocol/swift/Sources/AgentRemoteProtocol/*`, `bridge/src/server.ts`, `bridge/src/server.test.ts`, `apps/watchos/Sources/BridgeClient.swift`, `SessionStore.swift`, `SettingsView.swift`, `OnboardingView.swift`, new `ProjectPickerView.swift`, `apps/watchos/Tests/*`, `docs/protocol-v0.md`, `docs/onboarding.md`.
+
+- [ ] 1. Design `GET /v1/bridge` (authenticated, same envelope as `/v1/projects`) returning `{ bridgeId, provider, capabilities, maxSessions }`. Add `BridgeInfoResponse` next to `ProjectsResponse`. A new route rather than widening `/v1/health` (unauthenticated, must stay minimal) or the pair response (seen once). `provider` stays required on `SessionCreatePayload`, so no command schema change.
+- [ ] 2. Add a schema file only if HTTP response schemas already live in `protocol/schema` (inferred: only command/event schemas exist; if so, add the shared JSON vector to the TS and Swift decode tests instead).
+- [ ] 3. Bridge: route after `/v1/projects`; add optional `readonly maxSessions?: number` to `AgentProvider` (claude returns its ceiling, mock omits it). Tests: unauthenticated 401, paired returns body, claude provider reports `provider: "claude"`.
+- [ ] 4. Swift protocol: confirm `Project` and `Session` decode; add `BridgeInfo`. Shared vector test on both sides.
+- [ ] 5. `BridgeClient`: add `bridgeInfo()` and `projects()` (signed GETs like `sessions()`); add both to `BridgeClientProtocol` and every test fake.
+- [ ] 6. `SessionStore`: replace the static constants with `bridgeInfo`, `projects`, `selectedProjectId` (persisted under `dev.agentremote.watch.projectId`, cleared when `bridgeId` changes). Load in `start()` after pairing check and in `reconnect()`. `createSession()` uses `bridgeInfo.provider` and `selectedProjectId`; one project auto-selects, otherwise status line "Pick a project".
+- [ ] 7. Map `session_limit` (429) in `BridgeError.from` and `ActionOutcome.classify` as a retryable failure with its own text.
+- [ ] 8. UI: `ProjectPickerView` (list, checkmark, name + last path component), linked from a Settings "Project" row and an onboarding step after pairing when `projects.count > 1`. "Create session" disabled until a project is selected. Settings shows `Agent: <provider>`.
+- [ ] 9. Tests (XCTest): single project auto-selects; multi-project requires a selection; bridge id change clears the selection; `createSession` sends the provider from `bridgeInfo`. Bun: one `session.create` round trip with the claude provider fake asserting the real project id.
+- [ ] 10. Docs: `/v1/bridge` row in `protocol-v0.md`; project step in `onboarding.md`.
+
+Finish line: simulator Watch paired to a bridge started with `AGENTREMOTE_PROVIDER=claude AGENTREMOTE_PROJECT_DIRS=/abs/a,/abs/b` picks project b, sends a prompt, and the bridge log shows `session.started` with `prj_b_<hash>` then a real `approval.requested`. `bun run check` and Watch unit tests pass.
+Risks: the `AgentProvider` change touches mock, claude and every test fake (Medium); auto-select hides the picker on first use, so Settings must still show the active project (Low).
+
+### B. Multi-session and multiple pending interactions on the Watch
+
+Goal: the Watch tracks every session visible to the device, keeps a pending queue keyed by approval/question id, resolves cards only by id, and offers an inbox first page plus a session list.
+Dependencies: A. Size: 3-4 days, in 4 PRs. No bridge change for B1-B3.
+Files: `SessionStore.swift` (split into `SessionStore.swift` + new `SessionModel.swift` + `PendingInteraction.swift`), `RootView.swift`, new `InboxView.swift`, `SessionListView.swift`, `ChoiceCardView` call sites, `apps/watchos/Tests/SessionStoreTests*.swift`, `docs/protocol-v0.md` (client rules).
+
+B1. Pending queue + id-checked resolution (1 day, no UI change)
+- [ ] 1. `struct PendingInteraction: Identifiable { id, sessionId, projectId, kind, payload, receivedAt, expiresAt: Date? }` from `approval.requested` (binding.expiresAt) and `question.requested` (optional `expiresAt`, nil sorts last).
+- [ ] 2. `SessionStore.pending: [PendingInteraction]` becomes the source; keep computed `pendingApproval`/`pendingQuestion` for the selected session so views compile unchanged.
+- [ ] 3. `apply()`: `approvalResolved`/`questionAnswered` remove by id only (fixes the unconditional clear at `SessionStore.swift:646/660`); `sessionCompleted` and fatal `error` remove that session's entries; a 1 s tick drops entries past `expiresAt` and writes "Expired" to the transcript.
+- [ ] 4. `decide()`/`isCurrent(card)`/`clearCard` look up by id; `answer(...)` takes the session id from the entry.
+- [ ] 5. Tests: two sessions each raise an approval, resolving one leaves the other; resolving a non-pending id is a no-op; expiry removes only the expired entry.
+
+B2. Per-session state (1 day)
+- [ ] 6. Move per-session fields (transcript, turnState, currentTurnId, awaitingLocalTurnStart, localResolvedTurnId, unconfirmedSend, unconfirmedCancel, lastApproval, lastQuestion) into `@Observable final class SessionModel` in `SessionStore.sessions: [String: SessionModel]`; `selectedSessionId` replaces `sessionId`. Remove the "Ignored session" branch (`apply()` ~592-596) and the bind-on-first-event fallback (~610).
+- [ ] 7. `discardLocalView`/`resetSessionState`/`truncated` clear the dictionary; the gap line goes into every surviving model. `session.completed` keeps the model readable but hides Reply/Stop.
+- [ ] 8. Tests: interleaved events for two sessions give two transcripts; cancel on A leaves B's pending entry; reconnect clears both.
+
+B3. Inbox page (0.5-1 day)
+- [ ] 9. `InboxView` becomes the first TabView page (Inbox, Conversation, Sessions, Settings). Sort by soonest `expiresAt` (nil last), then `receivedAt`. Row: project name, title/text, `m:ss` countdown. Tap selects the session and opens its card.
+- [ ] 10. Empty state "Nothing waiting"; `"N more waiting"` badge under the active card when `pending.count > 1`.
+
+B4. Session list, per-session Stop, auto-advance (0.5-1 day)
+- [ ] 11. `SessionListView`: project, state pill, waiting count, "New session" (uses A's picker). Selecting a row switches `selectedSessionId`; Stop and `cancel()` act on the selected model.
+- [ ] 12. Auto-advance: after an acknowledged decision, select the next pending entry's session and scroll to its card. Settings toggle "Advance to next request", default on.
+- [ ] 13. Tests: sort with mixed nil/non-nil expiry; auto-advance picks the soonest-expiring entry; badge count.
+
+Finish line: against the mock bridge with two sessions both raising approvals, the inbox lists two rows with countdowns, answering the first advances to the second, and the bridge log shows each `approval.resolved` with the right id. 60+ Watch tests green.
+Risks: B2 extraction from a ~1000-line `SessionStore` is the highest-regression step; port the existing 43 tests first (High). Two cards arriving at once must not both speak; speak only the selected session's card (Medium). The mock may need a scripted second-session scenario (Low).
+
+### C. Physical Watch on LAN (M1 feasibility run)
+
+Goal: the app runs on a real Watch against the Mac bridge over home Wi-Fi with auth on, and the M1 numbers are recorded.
+Dependencies: A. Size: 1 day setup + 1 day measurement.
+Files: `apps/watchos/project.yml`, `docs/networking.md`, new `docs/m1-feasibility.md`, `docs/onboarding.md`.
+
+- [ ] 1. Start the bridge with `AGENTREMOTE_PROVIDER=claude AGENTREMOTE_HOST=<Mac LAN IP>` (or `0.0.0.0`), auth ON. Fix the stale "no auth" wording of the `warnNoAuth` message (`server.ts:1247`) in the same PR. Accept the macOS firewall prompt for `bun`.
+- [ ] 2. Device signing in `project.yml`: `CODE_SIGNING_ALLOWED: YES`, `CODE_SIGN_STYLE: Automatic`, `DEVELOPMENT_TEAM` from an untracked `Local.xcconfig`; keep the simulator ad-hoc path. Unverified: whether a free personal team can install a standalone `WKWatchOnly` app.
+- [ ] 3. Install from Xcode with the Watch as run destination (inferred: via the paired iPhone); trust the developer profile on the Watch.
+- [ ] 4. Enter `http://192.168.x.y:8787` in onboarding and pair with the printed code.
+- [ ] 5. ATS: `NSAllowsLocalNetworking` is set; confirm a numeric RFC1918 IP is covered on watchOS 26 (Unverified). Record whether any local network prompt appears.
+- [ ] 6. Measure into `docs/m1-feasibility.md`: approval-to-card latency (10 foreground samples); reconnect time after wrist-down at 30 s, 2 min, 10 min; whether the long poll survives screen off; battery % over 30 min; dictation and on-device speech on hardware.
+
+Finish line: one real approve/deny/question/dictation/Stop loop completed on the physical Watch with auth on, and the feasibility table filled with numbers.
+Risks: signing/provisioning eats the day (High); suspend/wake numbers will look bad, which is what M1 is for.
+
+### D. Background alerts (ADR 007)
+
+Goal: decide how an approval reaches the wrist when the app is not in the foreground.
+Dependencies: C numbers. Size: 2-3 days of experiments, then the ADR.
+Files: new `docs/adr/007-background-delivery.md`, `docs/networking.md`, experiment branches only.
+Options (watchOS API details from memory, Unverified for watchOS 26):
+1. Local notifications scheduled while foregrounded: cannot alert about a request that arrives after suspend. Keep only as an expiry warning for a card already shown.
+2. Background app refresh + background `URLSession` fetch of `/v1/events`: system-budgeted, minutes-scale. Cheapest to try; likely too slow for a 5-minute approval TTL.
+3. APNs push to the standalone Watch app, sent by the Mac bridge with a token-based key: no third-party server, needs a paid Apple developer key and internet on the Mac. Best latency; payload says only "1 request waiting", details fetched on open.
+4. `WKExtendedRuntimeSession`: session types do not fit a dev tool (App Review risk) and are time-limited. Rejected.
+5. iPhone companion (WatchConnectivity + phone notification forwarding): reintroduces the iPhone dependency; fallback only.
+
+- [ ] 1. Spike options 2 and 3 behind `#if DEBUG` flags, one branch each.
+- [ ] 2. Measure request-to-alert latency with wrist down for 1, 5 and 15 min, 10 samples each, plus battery.
+- [ ] 3. Decision rule: cheapest option with p90 latency under 150 s (half the approval TTL); if none, the product stays foreground-only until a relay exists.
+
+Finish line: ADR 007 accepted with the measurement table and the chosen option.
+Risks: APNs needs a paid team and key (Medium); background refresh may be throttled on a dev-signed app (Medium).
+
+### E. Away from home (ADR 006 + relay)
+
+Goal: reach the bridge off the home LAN with the smallest first step.
+Dependencies: C. Size: 0.5 day for option 1; others later.
+Files: new `docs/adr/006-remote-reach.md`, `docs/networking.md`, `docs/onboarding.md`.
+Ranked options:
+1. User-managed public HTTPS tunnel to the loopback bridge (`tailscale funnel 8787` or `cloudflared tunnel`). Zero app code: the Watch takes the `https://` URL, TLS satisfies ATS and adds the confidentiality ADR 008 lacks, the signed envelope still authenticates. Inferred: watchOS has no third-party VPN, so a plain tailnet does not work from the Watch; only the public Funnel/Tunnel form does. Cost: the bridge becomes internet-reachable behind pairing + HMAC, so re-check pairing-code brute force and `rate_limited`; document as opt-in.
+2. Paired-iPhone relay (iPhone on the tailnet, WatchConnectivity to the Watch). Needs an iOS target; only if D picks option 5.
+3. Own E2E-encrypted relay (ADR 003 deferred): needs a key exchange the pairing envelope lacks; not before a wire-encryption ADR.
+
+- [ ] 1. Verify `BridgeClient` accepts an https base URL (and a path prefix via `appending(path:)`).
+- [ ] 2. Run the loop over cellular through option 1 and record latency.
+- [ ] 3. Write ADR 006 with options 2 and 3 deferred.
+
+Finish line: one approval answered from the Watch on cellular through option 1, latency recorded, ADR 006 written.
+
+### F. Mac app: minimal menu bar surface
+
+Goal: replace the CLI for daily use: start/stop the bridge, show the pairing code, list devices and projects, review desk-only approvals.
+Dependencies: A, plus a bridge admin path for desk review. Size: 3-4 days.
+Files: new `apps/macos/` (XcodeGen, SwiftUI `MenuBarExtra`), `bridge/src/server.ts` (admin routes), `bridge/src/auth/*`, `docs/onboarding.md`.
+
+- [ ] 1. Decision needing sign-off: desk-review auth. Recommended: loopback-only `POST /v1/admin/approvals/:id/accept` gated by a bearer token written to `<stateDir>/admin-token` (0600). Alternative: pair the Mac app as a device with a `deskReview: true` flag bypassing the `deskOnly` gate (`server.ts:803`).
+- [ ] 2. Bridge: `GET /v1/admin/interactions` (pending records with `deskOnly` and full action text) and the accept route; both refuse non-loopback peers. Bun tests for both.
+- [ ] 3. Mac app skeleton: `MenuBarExtra` with status (running/stopped, bridge id, provider) and Start/Stop spawning `bun run bridge` via `Process` with the chosen env; reads `devices.json`, `pairing.json`, `projects.json` from the state dir.
+- [ ] 4. Pairing code view: large text, expiry countdown, "New code" runs `bun run bridge pair`.
+- [ ] 5. Devices list with Revoke; projects list with Allow/Deny per device (wraps the CLI).
+- [ ] 6. Desk review list: polls `/v1/admin/interactions` every 2 s while open, shows full action text, Allow/Deny.
+
+Finish line: from the menu bar, start the bridge, pair a simulator Watch with the displayed code, trigger a desk-only approval from the mock provider, accept it on the Mac; the Watch card resolves as "Allowed". `bun run check` green; Mac target builds.
+Risks: spawning bun from a sandboxed app fails, ship unsandboxed for now (Medium); admin token readable by any process of the user, acceptable for v0, note in ADR (Low).
 
 ## Delivery milestones
 
