@@ -130,6 +130,10 @@ struct ConversationView: View {
                         Button("Reply") { dictating = true }
                             .buttonStyle(.bordered)
                             .id("reply-\(store.transcript.count)")
+                        Text(BuildInfo.versionLabel)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("app-build-version")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

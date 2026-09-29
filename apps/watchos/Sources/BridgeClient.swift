@@ -103,6 +103,15 @@ struct SessionsResponse: Decodable, Sendable {
     var sessions: [Session]
 }
 
+struct BridgeInfo: Decodable, Sendable, Equatable {
+    var provider: String
+    var capabilities: AgentCapabilities
+}
+
+private struct ProjectsResponse: Decodable, Sendable {
+    var projects: [Project]
+}
+
 enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case invalidHost(String)
     case http(status: Int, message: String)
@@ -129,6 +138,12 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     /// The approval's `approval.requested` did not show the exact action text (M4 desk-only
     /// gate); the bridge refuses `approval.accept` for it regardless of what the Watch sends.
     case reviewAtDesk
+    /// `POST /v1/pair/start` outside a pairing window (docs/pairing-v0.md, "Pairing").
+    case pairingClosed
+    /// `POST /v1/pair/start` while another request is already pending.
+    case pairingBusy
+    /// A malformed `/v1/pair/start` body, or a commit/reveal mismatch on `/v1/pair/reveal`.
+    case pairingRejected
 
     var description: String {
         switch self {
@@ -149,6 +164,9 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .commandIndeterminate: "The bridge cannot tell whether that command took effect."
         case .interactionNotPending: "That request is no longer waiting for an answer."
         case .reviewAtDesk: "Review this action at the Mac before allowing it."
+        case .pairingClosed: "Run `bun run bridge pair` on your Mac first."
+        case .pairingBusy: "Another pairing is already in progress on the Mac. Wait a moment and try again."
+        case .pairingRejected: "That didn't go through. Start pairing again on your Mac."
         }
     }
 
@@ -169,9 +187,28 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "command_indeterminate": .commandIndeterminate
         case "interaction_not_pending": .interactionNotPending
         case "review_at_desk": .reviewAtDesk
+        case "pairing_closed": .pairingClosed
+        case "pairing_busy": .pairingBusy
+        case "pairing_rejected": .pairingRejected
         default: .http(status: status, message: message)
         }
     }
+}
+
+/// One round of the pairing v2 handshake: the locally-derived 3-digit code the user must match
+/// against the Mac's own display, and the `requestId` used to poll for the operator's decision.
+struct PairingHandshake: Sendable, Equatable {
+    var requestId: String
+    var code: Int
+}
+
+/// The result of one `GET /v1/pair/status` poll.
+enum PairingPollResult: Sendable, Equatable {
+    case pending
+    /// The credential has already been derived and stored by the time this is returned.
+    case approved
+    case denied
+    case expired
 }
 
 private struct ErrorBody: Decodable {
@@ -197,7 +234,18 @@ enum PairingLookup: Sendable, Equatable {
 /// without opening a real network connection.
 protocol BridgeClientProtocol: Sendable {
     func setBaseURL(_ url: URL) async
-    func pair(code: String, deviceName: String) async throws
+    /// Pairing v2 (docs/pairing-v0.md, "Pairing"): generates a fresh X25519 key pair and
+    /// watchNonce, POSTs `/v1/pair/start` then `/v1/pair/reveal`, and returns the locally
+    /// derived 3-digit code plus the `requestId` used for `pollPairing`/`cancelPairing`. Throws
+    /// `.pairingClosed`, `.pairingBusy`, `.rateLimited` or `.pairingRejected` per the route's
+    /// documented error bodies.
+    func beginPairing(deviceName: String) async throws -> PairingHandshake
+    /// Polls `GET /v1/pair/status`. On `.approved` the device credential has already been
+    /// derived (docs/pairing-v0.md, "Derivation") and persisted.
+    func pollPairing(requestId: String) async throws -> PairingPollResult
+    /// `POST /v1/pair/cancel`: the wrong-pick / "None match" path. Always best-effort; the
+    /// caller has already moved the UI on regardless of whether this succeeds.
+    func cancelPairing(requestId: String) async throws
     /// Single atomic read of the credential's pairing state. See `PairingLookup`.
     func pairingLookup() async -> PairingLookup
     /// Re-reads the stored credential from the Keychain and returns the resulting lookup in
@@ -209,6 +257,8 @@ protocol BridgeClientProtocol: Sendable {
     /// permanently undecodable credential does not leave the user stuck on
     /// `PairingCheckFailedView` forever. Only ever invoked from an explicit user action.
     func clearCredential() async throws
+    func info() async throws -> BridgeInfo
+    func projects() async throws -> [Project]
     func events(after: Int, wait: Int) async throws -> EventsPage
     /// `commandId` is the idempotency key: resending the same payload with the same id gets the
     /// bridge's recorded outcome instead of running the command again. `timestamp` goes into
@@ -230,6 +280,11 @@ extension BridgeClientProtocol {
 /// Talks to the Mac Agent Bridge over the HTTP long-poll baseline. One instance per app.
 actor BridgeClient: BridgeClientProtocol {
     static let defaultBaseURL = URL(string: "http://localhost:8787")!
+    /// Pairing calls (start/reveal/status/cancel) are quick request/response round trips, not
+    /// long polls -- the session-wide 60s default (sized for `events`' long poll) would otherwise
+    /// leave the pairing spinner stuck for up to a minute on a dead or unreachable bridge before
+    /// any error, error message, or "Try again" button ever shows.
+    private static let pairingRequestTimeoutSeconds: TimeInterval = 8
 
     private var baseURL: URL
     private let urlSession: URLSession
@@ -242,6 +297,13 @@ actor BridgeClient: BridgeClientProtocol {
     /// "genuinely unpaired" (E-002), and the description can be surfaced via `.checkFailed`
     /// (C2-003).
     private var credentialLoadError: String?
+    /// In-flight pairing v2 state, held only between `beginPairing` and the poll that resolves
+    /// it (`.approved`, `.denied`, `.expired`) or an explicit `cancelPairing`. Never persisted:
+    /// a process restart mid-pairing must start over, matching the bridge's own in-memory-only
+    /// handshake material (docs/pairing-v0.md, "Timing").
+    private var pairingPrivateKey: Curve25519.KeyAgreement.PrivateKey?
+    private var pairingTranscript: String?
+    private var pairingBridgePublicKeyHex: String?
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
@@ -319,50 +381,151 @@ actor BridgeClient: BridgeClientProtocol {
         pairingLookup() == .paired
     }
 
-    /// `POST /v1/pair`: the only signed-off route. Derives the device key locally from the
-    /// pairing code and the bridge's response, and never sends the code or the key over the
-    /// wire (docs/pairing-v0.md, "Enrollment").
-    func pair(code: String, deviceName: String) async throws {
-        struct PairRequestBody: Encodable {
+    /// `POST /v1/pair/start` then `POST /v1/pair/reveal` (docs/pairing-v0.md, "Pairing"): the
+    /// Watch never types anything, it generates its own X25519 key pair and watchNonce, commits
+    /// to the nonce before it learns the bridge's key or nonce, then reveals it. The code
+    /// returned here is derived purely from the transcript both sides now hold; nothing but the
+    /// commitment and the public key ever went over the wire before the reveal.
+    func beginPairing(deviceName: String) async throws -> PairingHandshake {
+        struct StartBody: Encodable {
             var deviceId: String
             var deviceName: String
-            var nonce: String
-            var proof: String
+            var devicePublicKey: String
+            var commit: String
         }
-        struct PairResponseBody: Decodable {
-            var deviceId: String
-            var keyId: String
+        struct StartResponse: Decodable {
+            var requestId: String
             var bridgeId: String
+            var bridgePublicKey: String
+            var bridgeNonce: String
+        }
+        struct RevealBody: Encodable {
+            var requestId: String
+            var watchNonce: String
         }
 
-        let normalizedCode = PairingCode.normalize(code)
-        let deviceId = "dev_" + RequestSigning.randomHex(bytes: 8)
-        let nonce = RequestSigning.randomHex(bytes: 16)
-        let proof = RequestSigning.pairingProof(
-            code: normalizedCode, deviceId: deviceId, deviceName: deviceName, nonce: nonce
-        )
+        let privateKey = Curve25519.KeyAgreement.PrivateKey()
+        let devicePublicKeyHex = hex(privateKey.publicKey.rawRepresentation)
+        let watchNonce = RequestSigning.randomHex(bytes: 16)
+        let commit = RequestSigning.commitment(watchNonce: watchNonce)
 
-        var request = URLRequest(url: baseURL.appending(path: "/v1/pair"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = try encoder.encode(
-            PairRequestBody(deviceId: deviceId, deviceName: deviceName, nonce: nonce, proof: proof)
-        )
+        var startRequest = URLRequest(url: baseURL.appending(path: "/v1/pair/start"))
+        startRequest.httpMethod = "POST"
+        startRequest.timeoutInterval = Self.pairingRequestTimeoutSeconds
+        startRequest.setValue("application/json", forHTTPHeaderField: "content-type")
+        startRequest.httpBody = try encoder.encode(StartBody(
+            deviceId: "dev_" + RequestSigning.randomHex(bytes: 8),
+            deviceName: deviceName,
+            devicePublicKey: devicePublicKeyHex,
+            commit: commit
+        ))
+        let (startData, startResponse) = try await urlSession.data(for: startRequest)
+        try Self.checkStatus(startResponse, data: startData)
+        let started = try decoder.decode(StartResponse.self, from: startData)
 
+        var revealRequest = URLRequest(url: baseURL.appending(path: "/v1/pair/reveal"))
+        revealRequest.httpMethod = "POST"
+        revealRequest.timeoutInterval = Self.pairingRequestTimeoutSeconds
+        revealRequest.setValue("application/json", forHTTPHeaderField: "content-type")
+        revealRequest.httpBody = try encoder.encode(RevealBody(requestId: started.requestId, watchNonce: watchNonce))
+        let (revealData, revealResponse) = try await urlSession.data(for: revealRequest)
+        try Self.checkStatus(revealResponse, data: revealData)
+
+        let transcript = RequestSigning.pairTranscript(
+            bridgeId: started.bridgeId,
+            bridgePublicKeyHex: started.bridgePublicKey,
+            devicePublicKeyHex: devicePublicKeyHex,
+            bridgeNonceHex: started.bridgeNonce,
+            watchNonceHex: watchNonce
+        )
+        let code = RequestSigning.confirmCode(transcript: transcript)
+
+        pairingPrivateKey = privateKey
+        pairingTranscript = transcript
+        pairingBridgePublicKeyHex = started.bridgePublicKey
+
+        return PairingHandshake(requestId: started.requestId, code: code)
+    }
+
+    /// `GET /v1/pair/status?requestId=`. On `approved` derives `deviceKey` from the handshake
+    /// material stashed by `beginPairing` and stores the credential exactly as pairing v1 did.
+    func pollPairing(requestId: String) async throws -> PairingPollResult {
+        struct StatusResponse: Decodable {
+            var status: String
+            var deviceId: String?
+            var keyId: String?
+            var bridgeId: String?
+        }
+
+        var components = URLComponents(url: baseURL.appending(path: "/v1/pair/status"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "requestId", value: requestId)]
+        guard let url = components?.url else { throw BridgeError.invalidHost(baseURL.absoluteString) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = Self.pairingRequestTimeoutSeconds
         let (data, response) = try await urlSession.data(for: request)
         try Self.checkStatus(response, data: data)
-        let decoded = try decoder.decode(PairResponseBody.self, from: data)
+        let decoded = try decoder.decode(StatusResponse.self, from: data)
 
-        let deviceKey = RequestSigning.deriveDeviceKey(code: normalizedCode, deviceId: deviceId, nonce: nonce)
-        let newCredential = DeviceCredential(
-            deviceId: decoded.deviceId,
-            keyId: decoded.keyId,
-            deviceKeyData: deviceKey.withUnsafeBytes { Data($0) },
-            bridgeId: decoded.bridgeId,
-            baseURL: baseURL
-        )
-        try credentialStore.save(newCredential)
-        credential = newCredential
+        switch decoded.status {
+        case "pending":
+            return .pending
+        case "denied":
+            clearPairingHandshakeState()
+            return .denied
+        case "expired", "cancelled":
+            clearPairingHandshakeState()
+            return .expired
+        case "approved":
+            guard
+                let privateKey = pairingPrivateKey,
+                let transcript = pairingTranscript,
+                let bridgePublicKeyHex = pairingBridgePublicKeyHex,
+                let deviceId = decoded.deviceId,
+                let keyId = decoded.keyId,
+                let bridgeId = decoded.bridgeId
+            else {
+                throw BridgeError.malformedResponse("approved pairing status missing enrollment fields")
+            }
+            let shared = try RequestSigning.sharedSecret(privateKey: privateKey, peerPublicKeyHex: bridgePublicKeyHex)
+            let deviceKey = RequestSigning.deriveDeviceKey(shared: shared, transcript: transcript)
+            let newCredential = DeviceCredential(
+                deviceId: deviceId,
+                keyId: keyId,
+                deviceKeyData: deviceKey.withUnsafeBytes { Data($0) },
+                bridgeId: bridgeId,
+                baseURL: baseURL
+            )
+            try credentialStore.save(newCredential)
+            credential = newCredential
+            clearPairingHandshakeState()
+            return .approved
+        default:
+            throw BridgeError.malformedResponse("unknown pairing status \(decoded.status)")
+        }
+    }
+
+    /// `POST /v1/pair/cancel`: always answers 200, so this only surfaces a transport failure.
+    func cancelPairing(requestId: String) async throws {
+        struct CancelBody: Encodable { var requestId: String }
+        var request = URLRequest(url: baseURL.appending(path: "/v1/pair/cancel"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = Self.pairingRequestTimeoutSeconds
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try encoder.encode(CancelBody(requestId: requestId))
+        let (data, response) = try await urlSession.data(for: request)
+        try Self.checkStatus(response, data: data)
+        clearPairingHandshakeState()
+    }
+
+    private func clearPairingHandshakeState() {
+        pairingPrivateKey = nil
+        pairingTranscript = nil
+        pairingBridgePublicKeyHex = nil
+    }
+
+    private func hex(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Long polls for events newer than `after`, waiting up to `wait` seconds for the first one.
@@ -375,6 +538,16 @@ actor BridgeClient: BridgeClientProtocol {
         guard let url = components?.url else { throw BridgeError.invalidHost(baseURL.absoluteString) }
         let data = try await get(url)
         return try EventsPageDecoder.decode(data, using: decoder)
+    }
+
+    func info() async throws -> BridgeInfo {
+        let data = try await get(baseURL.appending(path: "/v1/info"))
+        return try decoder.decode(BridgeInfo.self, from: data)
+    }
+
+    func projects() async throws -> [Project] {
+        let data = try await get(baseURL.appending(path: "/v1/projects"))
+        return try decoder.decode(ProjectsResponse.self, from: data).projects
     }
 
     func sessions() async throws -> [Session] {

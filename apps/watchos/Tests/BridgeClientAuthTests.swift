@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import AgentRemoteProtocol
 #if canImport(Darwin)
@@ -178,9 +179,10 @@ private extension Array {
 /// docs/pairing-v0.md.
 final class BridgeClientAuthTests: XCTestCase {
     private func makeCredential() -> DeviceCredential {
-        let key = RequestSigning.deriveDeviceKey(
-            code: "ABCDEFGHJKMN", deviceId: "dev_9f2c4a1b7d3e5061", nonce: "00112233445566778899aabbccddeeff"
-        )
+        // Any fixed 32-byte key works here: these tests exercise header construction and error
+        // mapping, not the pairing v2 derivation itself (covered separately in RequestSigning's
+        // own tests and testPairSuccessEnrollsAndYieldsAUsableCredential).
+        let key = SymmetricKey(size: .bits256)
         return DeviceCredential(
             deviceId: "dev_9f2c4a1b7d3e5061",
             keyId: "key_cd7749ef",
@@ -276,28 +278,38 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 409, code: nil, message: "stale binding"), .http(status: 409, message: "stale binding"))
     }
 
-    /// Covers R-004: a well-formed `POST /v1/pair` response must enroll the device and leave
-    /// behind a credential that subsequent requests can actually sign with -- specifically the
-    /// server's own `deviceId`, not whatever id the client generated locally before it knew
-    /// what the bridge would assign.
+    /// Covers R-004 for pairing v2: a well-formed `/v1/pair/start` + `/v1/pair/reveal` +
+    /// `/v1/pair/status` (approved) sequence must enroll the device and leave behind a
+    /// credential that subsequent requests can actually sign with -- specifically the server's
+    /// own `deviceId`, not whatever id the client generated locally before it knew what the
+    /// bridge would assign.
     func testPairSuccessEnrollsAndYieldsAUsableCredential() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
+        let bridgePublicKey = String(repeating: "11", count: 32)
         server.respondOnce(
             statusLine: "HTTP/1.1 200 OK",
-            body: #"{"deviceId":"dev_serverassigned01","keyId":"key_aaaa1111","bridgeId":"brg_87654321"}"#
+            body: #"{"requestId":"par_test01","bridgeId":"brg_87654321","bridgePublicKey":"\#(bridgePublicKey)","bridgeNonce":"00112233445566778899aabbccddeeff","expiresAt":"2026-09-20T10:15:00.000Z"}"#
+        )
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"status":"pending","expiresAt":"2026-09-20T10:15:00.000Z"}"#)
+        server.respondOnce(
+            statusLine: "HTTP/1.1 200 OK",
+            body: #"{"status":"approved","deviceId":"dev_serverassigned01","keyId":"key_aaaa1111","pairedAt":"2026-09-20T10:15:00.000Z","bridgeId":"brg_87654321","allowedProjects":[],"allowedActions":[]}"#
         )
 
         let credentialStore = InMemoryCredentialStore()
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
 
         let pairedBefore = await client.isPaired()
-        XCTAssertFalse(pairedBefore, "must not be paired before pair() runs")
-        try await client.pair(code: "ABCDEFGHJKMN", deviceName: "Test Watch")
+        XCTAssertFalse(pairedBefore, "must not be paired before pairing runs")
+        let handshake = try await client.beginPairing(deviceName: "Test Watch")
+        XCTAssertEqual(handshake.requestId, "par_test01")
+        let result = try await client.pollPairing(requestId: handshake.requestId)
+        XCTAssertEqual(result, .approved)
 
         let pairedAfter = await client.isPaired()
         XCTAssertTrue(pairedAfter)
-        let stored = try XCTUnwrap(credentialStore.load(), "pair() must persist a credential")
+        let stored = try XCTUnwrap(credentialStore.load(), "an approved pairing must persist a credential")
         XCTAssertEqual(stored.deviceId, "dev_serverassigned01", "the stored credential must use the bridge's assigned deviceId")
         XCTAssertEqual(stored.keyId, "key_aaaa1111")
         XCTAssertEqual(stored.bridgeId, "brg_87654321")
@@ -309,32 +321,27 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-AgentRemote-Device"), "dev_serverassigned01")
     }
 
-    /// Covers R-004: when the bridge rejects the pairing code, `pair()` must throw rather than
-    /// silently leaving the caller thinking it enrolled, and no credential may be persisted.
+    /// Covers R-004 for pairing v2: when the bridge refuses `/v1/pair/start` outside a pairing
+    /// window, `beginPairing()` must throw `.pairingClosed` rather than silently leaving the
+    /// caller thinking it enrolled, and no credential may be persisted.
     func testPairFailureSurfacesErrorAndDoesNotEnroll() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
-        // The real bridge answers every rejected pairing code the same way -- "pairing_rejected"
-        // at 401 -- per bridge/src/server.ts's handlePair (malformed body, wrong/expired/exhausted
-        // code, and malformed proof all share this response so an attacker can't distinguish them).
         server.respondOnce(
-            statusLine: "HTTP/1.1 401 Unauthorized",
-            body: #"{"error":"pairing_rejected"}"#
+            statusLine: "HTTP/1.1 403 Forbidden",
+            body: #"{"error":"pairing_closed"}"#
         )
 
         let credentialStore = InMemoryCredentialStore()
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
 
         do {
-            try await client.pair(code: "000000000000", deviceName: "Test Watch")
-            XCTFail("expected pair() to throw when the bridge rejects the pairing code")
-        } catch BridgeError.http(let status, let message) {
-            // "pairing_rejected" has no dedicated BridgeError case today, so BridgeError.from
-            // falls back to .http -- the failure still surfaces instead of being swallowed.
-            XCTAssertEqual(status, 401)
-            XCTAssertEqual(message, "pairing_rejected")
+            _ = try await client.beginPairing(deviceName: "Test Watch")
+            XCTFail("expected beginPairing() to throw when the bridge refuses /v1/pair/start")
+        } catch BridgeError.pairingClosed {
+            // Expected: no pairing window is open on the bridge.
         } catch {
-            XCTFail("expected .http(401, \"pairing_rejected\"), got \(error)")
+            XCTFail("expected .pairingClosed, got \(error)")
         }
 
         let pairedAfterFailure = await client.isPaired()

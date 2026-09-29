@@ -35,6 +35,25 @@ final class OnboardingViewTests: XCTestCase {
         XCTAssertTrue(OnboardingView.canAdvanceFromHostStep(host: "http://localhost:8799"))
     }
 
+    // MARK: - hostIsFromLaunchArgument
+
+    /// A host merely persisted from an earlier run (any value, even a non-default, currently
+    /// unreachable one) must NOT skip the `findingMac` discovery step -- the bug this fix
+    /// addresses: onboarding used to skip discovery whenever the saved host differed from the
+    /// default, which included a stale host left over from a dead bridge.
+    func testHostIsFromLaunchArgument_persistedHostOnly_isFalse() {
+        XCTAssertFalse(OnboardingView.hostIsFromLaunchArgument(argumentDomain: [:]))
+    }
+
+    /// CoreScreensUITests launches with `-dev.agentremote.watch.host <value>`, which lands in
+    /// the UserDefaults argument domain under that same key. Only that case should skip
+    /// discovery.
+    func testHostIsFromLaunchArgument_launchArgumentHost_isTrue() {
+        XCTAssertTrue(
+            OnboardingView.hostIsFromLaunchArgument(argumentDomain: ["dev.agentremote.watch.host": "http://localhost:8799"])
+        )
+    }
+
     // MARK: - shouldShowDefaultHostHint
 
     /// C3-005: the untouched default parses as valid (no red error) but still can't advance,
@@ -50,12 +69,16 @@ final class OnboardingViewTests: XCTestCase {
 
     // MARK: - previousStep
 
-    func testPreviousStep_fromPairingCode_isHostAddress() {
-        XCTAssertEqual(OnboardingView.previousStep(.pairingCode), .hostAddress)
+    func testPreviousStep_fromMatchCode_isFindingMac() {
+        XCTAssertEqual(OnboardingView.previousStep(.matchCode), .findingMac)
     }
 
-    func testPreviousStep_fromHostAddress_isMacSetup() {
-        XCTAssertEqual(OnboardingView.previousStep(.hostAddress), .macSetup)
+    func testPreviousStep_fromHostAddress_isFindingMac() {
+        XCTAssertEqual(OnboardingView.previousStep(.hostAddress), .findingMac)
+    }
+
+    func testPreviousStep_fromFindingMac_isMacSetup() {
+        XCTAssertEqual(OnboardingView.previousStep(.findingMac), .macSetup)
     }
 
     func testPreviousStep_fromMacSetup_staysMacSetup() {
