@@ -90,7 +90,13 @@ struct OnboardingView: View {
                 // Reused as-is: a successful pair flips store.paired and RootView swaps this
                 // whole view out for the TabView, so PairingView has nothing left to dismiss.
                 PairingView(onFindMyMac: { step = .findingMac })
-                    .toolbar { backButton { step = Self.previousStep(step) } }
+                    .toolbar {
+                        backButton {
+                            // Free the live handshake so re-entering matchCode restarts it.
+                            Task { await store.cancelPairing() }
+                            step = Self.previousStep(step)
+                        }
+                    }
             }
         }
     }

@@ -969,9 +969,10 @@ final class SessionStore {
         }
         await refreshBridgeConfiguration()
         guard let bridgeInfo, let selectedProjectId else {
-            statusLine = authorizedProjects.isEmpty
-                ? "No authorized project is available"
-                : "Choose a project before creating a session"
+            statusLine = configurationError
+                ?? (authorizedProjects.isEmpty
+                    ? "No authorized project is available"
+                    : "Choose a project before creating a session")
             statusKind = .error
             return nil
         }

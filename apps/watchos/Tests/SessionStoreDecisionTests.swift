@@ -434,6 +434,18 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
+    func testConfigurationErrorBlocksSessionCreationWithItsOwnMessage() async {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.failure(URLError(.notConnectedToInternet)))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let attempt = await store.createSession()
+        XCTAssertNil(attempt)
+        XCTAssertEqual(store.statusLine, "Could not load provider and projects")
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
     func testMetadataFailureDoesNotFallBackToMock() async {
         let client = FakeBridgeClient()
         await client.setInfoResult(.failure(BridgeError.http(status: 503, message: "unavailable")))
@@ -2911,6 +2923,30 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.pairingPhase, .cancelled)
         let cancelCount = await client.cancelPairingCallCount
         XCTAssertEqual(cancelCount, 1)
+    }
+
+    /// The matchCode back button cancels the live handshake; the next beginPairing() starts a
+    /// fresh one with a new requestId.
+    func testCancelThenBeginPairingStartsAFreshHandshake() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_first", code: 111)))
+        await store.beginPairing()
+        guard case .choosing = store.pairingPhase else {
+            return XCTFail("expected .choosing after the first beginPairing()")
+        }
+
+        await store.cancelPairing()
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_second", code: 222)))
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after restarting")
+        }
+        XCTAssertEqual(correct, 222)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_first"])
     }
 
     /// A `beginPairing()` whose network call is still in flight must not overwrite a
