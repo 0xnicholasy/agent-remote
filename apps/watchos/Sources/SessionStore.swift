@@ -986,7 +986,8 @@ final class SessionStore {
             // moved on to a new generation, otherwise this would rebind to a stale session.
             guard let created = response.sessionId,
                   generation == pollGeneration,
-                  configuration == configurationGeneration else {
+                  configuration == configurationGeneration,
+                  sessionId == nil || sessionId == created else {
                 // The rebind guard rejected this response: the id it carries is not (and must
                 // not become) the store's session, so callers like sendPrompt() must not treat
                 // it as a valid target either.
