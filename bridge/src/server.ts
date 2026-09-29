@@ -24,7 +24,6 @@ import {
   UnknownSessionError,
 } from "@agentremote/protocol";
 import { ClaudeProvider } from "@agentremote/provider-claude";
-import { CodexProvider } from "@agentremote/provider-codex";
 
 import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, type MockProviderOptions } from "./providers/mock";
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
@@ -96,14 +95,14 @@ export interface BridgeInfoResponse {
   capabilities: AgentProvider["capabilities"];
 }
 
-/** Options accepted by `createBridge`. Provider factories exist for tests: they let a test wire
- * a real-provider branch without constructing an adapter that spawns its agent subprocess.
- * Production code never passes them, so the defaults build the real providers. The auth-related options
+/** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
+ * test wire `AGENTREMOTE_PROVIDER=claude` without constructing a real `ClaudeProvider`, which
+ * would spawn the Claude Agent SDK's subprocess. Production code never passes it, so the
+ * default keeps building the real `ClaudeProvider` exactly as before. The auth-related options
  * below exist for the same reason: tests need to inject a registry/clock/auth-off flag without
  * ever touching the real `~/.agentremote`; production always uses the defaults. */
 export interface CreateBridgeOptions {
   createClaudeProvider?: (host: ProviderHost, options: { projects: Project[] }) => SeedableProvider;
-  createCodexProvider?: (host: ProviderHost, options: { projects: Project[] }) => SeedableProvider;
   /** Injects a `DeviceRegistry` instance directly, e.g. so a test can inspect registered
    * devices in memory. Production always builds its own from `devicesFilePath`. */
   registry?: DeviceRegistry;
@@ -118,7 +117,7 @@ export interface CreateBridgeOptions {
   authEnabled?: boolean;
   /** Passed straight through to `MockProvider` when it is the selected provider. Exists so tests
    * can exercise its approval/question expiry timers with a short `ttlMs` instead of waiting out
-   * the production default. Ignored when a real provider is selected. */
+   * the production default. Ignored when `AGENTREMOTE_PROVIDER=claude`. */
   mockProviderOptions?: MockProviderOptions;
 }
 
@@ -157,7 +156,7 @@ function loadOrCreateBridgeId(filePath: string | undefined): string {
   return bridgeId;
 }
 
-const VALID_PROVIDER_IDS = ["mock", "claude", "codex"] as const;
+const VALID_PROVIDER_IDS = ["mock", "claude"] as const;
 type ValidProviderId = (typeof VALID_PROVIDER_IDS)[number];
 
 function isValidProviderId(value: string): value is ValidProviderId {
@@ -356,6 +355,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const PAIR_RATE_LIMIT_WINDOW_MS = 60_000;
   const PAIR_RATE_LIMIT_MAX_STARTS = 6;
   const pairRateLimitStarts: number[] = [];
+  // Field formats the Swift client already sends (lowercase hex via `%02x`, `dev_` + 16 hex).
+  const PAIR_DEVICE_ID_PATTERN = /^dev_[0-9a-f]{16}$/;
+  const PAIR_DEVICE_NAME_PATTERN = /^[^\p{Cc}]{1,64}$/u;
+  const PAIR_KEY_HEX_PATTERN = /^[0-9a-f]{64}$/;
+  const PAIR_COMMIT_HEX_PATTERN = /^[0-9a-f]{64}$/;
+  const PAIR_REQUEST_ID_PATTERN = /^par_[0-9a-f]{16}$/;
+  const PAIR_WATCH_NONCE_PATTERN = /^[0-9a-f]{32}$/;
 
   // A bridge restart must not resurrect a pairing attempt from a previous process: the private
   // key that attempt was validated against no longer exists in memory anywhere.
@@ -388,6 +394,14 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     transcript: string;
   }
   let revealedPairing: RevealedPairing | undefined;
+
+  // The outcome of the one approval this process has completed. A status poll whose response was
+  // lost re-polls the same requestId; answering from this cache (until the record's own
+  // expiresAt) keeps that retry idempotent and lets concurrent polls share one registration. The
+  // cached body carries no secret: the device key is derived locally on the Watch.
+  let approvedPairing:
+    | { requestId: string; expiresAtMs: number; result: Promise<Record<string, unknown>> }
+    | undefined;
 
   // The event log and the command journal are both durable (docs/durability-v0.md): a client
   // reconnecting after a bridge restart resolves its cursor against retained events, and a retry
@@ -554,19 +568,14 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   let provider: SeedableProvider;
   let seedProjectId: string;
   let resolvedProjects: Project[];
-  if (providerId !== "mock") {
+  if (providerId === "claude") {
     // `resolveProjectIds` throws `AGENTREMOTE_PROJECT_DIRS must contain only absolute paths` for
     // a non-absolute entry, and falls back to `process.cwd()` when the variable is unset, blank,
     // or parses to zero usable directories, so seedSession's later "unknown projectId" lookup
     // never sees an empty project list. See projects.ts for the shared resolution logic.
     const projects: Project[] = resolveProjectIds(process.env, process.cwd());
-    if (providerId === "claude") {
-      const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
-      provider = createClaudeProvider(host, { projects });
-    } else {
-      const createCodexProvider = options.createCodexProvider ?? ((h, o) => new CodexProvider(h, o));
-      provider = createCodexProvider(host, { projects });
-    }
+    const createClaudeProvider = options.createClaudeProvider ?? ((h, o) => new ClaudeProvider(h, o));
+    provider = createClaudeProvider(host, { projects });
     seedProjectId = projects[0]?.id ?? projectIdFor(process.cwd());
     resolvedProjects = projects;
   } else {
@@ -951,9 +960,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     const record = value as Record<string, unknown>;
     return (
       typeof record.deviceId === "string" &&
+      PAIR_DEVICE_ID_PATTERN.test(record.deviceId) &&
       typeof record.deviceName === "string" &&
+      PAIR_DEVICE_NAME_PATTERN.test(record.deviceName) &&
       typeof record.devicePublicKey === "string" &&
-      typeof record.commit === "string"
+      PAIR_KEY_HEX_PATTERN.test(record.devicePublicKey) &&
+      typeof record.commit === "string" &&
+      PAIR_COMMIT_HEX_PATTERN.test(record.commit)
     );
   }
 
@@ -1007,6 +1020,20 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ error: "pairing_rejected" }, 401);
     }
 
+    // An id that is already registered (including a revoked one) can never be re-paired: this
+    // keeps the CLI's "registry has the deviceId" success check sound and stops a start from
+    // overwriting an existing record.
+    if (registry.get(body.deviceId) !== undefined) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+    // Import the device key once, here, so a value that is well-formed hex but not a usable
+    // X25519 point (including a low-order one) is rejected now rather than failing at status.
+    try {
+      sharedSecret(bridgeKeyPair.privateKey, body.devicePublicKey);
+    } catch {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
     pairRateLimitStarts.push(nowMs);
 
     const requestId = `par_${randomBytes(8).toString("hex")}`;
@@ -1041,7 +1068,12 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return false;
     }
     const record = value as Record<string, unknown>;
-    return typeof record.requestId === "string" && typeof record.watchNonce === "string";
+    return (
+      typeof record.requestId === "string" &&
+      PAIR_REQUEST_ID_PATTERN.test(record.requestId) &&
+      typeof record.watchNonce === "string" &&
+      PAIR_WATCH_NONCE_PATTERN.test(record.watchNonce)
+    );
   }
 
   /** `POST /v1/pair/reveal`. Every failure — malformed body, unknown/expired requestId, a
@@ -1139,6 +1171,13 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ status: "expired" });
     }
 
+    if (approvedPairing?.requestId === requestId) {
+      if (now().getTime() < approvedPairing.expiresAtMs) {
+        return json(await approvedPairing.result);
+      }
+      approvedPairing = undefined;
+    }
+
     const pending = readPendingPair(pendingPairStateDir);
     if (pending === undefined || pending.requestId !== requestId) {
       return json({ status: "expired" });
@@ -1160,7 +1199,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ status: "pending" });
     }
 
+    // Taken synchronously, before any await, so a concurrent poll cannot consume it twice.
     const revealed = revealedPairing;
+    revealedPairing = undefined;
     if (revealed === undefined || revealed.requestId !== requestId) {
       // The approval landed after this process lost the in-memory transcript (a restart mid
       // approval); nothing recoverable without the private key/nonce, which never touched disk.
@@ -1168,35 +1209,50 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ status: "expired" });
     }
 
-    const deviceKey = deriveDeviceKeyV2(sharedSecret(bridgeKeyPair.privateKey, revealed.devicePublicKeyHex), revealed.transcript);
-    const keyId = keyIdFor(deviceKey);
-    const pairedAt = now().toISOString();
-    const projects = await provider.listProjects();
-    const record: DeviceRecord = {
-      deviceId: pending.deviceId,
-      deviceName: pending.deviceName,
-      keyId,
-      deviceKeyHex: deviceKey.toString("hex"),
-      pairedAt,
-      allowedProjects: projects.map((project) => project.id),
-      allowedActions: [...ALL_COMMAND_ACTIONS],
-      revokedAt: null,
-      lastSeenAt: null,
-    };
-    registry.register(record);
-    revealedPairing = undefined;
-    clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
-    clearPairingWindow(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
-
-    return json({
-      status: "approved",
-      deviceId: record.deviceId,
-      keyId: record.keyId,
-      pairedAt: record.pairedAt,
-      bridgeId,
-      allowedProjects: record.allowedProjects,
-      allowedActions: record.allowedActions,
-    });
+    const stateDir = pendingPairStateDir;
+    const result = (async (): Promise<Record<string, unknown>> => {
+      let deviceKey: Buffer;
+      let keyId: string;
+      try {
+        deviceKey = deriveDeviceKeyV2(sharedSecret(bridgeKeyPair.privateKey, revealed.devicePublicKeyHex), revealed.transcript);
+        keyId = keyIdFor(deviceKey);
+      } catch (error) {
+        console.error(`pairing: key derivation failed for ${requestId}`, error);
+        clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
+        return { status: "expired" };
+      }
+      const pairedAt = now().toISOString();
+      const projects = await provider.listProjects();
+      const stillPending = readPendingPair(stateDir);
+      if (stillPending === undefined || stillPending.requestId !== requestId) {
+        return { status: "expired" };
+      }
+      const record: DeviceRecord = {
+        deviceId: pending.deviceId,
+        deviceName: pending.deviceName,
+        keyId,
+        deviceKeyHex: deviceKey.toString("hex"),
+        pairedAt,
+        allowedProjects: projects.map((project) => project.id),
+        allowedActions: [...ALL_COMMAND_ACTIONS],
+        revokedAt: null,
+        lastSeenAt: null,
+      };
+      registry.register(record);
+      clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      clearPairingWindow(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      return {
+        status: "approved",
+        deviceId: record.deviceId,
+        keyId: record.keyId,
+        pairedAt: record.pairedAt,
+        bridgeId,
+        allowedProjects: record.allowedProjects,
+        allowedActions: record.allowedActions,
+      };
+    })();
+    approvedPairing = { requestId, expiresAtMs: new Date(pending.expiresAt).getTime(), result };
+    return json(await result);
   }
 
   async function handleEvents(url: URL, device: DeviceRecord | undefined): Promise<Response> {
@@ -1430,16 +1486,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
  * `AGENTREMOTE_HOST` unset: real providers (which execute real host tool calls) default
  * to loopback-only; the mock provider is left on Bun's own default (binds all interfaces),
  * matching its pre-existing behavior. `AGENTREMOTE_HOST` set explicitly always wins, and a
- * non-loopback value with a real provider is flagged when authentication is disabled. */
+ * non-loopback value with the claude provider is flagged since this bridge has no auth. */
 export function resolveBindHost(
   providerId: string,
   envHost: string | undefined,
 ): { hostname: string | undefined; warnNoAuth: boolean } {
   const explicit = envHost?.trim();
   if (explicit !== undefined && explicit.length > 0) {
-    return { hostname: explicit, warnNoAuth: providerId !== "mock" && !isLoopbackHost(explicit) };
+    return { hostname: explicit, warnNoAuth: providerId === "claude" && !isLoopbackHost(explicit) };
   }
-  if (providerId !== "mock") {
+  if (providerId === "claude") {
     return { hostname: "127.0.0.1", warnNoAuth: false };
   }
   return { hostname: undefined, warnNoAuth: false };
@@ -1451,7 +1507,7 @@ export function isLoopbackHost(host: string | undefined): boolean {
 }
 
 /** The "Development bypass" refusal from docs/pairing-v0.md: `AGENTREMOTE_AUTH=off` must not
- * start with a real provider (which executes real host tool calls) on a bind host other
+ * start with the claude provider (which executes real host tool calls) on a bind host other
  * than loopback, since that combination is an unauthenticated endpoint reachable off the box.
  * Throws to refuse startup; does nothing when auth is enabled or the combination is safe. */
 export function assertAuthBypassAllowed(params: {
@@ -1459,11 +1515,11 @@ export function assertAuthBypassAllowed(params: {
   providerId: string;
   hostname: string | undefined;
 }): void {
-  if (params.authEnabled || params.providerId === "mock" || isLoopbackHost(params.hostname)) {
+  if (params.authEnabled || params.providerId !== "claude" || isLoopbackHost(params.hostname)) {
     return;
   }
   throw new Error(
-    `AGENTREMOTE_AUTH=off refuses to start with the ${params.providerId} provider bound to ${params.hostname ?? "all interfaces"}: ` +
+    `AGENTREMOTE_AUTH=off refuses to start with the claude provider bound to ${params.hostname ?? "all interfaces"}: ` +
       "that combination is an unauthenticated endpoint that can execute real tool calls on a reachable address. " +
       "Set AGENTREMOTE_HOST=127.0.0.1 or leave AGENTREMOTE_AUTH enabled.",
   );

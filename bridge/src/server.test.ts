@@ -646,45 +646,18 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
     }
   });
 
-  test("AGENTREMOTE_PROVIDER=codex wires the codex provider with the configured cwd", async () => {
-    process.env.AGENTREMOTE_PROVIDER = "codex";
-    const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
-    delete process.env.AGENTREMOTE_PROJECT_DIRS;
-    try {
-      let receivedProjects: Project[] = [];
-      const codexBridge = createBridge({
-        authEnabled: false,
-        createCodexProvider: (host, providerOptions) => {
-          receivedProjects = providerOptions.projects;
-          return new StubClaudeProvider(host, providerOptions, "codex");
-        },
-      });
-      expect(codexBridge.provider.id).toBe("codex");
-      expect(codexBridge.session.provider).toBe("codex");
-      expect(receivedProjects.map((project) => project.path)).toEqual([process.cwd()]);
-      codexBridge.close();
-    } finally {
-      if (originalDirs === undefined) {
-        delete process.env.AGENTREMOTE_PROJECT_DIRS;
-      } else {
-        process.env.AGENTREMOTE_PROJECT_DIRS = originalDirs;
-      }
-      restoreProviderEnv();
-    }
-  });
-
-  test("bridge close disposes the codex provider before returning", () => {
-    process.env.AGENTREMOTE_PROVIDER = "codex";
+  test("bridge close disposes the claude provider before returning", () => {
+    process.env.AGENTREMOTE_PROVIDER = "claude";
     try {
       let stub: StubClaudeProvider | undefined;
-      const codexBridge = createBridge({
+      const claudeBridge = createBridge({
         authEnabled: false,
-        createCodexProvider: (host, providerOptions) => {
-          stub = new StubClaudeProvider(host, providerOptions, "codex");
+        createClaudeProvider: (host, providerOptions) => {
+          stub = new StubClaudeProvider(host, providerOptions);
           return stub;
         },
       });
-      codexBridge.close();
+      claudeBridge.close();
       expect(stub?.disposeCallCount).toBe(1);
     } finally {
       restoreProviderEnv();
@@ -1275,16 +1248,8 @@ describe("resolveBindHost", () => {
     expect(resolveBindHost("mock", undefined)).toEqual({ hostname: undefined, warnNoAuth: false });
   });
 
-  test("defaults the codex provider to loopback when AGENTREMOTE_HOST is unset", () => {
-    expect(resolveBindHost("codex", undefined)).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
-  });
-
   test("an explicit non-loopback AGENTREMOTE_HOST with the claude provider warns", () => {
     expect(resolveBindHost("claude", "0.0.0.0")).toEqual({ hostname: "0.0.0.0", warnNoAuth: true });
-  });
-
-  test("an explicit non-loopback AGENTREMOTE_HOST with the codex provider warns", () => {
-    expect(resolveBindHost("codex", "0.0.0.0")).toEqual({ hostname: "0.0.0.0", warnNoAuth: true });
   });
 
   test("an explicit loopback AGENTREMOTE_HOST never warns", () => {
@@ -1303,12 +1268,6 @@ describe("assertAuthBypassAllowed", () => {
     expect(() =>
       assertAuthBypassAllowed({ authEnabled: false, providerId: "claude", hostname: "127.0.0.1" }),
     ).not.toThrow();
-  });
-
-  test("refuses AGENTREMOTE_AUTH=off with the codex provider bound to a non-loopback host", () => {
-    expect(() =>
-      assertAuthBypassAllowed({ authEnabled: false, providerId: "codex", hostname: "0.0.0.0" }),
-    ).toThrow(/AGENTREMOTE_AUTH=off refuses to start/);
   });
 
   test("permits AGENTREMOTE_AUTH=off with the mock provider bound to a non-loopback host", () => {
@@ -1855,7 +1814,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_bad_commit",
+          deviceId: "dev_b0000000000000c1",
           deviceName: "Watch",
           devicePublicKey: watch.publicKeyHex,
           commit: commitment("aa".repeat(16)),
@@ -1887,7 +1846,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_slow_reveal",
+          deviceId: "dev_5100000000000001",
           deviceName: "Watch",
           devicePublicKey: watch.publicKeyHex,
           commit: commitment(watchNonce),
@@ -1917,7 +1876,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_first",
+          deviceId: "dev_f000000000000001",
           deviceName: "Watch",
           devicePublicKey: first.publicKeyHex,
           commit: commitment("dd".repeat(16)),
@@ -1931,7 +1890,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_second",
+          deviceId: "dev_5000000000000002",
           deviceName: "Watch 2",
           devicePublicKey: second.publicKeyHex,
           commit: commitment("ee".repeat(16)),
@@ -1970,7 +1929,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_new_watch",
+          deviceId: "dev_0e00000000000001",
           deviceName: "Apple Watch",
           devicePublicKey: watch.publicKeyHex,
           commit: commitment("ff".repeat(16)),
@@ -2017,10 +1976,10 @@ describe("pairing", () => {
     }
 
     for (let i = 0; i < 6; i++) {
-      const response = await attemptStart(`dev_rate_${i}`);
+      const response = await attemptStart(`dev_${i.toString(16).padStart(16, "0")}`);
       expect(response.status).toBe(200);
     }
-    const seventh = await attemptStart("dev_rate_6");
+    const seventh = await attemptStart("dev_0000000000000006");
     expect(seventh.status).toBe(429);
     expect(await seventh.json()).toEqual({ error: "rate_limited" });
   });
@@ -2034,7 +1993,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_cancel_me",
+          deviceId: "dev_ca00000000000001",
           deviceName: "Watch",
           devicePublicKey: first.publicKeyHex,
           commit: commitment("ff".repeat(16)),
@@ -2058,7 +2017,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_after_cancel",
+          deviceId: "dev_ca00000000000002",
           deviceName: "Watch",
           devicePublicKey: second.publicKeyHex,
           commit: commitment("11".repeat(16)),
@@ -2092,7 +2051,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_expiring",
+          deviceId: "dev_e000000000000001",
           deviceName: "Watch",
           devicePublicKey: watch.publicKeyHex,
           commit: commitment(watchNonce),
@@ -2129,6 +2088,225 @@ describe("pairing", () => {
     expect(await response.json()).toEqual({ error: "pairing_rejected" });
   });
 
+  /** Posts a raw `/v1/pair/start` body built from valid defaults plus `overrides`. */
+  async function startWith(target: Bridge, overrides: Record<string, string>): Promise<Response> {
+    const watch = generateX25519KeyPair();
+    return target.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: `dev_${randomBytes(8).toString("hex")}`,
+          deviceName: "Apple Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment(randomBytes(16).toString("hex")),
+          ...overrides,
+        }),
+      }),
+    );
+  }
+
+  async function revealWith(target: Bridge, body: { requestId: string; watchNonce: string }): Promise<Response> {
+    return target.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+  }
+
+  async function statusOf(target: Bridge, requestId: string): Promise<Record<string, unknown>> {
+    const response = await target.fetch(new Request(`http://bridge.local/v1/pair/status?requestId=${requestId}`));
+    return (await response.json()) as Record<string, unknown>;
+  }
+
+  const MALFORMED_START_FIELDS: ReadonlyArray<readonly [string, Record<string, string>]> = [
+    ["a non-hex devicePublicKey", { devicePublicKey: "zz" }],
+    ["a 31-byte devicePublicKey", { devicePublicKey: "ab".repeat(31) }],
+    ["a deviceId without the dev_ + 16 hex shape", { deviceId: "dev_new_watch" }],
+    ["a deviceName with a control character", { deviceName: "\u001b[31mWatch" }],
+    ["a 65-character deviceName", { deviceName: "n".repeat(65) }],
+    ["a 63-character commit", { commit: `${"ab".repeat(31)}a` }],
+  ];
+
+  for (const [label, overrides] of MALFORMED_START_FIELDS) {
+    test(`/v1/pair/start rejects ${label} with 401 pairing_rejected`, async () => {
+      const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+      openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+      const response = await startWith(pairBridge, overrides);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: "pairing_rejected" });
+    });
+  }
+
+  test("/v1/pair/start rejects a low-order X25519 key at start, not with a 500 at status", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const response = await startWith(pairBridge, { devicePublicKey: "00".repeat(32) });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+  });
+
+  test("/v1/pair/reveal rejects a 31-hex watchNonce with 401 pairing_rejected", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const startResponse = await startWith(pairBridge, {});
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+    const response = await revealWith(pairBridge, { requestId, watchNonce: "a".repeat(31) });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+  });
+
+  test("/v1/pair/start refuses a deviceId that is already registered and leaves a revoked record revoked", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    const revokedAt = new Date(FIXED_NOW.getTime() - 60_000).toISOString();
+    const existing = sampleDeviceRecord({ deviceId: "dev_a000000000000001", keyId: "key_existing", revokedAt });
+    registry.register(existing);
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+
+    const response = await startWith(pairBridge, { deviceId: existing.deviceId });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+    const after = DeviceRegistry.load(devicesFilePath).get(existing.deviceId);
+    expect(after?.keyId).toBe("key_existing");
+    expect(after?.revokedAt).toBe(revokedAt);
+  });
+
+  test("re-polling an approved requestId returns the same body and registers the device once", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const { requestId, statusBody } = await pairDevice(pairBridge);
+    expect(statusBody.status).toBe("approved");
+
+    expect(await statusOf(pairBridge, requestId)).toEqual(statusBody);
+    expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(1);
+  });
+
+  test("two concurrent status polls after approval both answer approved with one registration", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watchNonce = "44".repeat(16);
+    const startResponse = await startWith(pairBridge, { commit: commitment(watchNonce) });
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+    await revealWith(pairBridge, { requestId, watchNonce });
+    setPendingPairDecision(stateDir, requestId, "approved", 2000);
+
+    const [first, second] = await Promise.all([statusOf(pairBridge, requestId), statusOf(pairBridge, requestId)]);
+    expect(first.status).toBe("approved");
+    expect(second).toEqual(first);
+    expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(1);
+  });
+
+  test("a status poll with a different requestId after approval still answers expired", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    await pairDevice(pairBridge);
+    expect(await statusOf(pairBridge, `par_${"0".repeat(16)}`)).toEqual({ status: "expired" });
+  });
+
+  test("/v1/pair/start is accepted one millisecond before the window expires and closed at expiry", async () => {
+    let current = FIXED_NOW;
+    const pairBridge = createBridge({ devicesFilePath, now: () => current });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+
+    current = new Date(FIXED_NOW.getTime() + 119_999);
+    expect((await startWith(pairBridge, {})).status).toBe(200);
+
+    const closedBridge = createBridge({ devicesFilePath: join(stateDir, "other", "devices.json"), now: () => current });
+    openPairingWindow(join(stateDir, "other"), FIXED_NOW, 120_000, 2000);
+    current = new Date(FIXED_NOW.getTime() + 120_000);
+    const closed = await startWith(closedBridge, {});
+    expect(closed.status).toBe(403);
+    expect(await closed.json()).toEqual({ error: "pairing_closed" });
+    closedBridge.close();
+  });
+
+  test("an unrevealed start is still busy at 29_999 ms and reclaimed at 30_000 ms", async () => {
+    let current = FIXED_NOW;
+    const pairBridge = createBridge({ devicesFilePath, now: () => current });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const first = (await (await startWith(pairBridge, {})).json()) as { requestId: string };
+
+    current = new Date(FIXED_NOW.getTime() + 29_999);
+    expect((await startWith(pairBridge, {})).status).toBe(409);
+
+    current = new Date(FIXED_NOW.getTime() + 30_000);
+    const reclaimed = await startWith(pairBridge, {});
+    expect(reclaimed.status).toBe(200);
+    expect(((await reclaimed.json()) as { requestId: string }).requestId).not.toBe(first.requestId);
+  });
+
+  test("an approved decision whose in-memory reveal is lost answers expired and registers nothing", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const requestId = `par_${"1".repeat(16)}`;
+    writePendingPair(
+      stateDir,
+      {
+        requestId,
+        deviceId: "dev_1000000000000001",
+        deviceName: "Apple Watch",
+        code: 123,
+        revealedAt: FIXED_NOW.toISOString(),
+        expiresAt: new Date(FIXED_NOW.getTime() + 60_000).toISOString(),
+        decision: "approved",
+        status: "pending",
+      },
+      2000,
+    );
+
+    expect(await statusOf(pairBridge, requestId)).toEqual({ status: "expired" });
+    expect(readPendingPair(stateDir)).toBeUndefined();
+    expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(0);
+  });
+
+  test("a reveal with the wrong requestId is rejected without consuming the slot", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watchNonce = "55".repeat(16);
+    const { requestId } = (await (await startWith(pairBridge, { commit: commitment(watchNonce) })).json()) as {
+      requestId: string;
+    };
+
+    expect((await revealWith(pairBridge, { requestId: `par_${"0".repeat(16)}`, watchNonce })).status).toBe(401);
+    expect((await revealWith(pairBridge, { requestId, watchNonce })).status).toBe(200);
+  });
+
+  test("a wrong-nonce reveal consumes the slot so the right nonce cannot be replayed afterwards", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watchNonce = "66".repeat(16);
+    const { requestId } = (await (await startWith(pairBridge, { commit: commitment(watchNonce) })).json()) as {
+      requestId: string;
+    };
+
+    expect((await revealWith(pairBridge, { requestId, watchNonce: "67".repeat(16) })).status).toBe(401);
+    expect((await revealWith(pairBridge, { requestId, watchNonce })).status).toBe(401);
+  });
+
+  test("a reveal is accepted at exactly 30_000 ms after start and rejected at 30_001 ms", async () => {
+    let current = FIXED_NOW;
+    const pairBridge = createBridge({ devicesFilePath, now: () => current });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+
+    const nonceA = "77".repeat(16);
+    const a = (await (await startWith(pairBridge, { commit: commitment(nonceA) })).json()) as { requestId: string };
+    current = new Date(FIXED_NOW.getTime() + 30_000);
+    expect((await revealWith(pairBridge, { requestId: a.requestId, watchNonce: nonceA })).status).toBe(200);
+    await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId: a.requestId }),
+      }),
+    );
+
+    const startedAt = current;
+    const nonceB = "88".repeat(16);
+    const b = (await (await startWith(pairBridge, { commit: commitment(nonceB) })).json()) as { requestId: string };
+    current = new Date(startedAt.getTime() + 30_001);
+    expect((await revealWith(pairBridge, { requestId: b.requestId, watchNonce: nonceB })).status).toBe(401);
+  });
+
   test("GET /v1/health reports the host name", async () => {
     const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
     const response = await pairBridge.fetch(new Request("http://bridge.local/v1/health"));
@@ -2160,7 +2338,7 @@ describe("pairing", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          deviceId: "dev_stale",
+          deviceId: "dev_5a00000000000001",
           deviceName: "Watch",
           devicePublicKey: watch.publicKeyHex,
           commit: commitment("33".repeat(16)),

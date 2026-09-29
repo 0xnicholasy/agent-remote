@@ -27,6 +27,7 @@ const DEFAULT_PORT = 8787;
 const PAIRING_WINDOW_TTL_MS = 120 * 1000;
 const POLL_INTERVAL_MS = 1000;
 const DEVICE_APPEAR_TIMEOUT_MS = 30 * 1000;
+const DENIED_ACK_POLLS = 5;
 
 /** Bridge health, as reported by `GET /v1/health`. `null` means the bridge could not be reached. */
 export interface CliHealth {
@@ -237,6 +238,7 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
   let deviceId: string | undefined;
   let code: number | undefined;
   let pendingExpiresAt: string | undefined;
+  let deviceName: string | undefined;
   for (;;) {
     let pending: ReturnType<typeof readPendingPair>;
     try {
@@ -250,6 +252,7 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
       deviceId = pending.deviceId;
       code = pending.code;
       pendingExpiresAt = pending.expiresAt;
+      deviceName = pending.deviceName;
       break;
     }
     if (deps.now().getTime() >= windowExpiresAt.getTime()) {
@@ -265,68 +268,98 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
   // expires on its own, and blocks every pairing attempt in between (see /v1/pair/start's
   // pairing_busy check).
   const onSigint = (): void => {
-    clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
-    process.exit(130);
+    try {
+      clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+    } catch (cause) {
+      console.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      process.exit(130);
+    }
   };
   process.once("SIGINT", onSigint);
   try {
-    // Phase 2: show the code prominently and spell out the order -- either order
-    // (tap-then-confirm or confirm-then-tap) must actually work, since the operator may do
-    // either first.
-    deps.stdout(`Code on this Mac: ${code}`);
-    deps.stdout(`1. On your Watch, tap ${code}.`);
-    deps.stdout("2. Then confirm here.");
-    const answer = await deps.prompt("Pair this Watch? [y/N] ");
-    const approved = answer.trim().toLowerCase() === "y";
+    try {
+      // Phase 2: show the code prominently and spell out the order -- either order
+      // (tap-then-confirm or confirm-then-tap) must actually work, since the operator may do
+      // either first.
+      deps.stdout(`Code on this Mac: ${code}`);
+      deps.stdout(`1. On your Watch, tap ${code}.`);
+      deps.stdout("2. Then confirm here.");
+      // The name is Watch-supplied: strip control characters so it cannot inject terminal escapes.
+      const shownName = deviceName!.replace(/\p{Cc}/gu, "");
+      const answer = await deps.prompt(
+        `Pair "${shownName}" (${deviceId})? Only press y if your Watch is showing ${code} and waiting. [y/N] `,
+      );
+      const approved = answer.trim().toLowerCase() === "y";
 
-    const applied = setPendingPairDecision(
-      deps.stateDir,
-      requestId!,
-      approved ? "approved" : "denied",
-      PENDING_PAIR_CLI_LOCK_TIMEOUT_MS,
-    );
-    if (!applied) {
-      deps.stderr("Pairing request expired or was cancelled before it could be answered.");
-      return 1;
-    }
-    if (!approved) {
-      deps.stdout("Pairing denied.");
-      // The Watch normally clears this on its next /v1/pair/status poll, but it may never poll
-      // again (it already gave up, or the operator denied before it started). Clear it ourselves
-      // so the next `pair` doesn't see a stale busy record.
-      clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
-      return 1;
-    }
-
-    // Phase 3: the bridge registers the device on the Watch's next status poll; wait for it to
-    // appear in devices.json. The deadline is the pending request's own expiry -- not a fixed
-    // 30s -- since the operator may have confirmed before the Watch even started polling.
-    deps.stdout(`Approved. Waiting for the Watch -- tap ${code} on your Watch if you haven't.`);
-    const parsedExpiresAt = pendingExpiresAt !== undefined ? Date.parse(pendingExpiresAt) : Number.NaN;
-    const decidedAt = deps.now();
-    const deadline = Number.isNaN(parsedExpiresAt) ? decidedAt.getTime() + DEVICE_APPEAR_TIMEOUT_MS : parsedExpiresAt;
-    for (;;) {
-      const registry = loadRegistry(deps);
-      if (isRegistryError(registry)) {
-        deps.stderr(registry.error);
+      const applied = setPendingPairDecision(
+        deps.stateDir,
+        requestId!,
+        approved ? "approved" : "denied",
+        PENDING_PAIR_CLI_LOCK_TIMEOUT_MS,
+      );
+      if (!applied) {
+        deps.stderr("Pairing request expired or was cancelled before it could be answered.");
         return 1;
       }
-      // deviceId is freshly chosen by the Watch for this attempt, so simply appearing in the
-      // registry at all -- with no clock comparison -- is enough to know this pairing landed.
-      const paired = registry.get(deviceId!);
-      if (paired !== undefined) {
-        deps.stdout(`Paired device ${paired.deviceId} (${paired.deviceName})`);
-        clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
-        return 0;
-      }
-      if (deps.now().getTime() >= deadline) {
-        deps.stderr("The Watch did not finish pairing. Run this command again and tap the code on your Watch.");
-        // Approved but the Watch never finished: leaving an approved, decided record sitting
-        // past its own expiry would otherwise block the next attempt with pairing_busy too.
+      if (!approved) {
+        deps.stdout("Pairing denied.");
+        // Leave the denied record in place so the Watch's next /v1/pair/status poll sees `denied`
+        // (the bridge clears it on delivery). Wait a bounded number of polls for that; bounded by
+        // iteration count, not the clock, since callers may stub sleep without advancing now().
+        for (let i = 0; i < DENIED_ACK_POLLS; i += 1) {
+          await deps.sleep(POLL_INTERVAL_MS);
+          const current = readPendingPair(deps.stateDir);
+          if (current === undefined || current.requestId !== requestId) {
+            return 1;
+          }
+        }
+        // The Watch never polled; clear the record ourselves so the next `pair` isn't blocked by
+        // a stale busy record.
         clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
         return 1;
       }
-      await deps.sleep(POLL_INTERVAL_MS);
+
+      // Phase 3: the bridge registers the device on the Watch's next status poll; wait for it to
+      // appear in devices.json. The deadline is the pending request's own expiry -- not a fixed
+      // 30s -- since the operator may have confirmed before the Watch even started polling.
+      deps.stdout(`Approved. Waiting for the Watch -- tap ${code} on your Watch if you haven't.`);
+      const parsedExpiresAt = pendingExpiresAt !== undefined ? Date.parse(pendingExpiresAt) : Number.NaN;
+      const decidedAt = deps.now();
+      const deadline = Number.isNaN(parsedExpiresAt) ? decidedAt.getTime() + DEVICE_APPEAR_TIMEOUT_MS : parsedExpiresAt;
+      for (;;) {
+        const registry = loadRegistry(deps);
+        if (isRegistryError(registry)) {
+          deps.stderr(registry.error);
+          return 1;
+        }
+        // deviceId is freshly chosen by the Watch for this attempt, so simply appearing in the
+        // registry at all -- with no clock comparison -- is enough to know this pairing landed.
+        const paired = registry.get(deviceId!);
+        if (paired !== undefined) {
+          deps.stdout(`Paired device ${paired.deviceId} (${paired.deviceName})`);
+          clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+          return 0;
+        }
+        if (deps.now().getTime() >= deadline) {
+          deps.stderr("The Watch did not finish pairing. Run this command again and tap the code on your Watch.");
+          // Approved but the Watch never finished: leaving an approved, decided record sitting
+          // past its own expiry would otherwise block the next attempt with pairing_busy too.
+          clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+          return 1;
+        }
+        await deps.sleep(POLL_INTERVAL_MS);
+      }
+    } catch (cause) {
+      // A lock timeout or unreadable state file must not escape as an unhandled rejection. The
+      // record is ours; leaving it would block the next attempt, so clear it best-effort.
+      deps.stderr(cause instanceof Error ? cause.message : String(cause));
+      try {
+        clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+      } catch (clearCause) {
+        deps.stderr(clearCause instanceof Error ? clearCause.message : String(clearCause));
+      }
+      return 1;
     }
   } finally {
     process.off("SIGINT", onSigint);
@@ -601,7 +634,11 @@ if (import.meta.main) {
     cwd: process.cwd(),
   };
 
-  const exitCode = await runCli(process.argv.slice(2), deps);
-  rl.close();
+  let exitCode = 1;
+  try {
+    exitCode = await runCli(process.argv.slice(2), deps);
+  } finally {
+    rl.close();
+  }
   process.exit(exitCode);
 }

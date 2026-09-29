@@ -97,7 +97,9 @@ describe("pair", () => {
     let revealed = false;
     const deps = makeDeps({
       prompt: async (question) => {
-        expect(question).toBe("Pair this Watch? [y/N] ");
+        expect(question).toBe(
+          `Pair "Ting's Apple Watch" (dev_9f2c4a1b7d3e5061)? Only press y if your Watch is showing 487 and waiting. [y/N] `,
+        );
         return "y";
       },
       sleep: async () => {
@@ -138,11 +140,67 @@ describe("pair", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.stdoutLines).toContain("Pairing denied.");
-    // The CLI clears the record it just denied itself, rather than leaving it for the Watch's
-    // next /v1/pair/status poll (which may never come) to clean up -- a stale decided record
-    // would otherwise block the next `pair` attempt with 409 pairing_busy.
+    // The Watch never polled (sleep here only rewrites the record), so at the end the CLI clears
+    // the record itself -- a stale decided record would otherwise block the next `pair` attempt
+    // with 409 pairing_busy.
     expect(readPendingPair(stateDir)).toBeUndefined();
   });
+
+  test("leaves the denied record for the Watch's poll", async () => {
+    writePendingPair(stateDir, samplePendingPair(), 2000);
+    let sleeps = 0;
+    let decisionSeenBySleep: string | null | undefined;
+    const deps = makeDeps({
+      prompt: async () => "n",
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 2) {
+          // Stands in for the bridge delivering `denied` on the Watch's poll and clearing it.
+          decisionSeenBySleep = readPendingPair(stateDir)?.decision;
+          rmSync(join(stateDir, "pending-pair.json"), { force: true });
+        }
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(decisionSeenBySleep).toBe("denied");
+    expect(sleeps).toBe(2);
+  });
+
+  test("prints the device name without terminal escape characters", async () => {
+    writePendingPair(stateDir, samplePendingPair({ deviceName: "Evil\u001b[31m Watch" }), 2000);
+    let asked = "";
+    const deps = makeDeps({
+      prompt: async (question) => {
+        asked = question;
+        return "n";
+      },
+    });
+
+    await runCli(["pair"], deps);
+
+    expect(asked).toContain('Pair "Evil[31m Watch"');
+    expect(asked).not.toContain("\u001b");
+  });
+
+  test("a lock timeout while recording the decision exits 1 with a message instead of throwing", async () => {
+    writePendingPair(stateDir, samplePendingPair(), 2000);
+    const lockPath = join(stateDir, "pending-pair.json.lock");
+    const deps = makeDeps({
+      prompt: async () => {
+        writeFileSync(lockPath, String(process.pid), { mode: 0o600 });
+        return "y";
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.length).toBeGreaterThan(0);
+    rmSync(lockPath, { force: true });
+  }, 15000);
 
   test("expires when the window passes with no device requesting to pair", async () => {
     const deps = makeDeps();

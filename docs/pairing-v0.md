@@ -47,7 +47,12 @@ bytes hex encoded (32 hex characters):
      [Timing](#timing)).
    - `409 {"error":"pairing_busy"}` when a request is already pending.
    - `429 {"error":"rate_limited"}` above 6 starts per minute, bridge-wide.
-   - `401 {"error":"pairing_rejected"}` for a malformed body.
+   - `401 {"error":"pairing_rejected"}` for a malformed body: `deviceId` must be `dev_` followed
+     by 16 lowercase hex characters, `deviceName` 1 to 64 printable characters (no control
+     characters), and `devicePublicKey` and `commit` 64 lowercase hex characters each, where the
+     key must also import as an X25519 public key. It is also answered for a `deviceId` that is
+     already registered (including a revoked one); the Watch mints a fresh id per attempt, so
+     re-pairing is unaffected.
    - `200`:
      ```json
      { "requestId": "par_<16 hex>", "bridgeId": "brg_<8 hex>",
@@ -61,7 +66,8 @@ bytes hex encoded (32 hex characters):
    { "requestId": "par_...", "watchNonce": "<32 hex>" }
    ```
 
-   Must arrive within 30 seconds of `start`. The bridge checks `commit` against the now-revealed
+   `requestId` must be `par_` followed by 16 lowercase hex characters and `watchNonce` 32
+   lowercase hex characters. Must arrive within 30 seconds of `start`. The bridge checks `commit` against the now-revealed
    `watchNonce` in constant time; a mismatch, an unknown `requestId`, or a late reveal all answer
    `401 {"error":"pairing_rejected"}` and drop the request. On a match the bridge computes the
    confirmation code (below), writes `pending-pair.json`, and answers
@@ -70,7 +76,9 @@ bytes hex encoded (32 hex characters):
 3. **`GET /v1/pair/status?requestId=`**, polled by the Watch about once a second:
    `{"status":"pending"|"approved"|"denied"|"expired"}`. On `approved` the body also carries the
    enrollment response fields: `deviceId`, `keyId`, `pairedAt`, `bridgeId`, `allowedProjects`,
-   `allowedActions`. An unknown `requestId` answers `expired`.
+   `allowedActions`. An unknown `requestId` answers `expired`. Re-polling an approved `requestId`
+   before the record's `expiresAt` returns the same `approved` body; the device is registered
+   once.
 
 4. **`POST /v1/pair/cancel`** `{"requestId": "par_..."}` — the Watch's "None match" or
    wrong-pick path. The bridge marks the request cancelled and frees the slot for a new `start`.
@@ -282,7 +290,9 @@ through those files rather than held in one process's memory:
   [Timing](#timing)) and tells the operator to open Agent Remote on the Watch and tap Next --
   there is no address to enter, since the Watch finds the Mac on its own. Once the Watch reaches
   `/v1/pair/reveal`, it prints the code prominently with the order spelled out ("1. On your
-  Watch, tap `<code>`. 2. Then confirm here.") and prompts `[y/N]`; either order works. On `y` it
+  Watch, tap `<code>`. 2. Then confirm here.") and prompts
+  `Pair "<deviceName>" (<deviceId>)? Only press y if your Watch is showing <code> and waiting. [y/N]`;
+  either order works. On `y` it
   waits until the pending request's own `expiresAt` (not a fixed timeout) for the Watch to finish
   pairing, printing "Approved. Waiting for the Watch..." once.
 - `bun run bridge devices` prints the registry (no key material); `--json` for machine-readable
