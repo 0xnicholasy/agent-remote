@@ -123,7 +123,9 @@ protect against.
 
 `bun run bridge pair` opens a pairing window of 120 seconds, recorded in `pairing-window.json`
 (`{openedAt, expiresAt}`) under the state directory. `/v1/pair/start` is refused outside that
-window. Approval must land within 120 seconds of `/v1/pair/reveal` (tracked in
+window, which also closes as soon as `bun run bridge pair` exits for any reason (paired, denied,
+cancelled, Ctrl-C or an error), because no process remains to show a code or record a decision;
+the Watch's next `/v1/pair/start` then answers `pairing_closed`. Approval must land within 120 seconds of `/v1/pair/reveal` (tracked in
 `pending-pair.json`'s own `expiresAt`). Only one request may be pending at a time (`start` while
 another is mid-flight, or awaiting approval, answers `pairing_busy`). The bridge's X25519 key pair
 and both nonces live in the bridge process's memory only, never on disk; a bridge restart deletes
@@ -186,20 +188,27 @@ Every implementation must reproduce these exact values. The bridge asserts them 
 `bridge/src/auth/vector.test.ts` and the Watch client in
 `protocol/swift/Tests/AgentRemoteProtocolTests/RequestSigningTests.swift`, both as literals.
 
-Inputs: code `ABCD-EFGH-JKMN` (normalised `ABCDEFGHJKMN`), deviceId `dev_9f2c4a1b7d3e5061`,
-deviceName `Test Watch`, nonce `00112233445566778899aabbccddeeff`, `POST /v1/commands`, timestamp
-`2026-09-20T10:15:00.000Z`, body `{"a":1}`.
+Inputs: bridgeId `brg_9f2c4a1b`; bridge private scalar `0x11` repeated 32 times and device private
+scalar `0x22` repeated 32 times (deterministic for the vector only; production keys are random);
+bridgeNonce `00112233445566778899aabbccddeeff`; watchNonce `aabbccddeeff00112233445566778899`.
 
 | Value | Expected |
 | --- | --- |
-| proof | `7a7c4223ee9042311a66a05098b446d4db027b9c498f2dff2acdef6b88e925ae` |
-| deviceKey | `ca9dcc8f90e9c298f6027ce885a8235519206cb03314cc36c5a60c8556bacfd8` |
-| keyId | `key_cd7749ef` |
-| body SHA-256 | `015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862` |
-| signature | `v1=e1702c4ff741df5df3e1dd59f0819a1a9f4bf56ee2dee410aa6dfac763b13032` |
+| bridgePublicKey | `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13` |
+| devicePublicKey | `0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20` |
+| commit | `44451b47ea1548fd1831d57eaedcda2cdbf53014acf86792e29b0b9459938068` |
+| code | `487` |
+| deviceKey | `bc6bd2bbeea0b02933e110b3082774c163d7574cd28a17650e4b6c4c4c35c781` |
+| keyId | `key_4217872d` |
 
-The signing string for that request is the six lines `v1`, `POST`, `/v1/commands`, the timestamp,
-the nonce, and the body digest, joined by `\n` with no trailing newline.
+The transcript is the six lines from [Derivation](#derivation) with those values, joined by `\n`
+with no trailing newline.
+
+Request signing uses the derived deviceKey: `POST /v1/commands`, timestamp
+`2026-09-20T10:15:00.000Z`, nonce `00112233445566778899aabbccddeeff`, body `{"a":1}`, body SHA-256
+`015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862`. The signing string for that
+request is the six lines `v1`, `POST`, `/v1/commands`, the timestamp, the nonce, and the body
+digest, joined by `\n` with no trailing newline.
 
 ## Command authorization
 

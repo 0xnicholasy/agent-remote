@@ -40,7 +40,15 @@ import {
 } from "./auth/pairing";
 import { BRIDGE_LOCK_TIMEOUT_MS, DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { atomicWriteFileSync, clearLockIfHolderDead } from "./auth/persist";
-import { clearPairingWindow, clearPendingPair, readPairingWindow, readPendingPair, writePendingPair } from "./auth/pending-pair";
+import {
+  clearPairingWindow,
+  clearPendingPair,
+  pairingWindowFilePath,
+  pendingPairFilePath,
+  readPairingWindow,
+  readPendingPair,
+  writePendingPair,
+} from "./auth/pending-pair";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
 import { CommandJournal } from "./state/commands";
@@ -296,10 +304,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         );
       }
     }
-    // The one race-free moment to clear a devices.json.lock orphaned by a crashed writer: this
+    // The one race-free moment to clear a devices/pairing lock orphaned by a crashed writer: this
     // process holds bridge.lock, so no other bridge exists, and a live CLI's lock is left alone.
-    if (clearLockIfHolderDead(`${devicesFilePath}.lock`)) {
-      console.warn(`Agent Remote bridge: removed devices.json.lock left by a dead process`);
+    for (const lockFile of [
+      `${devicesFilePath}.lock`,
+      `${pendingPairFilePath(stateDirPath)}.lock`,
+      `${pairingWindowFilePath(stateDirPath)}.lock`,
+    ]) {
+      if (clearLockIfHolderDead(lockFile)) {
+        console.warn(`Agent Remote bridge: removed ${path.basename(lockFile)} left by a dead process`);
+      }
     }
     let lockReleased = false;
     releaseLock = (): void => {
@@ -1183,14 +1197,28 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
       return json({ status: "expired" });
     }
 
+    // Best-effort: the pending record is only bookkeeping once the outcome is decided, so a
+    // failure to remove it (lock timeout, fs error) is logged and never changes the answer.
+    const clearBestEffort = (what: string, clear: () => void): void => {
+      try {
+        clear();
+      } catch (error) {
+        console.error(`pairing: ${what} cleanup failed for ${requestId}`, error);
+      }
+    };
+    // The decision is final once read: a record that cannot be removed now is removed by the CLI's
+    // denied-ack loop or by expiry, and the Watch must still receive the decision.
+    const clearPendingBestEffort = (): void =>
+      clearBestEffort("pending pair", () => clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS));
+
     if (now().getTime() >= new Date(pending.expiresAt).getTime()) {
-      clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      clearPendingBestEffort();
       revealedPairing = undefined;
       return json({ status: "expired" });
     }
 
     if (pending.decision === "denied") {
-      clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      clearPendingBestEffort();
       revealedPairing = undefined;
       return json({ status: "denied" });
     }
@@ -1205,20 +1233,11 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     if (revealed === undefined || revealed.requestId !== requestId) {
       // The approval landed after this process lost the in-memory transcript (a restart mid
       // approval); nothing recoverable without the private key/nonce, which never touched disk.
-      clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      clearPendingBestEffort();
       return json({ status: "expired" });
     }
 
     const stateDir = pendingPairStateDir;
-    // Best-effort: the pending record is only bookkeeping once the outcome is decided, so a
-    // failure to remove it (lock timeout, fs error) is logged and never changes the answer.
-    const clearBestEffort = (what: string, clear: () => void): void => {
-      try {
-        clear();
-      } catch (error) {
-        console.error(`pairing: ${what} cleanup failed for ${requestId}`, error);
-      }
-    };
     // Never rejects: the promise is cached per requestId, so a rejection would be replayed as a
     // 500 on every later poll with the one-shot reveal already consumed. A failure before or at
     // registration answers `expired` (a status the Watch already maps to a clear failure; the

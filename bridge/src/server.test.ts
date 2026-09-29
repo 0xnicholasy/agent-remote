@@ -30,7 +30,7 @@ import {
 } from "./server";
 import { readBridgeProjects, resolveProjectIds } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
-import { commitment, deriveDeviceKeyV2, generateX25519KeyPair, pairTranscript, sharedSecret } from "./auth/pairing";
+import { commitment, confirmCode, deriveDeviceKeyV2, generateX25519KeyPair, pairTranscript, sharedSecret } from "./auth/pairing";
 import {
   openPairingWindow,
   pendingPairFilePath,
@@ -1719,6 +1719,8 @@ describe("pairing", () => {
     revealResponse: Response;
     statusResponse: Response;
     statusBody: Record<string, unknown>;
+    pendingCode: number | undefined;
+    expectedCode: number;
   }> {
     const deviceId = params.deviceId ?? `dev_${randomBytes(8).toString("hex")}`;
     const deviceName = params.deviceName ?? "Ting's Apple Watch";
@@ -1751,6 +1753,7 @@ describe("pairing", () => {
       }),
     );
 
+    const pendingCode = readPendingPair(stateDir)?.code;
     const decision = params.decision ?? "approved";
     setPendingPairDecision(stateDir, requestId, decision, 2000);
 
@@ -1766,20 +1769,35 @@ describe("pairing", () => {
       bridgeNonceHex: startBody.bridgeNonce ?? "",
       watchNonceHex: watchNonce,
     });
+    const expectedCode = confirmCode(transcript);
     const shared = sharedSecret(watch.privateKey, startBody.bridgePublicKey ?? "");
     const deviceKey = deriveDeviceKeyV2(shared, transcript);
 
-    return { requestId, deviceId, deviceKey, startResponse, revealResponse, statusResponse, statusBody };
+    return {
+      requestId,
+      deviceId,
+      deviceKey,
+      startResponse,
+      revealResponse,
+      statusResponse,
+      statusBody,
+      pendingCode,
+      expectedCode,
+    };
   }
 
   test("the full handshake pairs a device and its independently derived key signs a request", async () => {
     const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const { startResponse, revealResponse, statusResponse, statusBody, deviceId, deviceKey } =
+    const { startResponse, revealResponse, statusResponse, statusBody, deviceId, deviceKey, pendingCode, expectedCode } =
       await pairDevice(pairBridge);
 
     expect(startResponse.status).toBe(200);
     expect(revealResponse.status).toBe(200);
     expect(statusResponse.status).toBe(200);
+    // The on-disk code the operator sees must be the code the Watch derives from the transcript.
+    expect(pendingCode).toBe(expectedCode);
+    expect(expectedCode).toBeGreaterThanOrEqual(100);
+    expect(expectedCode).toBeLessThanOrEqual(999);
     expect(statusBody.status).toBe("approved");
     expect(statusBody.deviceId).toBe(deviceId);
     expect(statusBody.bridgeId).toBe(pairBridge.bridgeId);
@@ -2321,6 +2339,38 @@ describe("pairing", () => {
     expect(await statusOf(pairBridge, requestId)).toEqual({ status: "expired" });
     expect(readPendingPair(stateDir)).toBeUndefined();
     expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(0);
+  });
+
+  test("a denied decision still answers denied when the pending-pair lock cannot be taken", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const requestId = `par_${"2".repeat(16)}`;
+    writePendingPair(
+      stateDir,
+      {
+        requestId,
+        deviceId: "dev_2000000000000002",
+        deviceName: "Apple Watch",
+        code: 123,
+        revealedAt: FIXED_NOW.toISOString(),
+        expiresAt: new Date(FIXED_NOW.getTime() + 60_000).toISOString(),
+        decision: "denied",
+        status: "pending",
+      },
+      2000,
+    );
+    const lockPath = join(stateDir, "pending-pair.json.lock");
+    writeFileSync(lockPath, String(process.pid), "utf8");
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const response = await pairBridge.fetch(new Request(`http://bridge.local/v1/pair/status?requestId=${requestId}`));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status: "denied" });
+      expect(readPendingPair(stateDir)).toBeDefined();
+      expect(errorSpy.mock.calls.some((call) => String(call[0]).includes("cleanup failed"))).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+      rmSync(lockPath, { force: true });
+    }
   });
 
   test("a reveal with the wrong requestId is rejected without consuming the slot", async () => {
@@ -3274,6 +3324,8 @@ describe("single-writer state dir lock", () => {
     try {
       // No real process can hold this pid; it is well past any platform's max pid.
       writeFileSync(join(deadLockDir, "devices.json.lock"), "999999999", "utf8");
+      writeFileSync(join(deadLockDir, "pending-pair.json.lock"), "999999999", "utf8");
+      writeFileSync(join(deadLockDir, "pairing-window.json.lock"), "999999999", "utf8");
       writeFileSync(join(liveLockDir, "devices.json.lock"), String(process.pid), "utf8");
 
       const deadLockBridge = createBridge({
@@ -3288,6 +3340,8 @@ describe("single-writer state dir lock", () => {
       });
       try {
         expect(existsSync(join(deadLockDir, "devices.json.lock"))).toBe(false);
+        expect(existsSync(join(deadLockDir, "pending-pair.json.lock"))).toBe(false);
+        expect(existsSync(join(deadLockDir, "pairing-window.json.lock"))).toBe(false);
         expect(existsSync(join(liveLockDir, "devices.json.lock"))).toBe(true);
       } finally {
         deadLockBridge.close();

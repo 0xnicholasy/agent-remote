@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
-import { readPendingPair, writePendingPair, type PendingPairRecord } from "./auth/pending-pair";
+import { readPairingWindow, readPendingPair, writePendingPair, type PendingPairRecord } from "./auth/pending-pair";
 import { healthCheckHost, runCli, type CliDeps, type CliHealth } from "./cli";
 import { projectIdFor } from "./projects";
 
@@ -128,6 +128,36 @@ describe("pair", () => {
     expect(deps.stdoutLines.some((line) => line.includes(sampleRecord().deviceId))).toBe(true);
   });
 
+  test("a paired device still exits 0 when the pairing window file cannot be removed", async () => {
+    const windowLockPath = join(stateDir, "pairing-window.json.lock");
+    let revealed = false;
+    const deps = makeDeps({
+      prompt: async () => "y",
+      sleep: async () => {
+        if (!revealed) {
+          revealed = true;
+          writeFileSync(join(stateDir, "pending-pair.json"), JSON.stringify(samplePendingPair()), { mode: 0o600 });
+          return;
+        }
+        if (readPendingPair(stateDir)?.decision === "approved") {
+          DeviceRegistry.load(join(stateDir, "devices.json")).register(sampleRecord());
+          // A live holder makes clearPairingWindow time out when the CLI closes the window.
+          writeFileSync(windowLockPath, String(process.pid), { mode: 0o600 });
+        }
+      },
+    });
+
+    try {
+      const exitCode = await runCli(["pair"], deps);
+
+      expect(exitCode).toBe(0);
+      expect(deps.stdoutLines.some((line) => line.startsWith("Paired device "))).toBe(true);
+      expect(deps.stderrLines).toHaveLength(1);
+    } finally {
+      rmSync(windowLockPath, { force: true });
+    }
+  }, 15000);
+
   test("denies on anything other than 'y' and never waits for a device", async () => {
     const deps = makeDeps({
       prompt: async () => "n",
@@ -140,6 +170,8 @@ describe("pair", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.stdoutLines).toContain("Pairing denied.");
+    // The window closes with the CLI, so the Watch's next start is refused at once.
+    expect(readPairingWindow(stateDir)).toBeUndefined();
     // The Watch never polled (sleep here only rewrites the record), so at the end the CLI clears
     // the record itself -- a stale decided record would otherwise block the next `pair` attempt
     // with 409 pairing_busy.
@@ -225,6 +257,7 @@ describe("pair", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.stderrLines).toContain("Pairing request expired or was cancelled before it could be answered.");
+    expect(readPairingWindow(stateDir)).toBeUndefined();
   });
 
   test("prints the waiting message on approval and times out at the request's own expiresAt, not a fixed 30s", async () => {

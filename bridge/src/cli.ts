@@ -270,6 +270,7 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
   const onSigint = (): void => {
     try {
       clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+      clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
     } catch (cause) {
       console.error(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -338,7 +339,6 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
         const paired = registry.get(deviceId!);
         if (paired !== undefined) {
           deps.stdout(`Paired device ${paired.deviceId} (${paired.deviceName})`);
-          clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
           return 0;
         }
         if (deps.now().getTime() >= deadline) {
@@ -363,6 +363,13 @@ async function runPair(_args: string[], deps: CliDeps): Promise<number> {
     }
   } finally {
     process.off("SIGINT", onSigint);
+    // The window lives exactly as long as this process: no CLI remains to show a code or record a
+    // decision once we exit. Best-effort, so a paired device still exits 0 if the file is stuck.
+    try {
+      clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+    } catch (cause) {
+      deps.stderr(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 }
 
