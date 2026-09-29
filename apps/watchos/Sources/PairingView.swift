@@ -110,17 +110,7 @@ struct PairingView: View {
     }
 
     private func start() async {
-        guard case .idle = store.pairingPhase else {
-            // A stale terminal state (denied/expired/cancelled/failed) restarts fresh; any other
-            // in-flight phase (starting/choosing/waitingForMac/approved) must not be re-entered.
-            switch store.pairingPhase {
-            case .denied, .expired, .cancelled, .failed:
-                await store.beginPairing()
-            default:
-                break
-            }
-            return
-        }
+        guard store.pairingPhase.canRestart else { return }
         await store.beginPairing()
     }
 }

@@ -121,16 +121,8 @@ final class CoreScreensUITests: XCTestCase {
             // Reveal the indicator itself, not the Pair Watch link below it -- Device and
             // Pair Watch share one Form section, and the form only keeps rows near the screen
             // in the accessibility tree, so scrolling to Pair Watch can scroll Device off it.
-            let lowP = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7))
-            let highP = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
-            for i in 0..<12 {
-                let deviceMatches = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Device' OR label CONTAINS 'aired'"))
-                let n = deviceMatches.count
-                print("DEBUG scan iter \(i): matchCount=\(n) labels=\((0..<min(n, 5)).map { deviceMatches.element(boundBy: $0).label })")
-                if n > 0 { break }
-                lowP.press(forDuration: 0.05, thenDragTo: highP)
-            }
-            XCTFail("DEBUG diagnostic stop -- see DEBUG scan iter lines above for Device/Paired matches")
+            reveal(pairedIndicator)
+            XCTAssertTrue(pairedIndicator.exists, "expected the paired indicator after relaunch")
             return
         }
 
@@ -166,7 +158,6 @@ final class CoreScreensUITests: XCTestCase {
         relaunchToSettings()
         // Same reasoning as the already-paired branch above: reveal the indicator itself.
         reveal(pairedIndicator)
-        print("DEBUG first-time-pairing branch hierarchy:\n\(app.debugDescription)")
         XCTAssertTrue(pairedIndicator.exists, "expected pairing to have completed")
     }
 

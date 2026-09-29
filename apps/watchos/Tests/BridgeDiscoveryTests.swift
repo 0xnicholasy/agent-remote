@@ -87,4 +87,44 @@ final class BridgeDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(found, [FoundBridge(host: "192.168.50.7", port: 8787, bridgeId: "brg_saved", name: "192.168.50.7:8787")])
     }
+
+    /// Runs `sweep` with only the saved host `192.168.50.7:8787` answering, with `status`/`body`.
+    /// Every other address fails as unreachable, so the /24 fallback resolves empty and fast.
+    private func sweepWithSavedHostAnswering(status: Int, body: String) async -> [FoundBridge] {
+        let data = Data(body.utf8)
+        stubURLProtocolResponder.set { request in
+            guard request.url?.host == "192.168.50.7", request.url?.port == 8787 else { return nil }
+            return (status, data)
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        return await HealthSweepFinder.sweep(
+            lastKnownHost: "192.168.50.7", lastKnownPort: 8787, session: URLSession(configuration: configuration)
+        )
+    }
+
+    func testSweepRejectsSavedHostAnswering500WithValidBody() async {
+        let found = await sweepWithSavedHostAnswering(status: 500, body: #"{"ok":true,"bridgeId":"brg_x"}"#)
+        XCTAssertEqual(found, [])
+    }
+
+    func testSweepRejectsSavedHostReportingNotOk() async {
+        let found = await sweepWithSavedHostAnswering(status: 200, body: #"{"ok":false,"bridgeId":"x"}"#)
+        XCTAssertEqual(found, [])
+    }
+
+    func testSweepRejectsSavedHostReturningNonJSON() async {
+        let found = await sweepWithSavedHostAnswering(status: 200, body: "not json")
+        XCTAssertEqual(found, [])
+    }
+
+    func testSweepRejectsSavedHostWithoutBridgeId() async {
+        let found = await sweepWithSavedHostAnswering(status: 200, body: #"{"ok":true}"#)
+        XCTAssertEqual(found, [])
+    }
+
+    func testSweepUsesNameFromHealthBodyWhenPresent() async {
+        let found = await sweepWithSavedHostAnswering(status: 200, body: #"{"ok":true,"bridgeId":"brg_x","name":"Studio Mac"}"#)
+        XCTAssertEqual(found, [FoundBridge(host: "192.168.50.7", port: 8787, bridgeId: "brg_x", name: "Studio Mac")])
+    }
 }

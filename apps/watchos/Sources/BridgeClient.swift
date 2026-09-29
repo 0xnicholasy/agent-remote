@@ -304,6 +304,10 @@ actor BridgeClient: BridgeClientProtocol {
     private var pairingPrivateKey: Curve25519.KeyAgreement.PrivateKey?
     private var pairingTranscript: String?
     private var pairingBridgePublicKeyHex: String?
+    /// The deviceId sent at `/v1/pair/start` and the bridgeId the bridge answered with; the
+    /// approved status must echo both (E-11).
+    private var pairingDeviceId: String?
+    private var pairingBridgeId: String?
 
     init(baseURL: URL = BridgeClient.defaultBaseURL, credentialStore: any CredentialStore = KeychainCredentialStore()) {
         self.baseURL = baseURL
@@ -406,6 +410,7 @@ actor BridgeClient: BridgeClientProtocol {
 
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         let devicePublicKeyHex = hex(privateKey.publicKey.rawRepresentation)
+        let deviceId = "dev_" + RequestSigning.randomHex(bytes: 8)
         let watchNonce = RequestSigning.randomHex(bytes: 16)
         let commit = RequestSigning.commitment(watchNonce: watchNonce)
 
@@ -414,7 +419,7 @@ actor BridgeClient: BridgeClientProtocol {
         startRequest.timeoutInterval = Self.pairingRequestTimeoutSeconds
         startRequest.setValue("application/json", forHTTPHeaderField: "content-type")
         startRequest.httpBody = try encoder.encode(StartBody(
-            deviceId: "dev_" + RequestSigning.randomHex(bytes: 8),
+            deviceId: deviceId,
             deviceName: deviceName,
             devicePublicKey: devicePublicKeyHex,
             commit: commit
@@ -422,14 +427,27 @@ actor BridgeClient: BridgeClientProtocol {
         let (startData, startResponse) = try await urlSession.data(for: startRequest)
         try Self.checkStatus(startResponse, data: startData)
         let started = try decoder.decode(StartResponse.self, from: startData)
+        guard
+            !started.requestId.isEmpty,
+            Self.isHex(started.bridgePublicKey, bytes: 32),
+            Self.isHex(started.bridgeNonce, bytes: 16)
+        else {
+            throw BridgeError.malformedResponse("pair/start returned a malformed bridgePublicKey or bridgeNonce")
+        }
 
         var revealRequest = URLRequest(url: baseURL.appending(path: "/v1/pair/reveal"))
         revealRequest.httpMethod = "POST"
         revealRequest.timeoutInterval = Self.pairingRequestTimeoutSeconds
         revealRequest.setValue("application/json", forHTTPHeaderField: "content-type")
         revealRequest.httpBody = try encoder.encode(RevealBody(requestId: started.requestId, watchNonce: watchNonce))
-        let (revealData, revealResponse) = try await urlSession.data(for: revealRequest)
-        try Self.checkStatus(revealResponse, data: revealData)
+        do {
+            let (revealData, revealResponse) = try await urlSession.data(for: revealRequest)
+            try Self.checkStatus(revealResponse, data: revealData)
+        } catch {
+            // The bridge holds the slot until the window closes; free it for the next attempt.
+            try? await cancelPairing(requestId: started.requestId)
+            throw error
+        }
 
         let transcript = RequestSigning.pairTranscript(
             bridgeId: started.bridgeId,
@@ -443,6 +461,8 @@ actor BridgeClient: BridgeClientProtocol {
         pairingPrivateKey = privateKey
         pairingTranscript = transcript
         pairingBridgePublicKeyHex = started.bridgePublicKey
+        pairingDeviceId = deviceId
+        pairingBridgeId = started.bridgeId
 
         return PairingHandshake(requestId: started.requestId, code: code)
     }
@@ -481,6 +501,8 @@ actor BridgeClient: BridgeClientProtocol {
                 let privateKey = pairingPrivateKey,
                 let transcript = pairingTranscript,
                 let bridgePublicKeyHex = pairingBridgePublicKeyHex,
+                let expectedDeviceId = pairingDeviceId,
+                let expectedBridgeId = pairingBridgeId,
                 let deviceId = decoded.deviceId,
                 let keyId = decoded.keyId,
                 let bridgeId = decoded.bridgeId
@@ -489,6 +511,14 @@ actor BridgeClient: BridgeClientProtocol {
             }
             let shared = try RequestSigning.sharedSecret(privateKey: privateKey, peerPublicKeyHex: bridgePublicKeyHex)
             let deviceKey = RequestSigning.deriveDeviceKey(shared: shared, transcript: transcript)
+            guard
+                RequestSigning.keyId(for: deviceKey) == keyId,
+                deviceId == expectedDeviceId,
+                bridgeId == expectedBridgeId
+            else {
+                clearPairingHandshakeState()
+                throw BridgeError.malformedResponse("approved pairing status does not match this handshake")
+            }
             let newCredential = DeviceCredential(
                 deviceId: deviceId,
                 keyId: keyId,
@@ -496,7 +526,12 @@ actor BridgeClient: BridgeClientProtocol {
                 bridgeId: bridgeId,
                 baseURL: baseURL
             )
-            try credentialStore.save(newCredential)
+            do {
+                try credentialStore.save(newCredential)
+            } catch {
+                clearPairingHandshakeState()
+                throw BridgeError.malformedResponse("could not store the pairing credential: \(error.localizedDescription)")
+            }
             credential = newCredential
             clearPairingHandshakeState()
             return .approved
@@ -522,6 +557,12 @@ actor BridgeClient: BridgeClientProtocol {
         pairingPrivateKey = nil
         pairingTranscript = nil
         pairingBridgePublicKeyHex = nil
+        pairingDeviceId = nil
+        pairingBridgeId = nil
+    }
+
+    private static func isHex(_ value: String, bytes: Int) -> Bool {
+        value.utf8.count == bytes * 2 && value.utf8.allSatisfy { ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }
     }
 
     private func hex(_ data: Data) -> String {

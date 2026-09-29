@@ -239,6 +239,14 @@ final class SessionStore {
         /// would otherwise carry verbatim) never renders -- only `host` is shown here; the
         /// underlying error is logged instead (see `classifyPairingFailure`).
         case connectionFailure(host: String)
+
+        /// True when the view may begin a fresh handshake from this phase.
+        var canRestart: Bool {
+            switch self {
+            case .idle, .denied, .expired, .cancelled, .failed, .connectionFailure: true
+            default: false
+            }
+        }
     }
     private(set) var pairingPhase: PairingPhase = .idle
     /// False until the first `refreshPairedState()` (or `pair()`) has resolved, so RootView can
@@ -365,7 +373,12 @@ final class SessionStore {
         pairingPhase = .starting
         do {
             let handshake = try await client.beginPairing(deviceName: "Apple Watch")
-            guard generation == pairingGeneration else { return }
+            guard generation == pairingGeneration else {
+                // A concurrent cancelPairing() saw no requestId yet and sent nothing, so free
+                // the bridge's slot here.
+                try? await client.cancelPairing(requestId: handshake.requestId)
+                return
+            }
             pairingRequestId = handshake.requestId
             var decoys = Set<Int>()
             while decoys.count < 3 {
@@ -391,8 +404,12 @@ final class SessionStore {
         if let bridgeError = error as? BridgeError {
             return .failed(bridgeError.description)
         }
-        print("[SessionStore] pairing connection failure for \(host): \(error)")
-        return .connectionFailure(host: host)
+        if error is URLError {
+            print("[SessionStore] pairing connection failure for \(host): \(error)")
+            return .connectionFailure(host: host)
+        }
+        print("[SessionStore] pairing unexpected failure for \(host): \(error)")
+        return .failed("Unexpected reply from the bridge")
     }
 
     /// The user tapped one of the four options shown. The correct pick moves to
@@ -431,7 +448,11 @@ final class SessionStore {
         pairingRequestId = nil
         pairingPhase = .cancelled
         if let requestId {
-            try? await client.cancelPairing(requestId: requestId)
+            do {
+                try await client.cancelPairing(requestId: requestId)
+            } catch {
+                print("[SessionStore] pairing cancel failed for \(hostText): \(error)")
+            }
         }
     }
 
@@ -486,6 +507,12 @@ final class SessionStore {
                 if let bridgeError = error as? BridgeError {
                     pairingRequestId = nil
                     pairingPhase = .failed(bridgeError.description)
+                    return
+                }
+                guard error is URLError else {
+                    pairingRequestId = nil
+                    print("[SessionStore] pairing poll unexpected failure for \(hostText): \(error)")
+                    pairingPhase = .failed("Unexpected reply from the bridge")
                     return
                 }
                 if retriedSeconds < Self.pairingPollRetryCapSeconds {
