@@ -1210,37 +1210,50 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     }
 
     const stateDir = pendingPairStateDir;
-    const result = (async (): Promise<Record<string, unknown>> => {
-      let deviceKey: Buffer;
-      let keyId: string;
+    // Best-effort: the pending record is only bookkeeping once the outcome is decided, so a
+    // failure to remove it (lock timeout, fs error) is logged and never changes the answer.
+    const clearBestEffort = (what: string, clear: () => void): void => {
       try {
-        deviceKey = deriveDeviceKeyV2(sharedSecret(bridgeKeyPair.privateKey, revealed.devicePublicKeyHex), revealed.transcript);
-        keyId = keyIdFor(deviceKey);
+        clear();
       } catch (error) {
-        console.error(`pairing: key derivation failed for ${requestId}`, error);
-        clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
+        console.error(`pairing: ${what} cleanup failed for ${requestId}`, error);
+      }
+    };
+    // Never rejects: the promise is cached per requestId, so a rejection would be replayed as a
+    // 500 on every later poll with the one-shot reveal already consumed. A failure before or at
+    // registration answers `expired` (a status the Watch already maps to a clear failure; the
+    // registry rolls back a failed write, so no device is left behind), and a failure after
+    // registration is only logged, because the device IS registered and must get its credential.
+    const result = (async (): Promise<Record<string, unknown>> => {
+      let record: DeviceRecord;
+      try {
+        const deviceKey = deriveDeviceKeyV2(sharedSecret(bridgeKeyPair.privateKey, revealed.devicePublicKeyHex), revealed.transcript);
+        const keyId = keyIdFor(deviceKey);
+        const pairedAt = now().toISOString();
+        const projects = await provider.listProjects();
+        const stillPending = readPendingPair(stateDir);
+        if (stillPending === undefined || stillPending.requestId !== requestId) {
+          return { status: "expired" };
+        }
+        record = {
+          deviceId: pending.deviceId,
+          deviceName: pending.deviceName,
+          keyId,
+          deviceKeyHex: deviceKey.toString("hex"),
+          pairedAt,
+          allowedProjects: projects.map((project) => project.id),
+          allowedActions: [...ALL_COMMAND_ACTIONS],
+          revokedAt: null,
+          lastSeenAt: null,
+        };
+        registry.register(record);
+      } catch (error) {
+        console.error(`pairing: approval failed before registration for ${requestId}`, error);
+        clearBestEffort("pending pair", () => clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
         return { status: "expired" };
       }
-      const pairedAt = now().toISOString();
-      const projects = await provider.listProjects();
-      const stillPending = readPendingPair(stateDir);
-      if (stillPending === undefined || stillPending.requestId !== requestId) {
-        return { status: "expired" };
-      }
-      const record: DeviceRecord = {
-        deviceId: pending.deviceId,
-        deviceName: pending.deviceName,
-        keyId,
-        deviceKeyHex: deviceKey.toString("hex"),
-        pairedAt,
-        allowedProjects: projects.map((project) => project.id),
-        allowedActions: [...ALL_COMMAND_ACTIONS],
-        revokedAt: null,
-        lastSeenAt: null,
-      };
-      registry.register(record);
-      clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
-      clearPairingWindow(stateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      clearBestEffort("pending pair", () => clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
+      clearBestEffort("pairing window", () => clearPairingWindow(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
       return {
         status: "approved",
         deviceId: record.deviceId,

@@ -31,7 +31,13 @@ import {
 import { readBridgeProjects, resolveProjectIds } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
 import { commitment, deriveDeviceKeyV2, generateX25519KeyPair, pairTranscript, sharedSecret } from "./auth/pairing";
-import { openPairingWindow, readPendingPair, setPendingPairDecision, writePendingPair } from "./auth/pending-pair";
+import {
+  openPairingWindow,
+  pendingPairFilePath,
+  readPendingPair,
+  setPendingPairDecision,
+  writePendingPair,
+} from "./auth/pending-pair";
 import { signRequest } from "./auth/verify";
 import { runCli, type CliDeps } from "./cli";
 
@@ -2196,6 +2202,64 @@ describe("pairing", () => {
     expect(first.status).toBe("approved");
     expect(second).toEqual(first);
     expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(1);
+  });
+
+  test("a failure while registering answers expired on every poll and leaves no device behind", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    spyOn(registry, "register").mockImplementation(() => {
+      throw new Error("devices.json lock timeout");
+    });
+    const pairBridge = createBridge({ devicesFilePath, registry, now: () => FIXED_NOW });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { requestId, statusResponse, statusBody } = await pairDevice(pairBridge);
+      expect(statusResponse.status).toBe(200);
+      expect(statusBody).toEqual({ status: "expired" });
+      expect(await statusOf(pairBridge, requestId)).toEqual({ status: "expired" });
+      expect(await statusOf(pairBridge, requestId)).toEqual({ status: "expired" });
+      expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a listProjects failure answers expired instead of a 500 and registers nothing", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    spyOn(pairBridge.provider, "listProjects").mockRejectedValue(new Error("provider down"));
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { requestId, statusResponse, statusBody } = await pairDevice(pairBridge);
+      expect(statusResponse.status).toBe(200);
+      expect(statusBody).toEqual({ status: "expired" });
+      expect(await statusOf(pairBridge, requestId)).toEqual({ status: "expired" });
+      expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a cleanup failure after registration still hands the Watch its credential, registered once", async () => {
+    const registry = DeviceRegistry.load(devicesFilePath);
+    const realRegister = registry.register.bind(registry);
+    spyOn(registry, "register").mockImplementation((record) => {
+      realRegister(record);
+      // Make clearPendingPair fail: rmSync on a directory throws.
+      const pendingFile = pendingPairFilePath(stateDir);
+      rmSync(pendingFile, { force: true });
+      mkdirSync(pendingFile);
+    });
+    const pairBridge = createBridge({ devicesFilePath, registry, now: () => FIXED_NOW });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { requestId, statusResponse, statusBody, deviceId } = await pairDevice(pairBridge);
+      expect(statusResponse.status).toBe(200);
+      expect(statusBody.status).toBe("approved");
+      expect(statusBody.deviceId).toBe(deviceId);
+      expect(await statusOf(pairBridge, requestId)).toEqual(statusBody);
+      expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   test("a status poll with a different requestId after approval still answers expired", async () => {
