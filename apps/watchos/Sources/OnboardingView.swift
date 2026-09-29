@@ -74,7 +74,11 @@ struct OnboardingView: View {
         case .macSetup: return .macSetup
         case .findingMac: return .macSetup
         case .hostAddress: return .findingMac
-        case .matchCode: return .findingMac
+        // `.findingMac` re-runs the LAN sweep and auto-advances on a single result
+        // (`sweep()`/`choose()`), so returning there would restart the handshake Back just
+        // cancelled; `.macSetup` tells the user to re-run `bun run bridge pair`, which they must
+        // do after a cancel anyway.
+        case .matchCode: return .macSetup
         }
     }
 

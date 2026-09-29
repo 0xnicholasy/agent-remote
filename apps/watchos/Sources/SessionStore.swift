@@ -302,7 +302,7 @@ final class SessionStore {
     /// The pairing v2 request the Watch is currently waiting on the Mac for, set by
     /// `beginPairing()` and cleared once the handshake resolves or is cancelled.
     @ObservationIgnored private var pairingRequestId: String?
-    @ObservationIgnored private var pairingPollTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var pairingPollTask: Task<Void, Never>?
     /// True for the lifetime of a running `pollPairingLoop`, so `resumePairingPollingIfNeeded()`
     /// can tell a foreground-return apart from a loop that is still actually polling: a `Task`
     /// reference alone does not report whether the work it started has finished.
@@ -376,7 +376,12 @@ final class SessionStore {
             guard generation == pairingGeneration else {
                 // A concurrent cancelPairing() saw no requestId yet and sent nothing, so free
                 // the bridge's slot here.
-                try? await client.cancelPairing(requestId: handshake.requestId)
+                // An unstructured Task does not inherit the caller's cancellation, so when Back
+                // has already cancelled the view's .task the request is still sent (URLSession
+                // fails immediately inside a cancelled task); awaiting .value keeps the
+                // send-before-return ordering, and Task.value is not interrupted by the
+                // awaiting task's cancellation.
+                await Task { [client] in try? await client.cancelPairing(requestId: handshake.requestId) }.value
                 return
             }
             pairingRequestId = handshake.requestId
@@ -458,8 +463,10 @@ final class SessionStore {
 
     /// A network error during pairing status polling retries (1 s between attempts) for up to
     /// this long before finally giving up and showing a connection failure -- a dimmed screen or
-    /// a momentary Wi-Fi blip must not strand the user on a silent "waiting" state.
-    private static let pairingPollRetryCapSeconds: Double = 60
+    /// a momentary Wi-Fi blip must not strand the user on a silent "waiting" state. Instance-level
+    /// and internal so `SessionStoreDecisionTests` can shorten it, the same way `client` is
+    /// injectable; production code never writes it.
+    @ObservationIgnored var pairingPollRetryCap: Duration = .seconds(60)
 
     /// Polls `GET /v1/pair/status` about once a second until the handshake resolves. Guarded by
     /// `generation` throughout so a `cancelPairing()`/new `beginPairing()` started while this
@@ -469,17 +476,17 @@ final class SessionStore {
     /// place rather than immediately failing the handshake: `BridgeError` values are semantic
     /// answers from the bridge (e.g. the request expired or was denied) and still end the loop
     /// right away, but anything else keeps retrying, 1 s apart, until
-    /// `pairingPollRetryCapSeconds` of retrying has elapsed.
+    /// `pairingPollRetryCap` of retrying has elapsed.
     private func pollPairingLoop(requestId: String, generation: Int) async {
         pairingPollActive = true
         defer { pairingPollActive = false }
-        var retriedSeconds: Double = 0
+        var retryDeadline: ContinuousClock.Instant?
         while !Task.isCancelled {
             guard generation == pairingGeneration else { return }
             do {
                 let result = try await client.pollPairing(requestId: requestId)
                 guard generation == pairingGeneration else { return }
-                retriedSeconds = 0
+                retryDeadline = nil
                 switch result {
                 case .pending:
                     try? await Task.sleep(for: .seconds(1))
@@ -515,8 +522,9 @@ final class SessionStore {
                     pairingPhase = .failed("Unexpected reply from the bridge")
                     return
                 }
-                if retriedSeconds < Self.pairingPollRetryCapSeconds {
-                    retriedSeconds += 1
+                let deadline = retryDeadline ?? ContinuousClock.now + pairingPollRetryCap
+                retryDeadline = deadline
+                if ContinuousClock.now < deadline {
                     try? await Task.sleep(for: .seconds(1))
                     continue
                 }

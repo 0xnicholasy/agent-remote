@@ -69,8 +69,9 @@ final class OnboardingViewTests: XCTestCase {
 
     // MARK: - previousStep
 
-    func testPreviousStep_fromMatchCode_isFindingMac() {
-        XCTAssertEqual(OnboardingView.previousStep(.matchCode), .findingMac)
+    /// `.findingMac` auto-advances on a single LAN result, so Back must not land there.
+    func testPreviousStep_fromMatchCode_isMacSetup() {
+        XCTAssertEqual(OnboardingView.previousStep(.matchCode), .macSetup)
     }
 
     func testPreviousStep_fromHostAddress_isFindingMac() {

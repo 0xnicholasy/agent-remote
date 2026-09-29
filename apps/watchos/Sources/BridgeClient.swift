@@ -445,7 +445,11 @@ actor BridgeClient: BridgeClientProtocol {
             try Self.checkStatus(revealResponse, data: revealData)
         } catch {
             // The bridge holds the slot until the window closes; free it for the next attempt.
-            try? await cancelPairing(requestId: started.requestId)
+            // An unstructured Task does not inherit the caller's cancellation, so the request is
+            // still sent when the caller was cancelled (URLSession fails immediately inside a
+            // cancelled task); awaiting .value keeps the send-before-return ordering, and
+            // Task.value is not interrupted by the awaiting task's cancellation.
+            await Task { try? await self.cancelPairing(requestId: started.requestId) }.value
             throw error
         }
 
