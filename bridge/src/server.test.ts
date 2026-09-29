@@ -2256,6 +2256,44 @@ describe("pairing", () => {
     }
   });
 
+  test("a cancel during the listProjects await answers expired and registers nothing", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    let release: (projects: Project[]) => void = () => undefined;
+    const listing = new Promise<Project[]>((resolve) => {
+      release = resolve;
+    });
+    let listingStarted: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      listingStarted = resolve;
+    });
+    spyOn(pairBridge.provider, "listProjects").mockImplementation(() => {
+      listingStarted();
+      return listing;
+    });
+
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watchNonce = "55".repeat(16);
+    const startResponse = await startWith(pairBridge, { commit: commitment(watchNonce) });
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+    await revealWith(pairBridge, { requestId, watchNonce });
+    setPendingPairDecision(stateDir, requestId, "approved", 2000);
+
+    const poll = statusOf(pairBridge, requestId);
+    await started;
+    // The Watch cancels (or a newer pairing supersedes) while approval is awaiting the provider.
+    await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId }),
+      }),
+    );
+    release([{ id: "prj_demo", name: "demo", path: "/tmp/demo" }]);
+
+    expect(await poll).toEqual({ status: "expired" });
+    expect(DeviceRegistry.load(devicesFilePath).list()).toHaveLength(0);
+  });
+
   test("a cleanup failure after registration still hands the Watch its credential, registered once", async () => {
     const registry = DeviceRegistry.load(devicesFilePath);
     const realRegister = registry.register.bind(registry);
