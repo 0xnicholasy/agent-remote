@@ -30,7 +30,8 @@ import {
 } from "./server";
 import { readBridgeProjects, resolveProjectIds } from "./projects";
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
-import { deriveDeviceKey, pairingProof } from "./auth/pairing";
+import { commitment, deriveDeviceKeyV2, generateX25519KeyPair, pairTranscript, sharedSecret } from "./auth/pairing";
+import { openPairingWindow, readPendingPair, setPendingPairDecision, writePendingPair } from "./auth/pending-pair";
 import { signRequest } from "./auth/verify";
 import { runCli, type CliDeps } from "./cli";
 
@@ -468,7 +469,7 @@ describe("bridge HTTP surface", () => {
  * tests exercise the AGENTREMOTE_PROVIDER=claude branch without spawning the real SDK
  * subprocess. */
 class StubClaudeProvider implements AgentProvider {
-  readonly id = "claude";
+  readonly id: string;
   readonly capabilities: AgentCapabilities = {
     approvals: true,
     questions: true,
@@ -497,14 +498,20 @@ class StubClaudeProvider implements AgentProvider {
   createSessionCallCount = 0;
   /** Set by a test to make the next listSessions call throw instead of returning sessions. */
   listSessionsError: Error | undefined;
+  disposeCallCount = 0;
 
-  constructor(host: ProviderHost, options: { projects: Project[] }) {
+  constructor(host: ProviderHost, options: { projects: Project[] }, id = "claude") {
     this.host = host;
     this.projects = options.projects;
+    this.id = id;
   }
 
   seedSession(session: Session): void {
     this.sessions.set(session.id, session);
+  }
+
+  dispose(): void {
+    this.disposeCallCount += 1;
   }
 
   async listProjects(): Promise<Project[]> {
@@ -634,6 +641,51 @@ describe("AGENTREMOTE_PROVIDER selection", () => {
       for (const event of body.events) {
         expect(event.provider).toBe("claude");
       }
+    } finally {
+      restoreProviderEnv();
+    }
+  });
+
+  test("AGENTREMOTE_PROVIDER=codex wires the codex provider with the configured cwd", async () => {
+    process.env.AGENTREMOTE_PROVIDER = "codex";
+    const originalDirs = process.env.AGENTREMOTE_PROJECT_DIRS;
+    delete process.env.AGENTREMOTE_PROJECT_DIRS;
+    try {
+      let receivedProjects: Project[] = [];
+      const codexBridge = createBridge({
+        authEnabled: false,
+        createCodexProvider: (host, providerOptions) => {
+          receivedProjects = providerOptions.projects;
+          return new StubClaudeProvider(host, providerOptions, "codex");
+        },
+      });
+      expect(codexBridge.provider.id).toBe("codex");
+      expect(codexBridge.session.provider).toBe("codex");
+      expect(receivedProjects.map((project) => project.path)).toEqual([process.cwd()]);
+      codexBridge.close();
+    } finally {
+      if (originalDirs === undefined) {
+        delete process.env.AGENTREMOTE_PROJECT_DIRS;
+      } else {
+        process.env.AGENTREMOTE_PROJECT_DIRS = originalDirs;
+      }
+      restoreProviderEnv();
+    }
+  });
+
+  test("bridge close disposes the codex provider before returning", () => {
+    process.env.AGENTREMOTE_PROVIDER = "codex";
+    try {
+      let stub: StubClaudeProvider | undefined;
+      const codexBridge = createBridge({
+        authEnabled: false,
+        createCodexProvider: (host, providerOptions) => {
+          stub = new StubClaudeProvider(host, providerOptions, "codex");
+          return stub;
+        },
+      });
+      codexBridge.close();
+      expect(stub?.disposeCallCount).toBe(1);
     } finally {
       restoreProviderEnv();
     }
@@ -1223,8 +1275,16 @@ describe("resolveBindHost", () => {
     expect(resolveBindHost("mock", undefined)).toEqual({ hostname: undefined, warnNoAuth: false });
   });
 
+  test("defaults the codex provider to loopback when AGENTREMOTE_HOST is unset", () => {
+    expect(resolveBindHost("codex", undefined)).toEqual({ hostname: "127.0.0.1", warnNoAuth: false });
+  });
+
   test("an explicit non-loopback AGENTREMOTE_HOST with the claude provider warns", () => {
     expect(resolveBindHost("claude", "0.0.0.0")).toEqual({ hostname: "0.0.0.0", warnNoAuth: true });
+  });
+
+  test("an explicit non-loopback AGENTREMOTE_HOST with the codex provider warns", () => {
+    expect(resolveBindHost("codex", "0.0.0.0")).toEqual({ hostname: "0.0.0.0", warnNoAuth: true });
   });
 
   test("an explicit loopback AGENTREMOTE_HOST never warns", () => {
@@ -1245,7 +1305,13 @@ describe("assertAuthBypassAllowed", () => {
     ).not.toThrow();
   });
 
-  test("permits AGENTREMOTE_AUTH=off with the mock provider bound to a non-loopback host: the gate is claude-only", () => {
+  test("refuses AGENTREMOTE_AUTH=off with the codex provider bound to a non-loopback host", () => {
+    expect(() =>
+      assertAuthBypassAllowed({ authEnabled: false, providerId: "codex", hostname: "0.0.0.0" }),
+    ).toThrow(/AGENTREMOTE_AUTH=off refuses to start/);
+  });
+
+  test("permits AGENTREMOTE_AUTH=off with the mock provider bound to a non-loopback host", () => {
     // The mock provider is exempt by design: it serves fixed demo data (a constant fake cwd,
     // prj_demo/ses_seed) and executes nothing on the host, so an unauthenticated non-loopback
     // mock bridge exposes no real data.
@@ -1335,6 +1401,29 @@ describe("signed request envelope and command authorization", () => {
     expect(await response.json()).toEqual({ error: "unauthenticated" });
   });
 
+  test("GET /v1/info requires authentication", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(new Request("http://bridge.local/v1/info"));
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "unauthenticated" });
+  });
+
+  test("GET /v1/info returns the exact selected provider and capabilities", async () => {
+    const registry = new DeviceRegistry();
+    registry.register(sampleDeviceRecord());
+    const authedBridge = createBridge({ registry, now: () => FIXED_NOW });
+
+    const response = await authedBridge.fetch(signedRequest({ method: "GET", pathWithQuery: "/v1/info" }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      provider: "mock",
+      capabilities: authedBridge.provider.capabilities,
+    });
+  });
+
   test("a revoked device is rejected with 403 device_revoked", async () => {
     const registry = new DeviceRegistry();
     registry.register(sampleDeviceRecord());
@@ -1421,7 +1510,10 @@ describe("signed request envelope and command authorization", () => {
 
     const response = await authedBridge.fetch(new Request("http://bridge.local/v1/health"));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, bridgeId: authedBridge.bridgeId });
+    const body = (await response.json()) as { ok: boolean; bridgeId: string; name: string };
+    expect(body.ok).toBe(true);
+    expect(body.bridgeId).toBe(authedBridge.bridgeId);
+    expect(typeof body.name).toBe("string");
   });
 
   test("an action outside allowedActions is rejected with 403 action_not_allowed", async () => {
@@ -1648,64 +1740,386 @@ describe("pairing", () => {
     rmSync(stateDir, { recursive: true, force: true });
   });
 
-  test("a successful pairing followed by a signed command succeeds", async () => {
-    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_aaaaaaaaaaaaaaaa";
-    const deviceName = "Ting's Apple Watch";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof(pairBridge.pairingCode, deviceId, deviceName, nonce);
+  /** Walks the full v2 handshake against `target` (start -> reveal -> the CLI's decision write ->
+   * status), and independently recomputes the device key the Watch side would derive, so callers
+   * get back something they can sign requests with without trusting the bridge's own derivation. */
+  async function pairDevice(
+    target: Bridge,
+    params: { deviceId?: string; deviceName?: string; decision?: "approved" | "denied" } = {},
+  ): Promise<{
+    requestId: string;
+    deviceId: string;
+    deviceKey: Buffer;
+    startResponse: Response;
+    revealResponse: Response;
+    statusResponse: Response;
+    statusBody: Record<string, unknown>;
+  }> {
+    const deviceId = params.deviceId ?? `dev_${randomBytes(8).toString("hex")}`;
+    const deviceName = params.deviceName ?? "Ting's Apple Watch";
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
 
-    const pairResponse = await pairBridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
+    const watch = generateX25519KeyPair();
+    const watchNonce = randomBytes(16).toString("hex");
+    const commit = commitment(watchNonce);
+
+    const startResponse = await target.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
+        body: JSON.stringify({ deviceId, deviceName, devicePublicKey: watch.publicKeyHex, commit }),
       }),
     );
-    expect(pairResponse.status).toBe(200);
-    const pairBody = (await pairResponse.json()) as {
-      deviceId: string;
-      keyId: string;
-      pairedAt: string;
-      bridgeId: string;
-      allowedProjects: string[];
-      allowedActions: string[];
+    const startBody = (await startResponse.clone().json()) as {
+      requestId?: string;
+      bridgeId?: string;
+      bridgePublicKey?: string;
+      bridgeNonce?: string;
     };
-    expect(pairBody.deviceId).toBe(deviceId);
-    expect(pairBody.bridgeId).toBe(pairBridge.bridgeId);
-    expect(pairBody.allowedProjects).toEqual(["prj_demo"]);
-    expect(pairBody.allowedActions).toContain("prompt.send");
+    const requestId = startBody.requestId ?? "";
 
-    const deviceKey = deriveDeviceKey(pairBridge.pairingCode, deviceId, nonce);
+    const revealResponse = await target.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, watchNonce }),
+      }),
+    );
+
+    const decision = params.decision ?? "approved";
+    setPendingPairDecision(stateDir, requestId, decision, 2000);
+
+    const statusResponse = await target.fetch(
+      new Request(`http://bridge.local/v1/pair/status?requestId=${requestId}`),
+    );
+    const statusBody = (await statusResponse.clone().json()) as Record<string, unknown>;
+
+    const transcript = pairTranscript({
+      bridgeId: startBody.bridgeId ?? "",
+      bridgePublicKeyHex: startBody.bridgePublicKey ?? "",
+      devicePublicKeyHex: watch.publicKeyHex,
+      bridgeNonceHex: startBody.bridgeNonce ?? "",
+      watchNonceHex: watchNonce,
+    });
+    const shared = sharedSecret(watch.privateKey, startBody.bridgePublicKey ?? "");
+    const deviceKey = deriveDeviceKeyV2(shared, transcript);
+
+    return { requestId, deviceId, deviceKey, startResponse, revealResponse, statusResponse, statusBody };
+  }
+
+  test("the full handshake pairs a device and its independently derived key signs a request", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const { startResponse, revealResponse, statusResponse, statusBody, deviceId, deviceKey } =
+      await pairDevice(pairBridge);
+
+    expect(startResponse.status).toBe(200);
+    expect(revealResponse.status).toBe(200);
+    expect(statusResponse.status).toBe(200);
+    expect(statusBody.status).toBe("approved");
+    expect(statusBody.deviceId).toBe(deviceId);
+    expect(statusBody.bridgeId).toBe(pairBridge.bridgeId);
+    expect(statusBody.allowedProjects).toEqual(["prj_demo"]);
+    expect((statusBody.allowedActions as string[]) ?? []).toContain("prompt.send");
+
     const response = await pairBridge.fetch(
       signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
     );
     expect(response.status).toBe(200);
   });
 
-  test("a wrong pairing code is rejected with 401 pairing_rejected", async () => {
+  test("/v1/pair/start is refused with 403 pairing_closed when no window is open", async () => {
     const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_bbbbbbbbbbbbbbbb";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof("WRONGWRONGWR", deviceId, "Watch", nonce);
-
+    const watch = generateX25519KeyPair();
     const response = await pairBridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
+      new Request("http://bridge.local/v1/pair/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName: "Watch", nonce, proof }),
+        body: JSON.stringify({
+          deviceId: "dev_no_window",
+          deviceName: "Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment(randomBytes(16).toString("hex")),
+        }),
       }),
     );
-    expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "pairing_rejected" });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "pairing_closed" });
   });
 
-  test("a malformed JSON body is rejected with 401 pairing_rejected and enrolls no device", async () => {
-    const registry = new DeviceRegistry(devicesFilePath);
-    const pairBridge = createBridge({ registry, now: () => FIXED_NOW });
+  test("/v1/pair/reveal rejects a commit that does not match the revealed nonce, with 401", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watch = generateX25519KeyPair();
+    const startResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_bad_commit",
+          deviceName: "Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment("aa".repeat(16)),
+        }),
+      }),
+    );
+    const { requestId } = (await startResponse.json()) as { requestId: string };
 
+    const revealResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, watchNonce: "bb".repeat(16) }),
+      }),
+    );
+    expect(revealResponse.status).toBe(401);
+    expect(await revealResponse.json()).toEqual({ error: "pairing_rejected" });
+    expect(readPendingPair(stateDir)).toBeUndefined();
+  });
+
+  test("/v1/pair/reveal after the 30s timeout is rejected", async () => {
+    let clock = FIXED_NOW;
+    const pairBridge = createBridge({ devicesFilePath, now: () => clock });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watch = generateX25519KeyPair();
+    const watchNonce = "cc".repeat(16);
+    const startResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_slow_reveal",
+          deviceName: "Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment(watchNonce),
+        }),
+      }),
+    );
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+
+    clock = new Date(FIXED_NOW.getTime() + 31_000);
+    const revealResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, watchNonce }),
+      }),
+    );
+    expect(revealResponse.status).toBe(401);
+    expect(await revealResponse.json()).toEqual({ error: "pairing_rejected" });
+  });
+
+  test("a second /v1/pair/start while one is pending answers 409 pairing_busy", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const first = generateX25519KeyPair();
+    await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_first",
+          deviceName: "Watch",
+          devicePublicKey: first.publicKeyHex,
+          commit: commitment("dd".repeat(16)),
+        }),
+      }),
+    );
+
+    const second = generateX25519KeyPair();
     const response = await pairBridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_second",
+          deviceName: "Watch 2",
+          devicePublicKey: second.publicKeyHex,
+          commit: commitment("ee".repeat(16)),
+        }),
+      }),
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "pairing_busy" });
+  });
+
+  test("/v1/pair/start clears a stale, decided pending-pair record and succeeds", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+
+    // Exact shape of the leftover record observed in production: a denied decision from an
+    // earlier attempt whose expiresAt has already passed, and that nothing ever cleared because
+    // the Watch never polled /v1/pair/status.
+    writePendingPair(
+      stateDir,
+      {
+        requestId: "par_ce9ff469d44fed95",
+        deviceId: "dev_404d25e5465bc3ee",
+        deviceName: "Apple Watch",
+        code: 258,
+        revealedAt: new Date(FIXED_NOW.getTime() - 14 * 60_000).toISOString(),
+        expiresAt: new Date(FIXED_NOW.getTime() - 12 * 60_000).toISOString(),
+        decision: "denied",
+        status: "pending",
+      },
+      2000,
+    );
+
+    const watch = generateX25519KeyPair();
+    const response = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_new_watch",
+          deviceName: "Apple Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment("ff".repeat(16)),
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { requestId: string };
+    expect(body.requestId).toBeDefined();
+    expect(readPendingPair(stateDir)?.requestId).toBeUndefined();
+  });
+
+  test("a 7th start within a minute is rate limited with 429", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+
+    async function attemptStart(deviceId: string): Promise<Response> {
+      const watch = generateX25519KeyPair();
+      const response = await pairBridge.fetch(
+        new Request("http://bridge.local/v1/pair/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            deviceId,
+            deviceName: "Watch",
+            devicePublicKey: watch.publicKeyHex,
+            commit: commitment(randomBytes(16).toString("hex")),
+          }),
+        }),
+      );
+      // Immediately cancel so the next attempt is never blocked by pairing_busy, only by the
+      // rate limit this test is checking.
+      const body = (await response.clone().json()) as { requestId?: string };
+      if (body.requestId !== undefined) {
+        await pairBridge.fetch(
+          new Request("http://bridge.local/v1/pair/cancel", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ requestId: body.requestId }),
+          }),
+        );
+      }
+      return response;
+    }
+
+    for (let i = 0; i < 6; i++) {
+      const response = await attemptStart(`dev_rate_${i}`);
+      expect(response.status).toBe(200);
+    }
+    const seventh = await attemptStart("dev_rate_6");
+    expect(seventh.status).toBe(429);
+    expect(await seventh.json()).toEqual({ error: "rate_limited" });
+  });
+
+  test("/v1/pair/cancel frees the slot for a new start", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const first = generateX25519KeyPair();
+    const startResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_cancel_me",
+          deviceName: "Watch",
+          devicePublicKey: first.publicKeyHex,
+          commit: commitment("ff".repeat(16)),
+        }),
+      }),
+    );
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+
+    const cancelResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId }),
+      }),
+    );
+    expect(cancelResponse.status).toBe(200);
+
+    const second = generateX25519KeyPair();
+    const secondStart = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_after_cancel",
+          deviceName: "Watch",
+          devicePublicKey: second.publicKeyHex,
+          commit: commitment("11".repeat(16)),
+        }),
+      }),
+    );
+    expect(secondStart.status).toBe(200);
+  });
+
+  test("/v1/pair/status answers denied and frees the slot when the operator declines", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const { statusBody, deviceId } = await pairDevice(pairBridge, { decision: "denied" });
+    expect(statusBody).toEqual({ status: "denied" });
+    expect(DeviceRegistry.load(devicesFilePath).get(deviceId)).toBeUndefined();
+  });
+
+  test("/v1/pair/status answers expired for an unknown requestId", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const response = await pairBridge.fetch(new Request("http://bridge.local/v1/pair/status?requestId=par_bogus"));
+    expect(await response.json()).toEqual({ status: "expired" });
+  });
+
+  test("/v1/pair/status answers expired once 120s pass after reveal with no decision", async () => {
+    let clock = FIXED_NOW;
+    const pairBridge = createBridge({ devicesFilePath, now: () => clock });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watch = generateX25519KeyPair();
+    const watchNonce = "22".repeat(16);
+    const startResponse = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_expiring",
+          deviceName: "Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment(watchNonce),
+        }),
+      }),
+    );
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+    await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, watchNonce }),
+      }),
+    );
+
+    clock = new Date(FIXED_NOW.getTime() + 121_000);
+    const response = await pairBridge.fetch(
+      new Request(`http://bridge.local/v1/pair/status?requestId=${requestId}`),
+    );
+    expect(await response.json()).toEqual({ status: "expired" });
+  });
+
+  test("a malformed JSON body to /v1/pair/start is rejected with 401 pairing_rejected", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const response = await pairBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{not valid json",
@@ -1713,42 +2127,20 @@ describe("pairing", () => {
     );
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "pairing_rejected" });
-    expect(registry.list()).toEqual([]);
   });
 
-  test("valid JSON missing/ill-typed required fields is rejected with 401 pairing_rejected and enrolls no device", async () => {
-    const registry = new DeviceRegistry(devicesFilePath);
-    const pairBridge = createBridge({ registry, now: () => FIXED_NOW });
-
-    // Well-formed JSON, but `nonce` is missing and `proof` is a number rather than a string.
-    const response = await pairBridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId: "dev_eeeeeeeeeeeeeeee", deviceName: "Watch", proof: 12345 }),
-      }),
-    );
-    expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "pairing_rejected" });
-    expect(registry.list()).toEqual([]);
+  test("GET /v1/health reports the host name", async () => {
+    const pairBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    const response = await pairBridge.fetch(new Request("http://bridge.local/v1/health"));
+    const body = (await response.json()) as { ok: boolean; bridgeId: string; name: string };
+    expect(body.ok).toBe(true);
+    expect(typeof body.name).toBe("string");
+    expect(body.name.length).toBeGreaterThan(0);
   });
 
   test("pairing survives a new createBridge over the same devices file", async () => {
     const firstBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_cccccccccccccccc";
-    const deviceName = "Watch";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof(firstBridge.pairingCode, deviceId, deviceName, nonce);
-
-    const pairResponse = await firstBridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
-      }),
-    );
-    expect(pairResponse.status).toBe(200);
-    const deviceKey = deriveDeviceKey(firstBridge.pairingCode, deviceId, nonce);
+    const { deviceId, deviceKey } = await pairDevice(firstBridge, { deviceId: "dev_cccccccccccccccc" });
 
     firstBridge.close();
     const secondBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
@@ -1759,25 +2151,47 @@ describe("pairing", () => {
     expect(secondBridge.bridgeId).toBe(firstBridge.bridgeId);
   });
 
+  test("a bridge restart clears a stale pending-pair.json/pairing-window.json left by a crashed process", async () => {
+    const firstBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    openPairingWindow(stateDir, FIXED_NOW, 120_000, 2000);
+    const watch = generateX25519KeyPair();
+    const startResponse = await firstBridge.fetch(
+      new Request("http://bridge.local/v1/pair/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          deviceId: "dev_stale",
+          deviceName: "Watch",
+          devicePublicKey: watch.publicKeyHex,
+          commit: commitment("33".repeat(16)),
+        }),
+      }),
+    );
+    const { requestId } = (await startResponse.json()) as { requestId: string };
+    await firstBridge.fetch(
+      new Request("http://bridge.local/v1/pair/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ requestId, watchNonce: "33".repeat(16) }),
+      }),
+    );
+    expect(readPendingPair(stateDir)).toBeDefined();
+    firstBridge.close();
+
+    const secondBridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
+    expect(readPendingPair(stateDir)).toBeUndefined();
+    const statusResponse = await secondBridge.fetch(
+      new Request(`http://bridge.local/v1/pair/status?requestId=${requestId}`),
+    );
+    expect(await statusResponse.json()).toEqual({ status: "expired" });
+  });
+
   // Regression test for the live bug: AGENTREMOTE_REVOKE runs as a separate one-shot process
   // that writes devices.json directly. A running bridge must notice that write on its next
   // request rather than needing a restart, since restarting kills every live session.
   test("a device revoked by a separate DeviceRegistry over the same file is rejected without a bridge restart", async () => {
     const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_dddddddddddddddd";
-    const deviceName = "Watch";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
-
-    const pairResponse = await bridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
-      }),
-    );
-    expect(pairResponse.status).toBe(200);
-    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+    const { deviceId, deviceKey } = await pairDevice(bridge, { deviceId: "dev_dddddddddddddddd" });
 
     const beforeRevoke = await bridge.fetch(
       signedRequest({ method: "GET", pathWithQuery: "/v1/sessions", deviceId, deviceKey }),
@@ -1800,20 +2214,7 @@ describe("pairing", () => {
   // process editing devices.json directly must be visible to a running bridge without a restart.
   test("projects deny run via the CLI over the same devices file is enforced without a bridge restart", async () => {
     const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_eeeeeeeeeeeeeeee";
-    const deviceName = "Watch";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
-
-    const pairResponse = await bridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
-      }),
-    );
-    expect(pairResponse.status).toBe(200);
-    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+    const { deviceId, deviceKey } = await pairDevice(bridge, { deviceId: "dev_eeeeeeeeeeeeeeee" });
 
     const createCommand: Command = {
       commandId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
@@ -1834,6 +2235,7 @@ describe("pairing", () => {
       stderr: () => {},
       sleep: () => Promise.resolve(),
       health: () => Promise.resolve(null),
+      prompt: () => Promise.resolve("n"),
       env: {},
       cwd: process.cwd(),
     };
@@ -1859,20 +2261,7 @@ describe("pairing", () => {
   // bridge restart in between.
   test("projects grant run against the same devices file is enforced without a bridge restart", async () => {
     const bridge = createBridge({ devicesFilePath, now: () => FIXED_NOW });
-    const deviceId = "dev_ffffffffffffffff";
-    const deviceName = "Watch";
-    const nonce = randomBytes(16).toString("hex");
-    const proof = pairingProof(bridge.pairingCode, deviceId, deviceName, nonce);
-
-    const pairResponse = await bridge.fetch(
-      new Request("http://bridge.local/v1/pair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ deviceId, deviceName, nonce, proof }),
-      }),
-    );
-    expect(pairResponse.status).toBe(200);
-    const deviceKey = deriveDeviceKey(bridge.pairingCode, deviceId, nonce);
+    const { deviceId, deviceKey } = await pairDevice(bridge, { deviceId: "dev_ffffffffffffffff" });
 
     // Stands in for `bun run bridge projects deny <deviceId> prj_demo`: a separate registry
     // instance over the same file strips the project the pairing flow granted by default.
@@ -1907,7 +2296,6 @@ describe("pairing", () => {
     expect(afterGrant.status).toBe(200);
   });
 });
-
 describe("interaction lifecycle", () => {
   async function createSecondSession(): Promise<string> {
     const response = await post({

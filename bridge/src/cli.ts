@@ -1,30 +1,38 @@
 // The Agent Remote bridge admin CLI: `bun run bridge pair|devices|revoke|projects ...`.
 //
-// This module deliberately does NOT import server.ts. It edits devices.json/pairing.json in the
-// state dir directly, exactly the way the old AGENTREMOTE_PAIR/AGENTREMOTE_REVOKE/
-// AGENTREMOTE_LIST_DEVICES one-shot env vars did: a running bridge notices the change on its next
-// request via DeviceRegistry.reloadIfChanged / PairingCodeStore.verify's reload (see
-// bridge/src/auth/devices.ts and bridge/src/auth/pairing.ts). Importing server.ts would pull in
-// the HTTP server, the command journal and bridge.lock — none of which this CLI may touch, since
-// it has to work correctly while a bridge process already holds the lock.
-import { existsSync, readFileSync } from "node:fs";
-import { networkInterfaces } from "node:os";
+// This module deliberately does NOT import server.ts. It edits devices.json/pending-pair.json/
+// pairing-window.json in the state dir directly, exactly the way the old AGENTREMOTE_PAIR/
+// AGENTREMOTE_REVOKE/AGENTREMOTE_LIST_DEVICES one-shot env vars did: a running bridge notices the
+// change on its next request via DeviceRegistry.reloadIfChanged / the pending-pair reload trick
+// (see bridge/src/auth/devices.ts and bridge/src/auth/pending-pair.ts). Importing server.ts would
+// pull in the HTTP server, the command journal and bridge.lock — none of which this CLI may touch,
+// since it has to work correctly while a bridge process already holds the lock.
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 
 import type { Project } from "@agentremote/protocol";
 
 import { DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
-import { formatPairingCode, PairingCodeStore } from "./auth/pairing";
+import {
+  clearPairingWindow,
+  clearPendingPair,
+  openPairingWindow,
+  PENDING_PAIR_CLI_LOCK_TIMEOUT_MS,
+  readPendingPair,
+  setPendingPairDecision,
+} from "./auth/pending-pair";
 import { bridgeProjectsFileName, projectIdFor, readBridgeProjects, resolveProjectIds } from "./projects";
 
 const DEFAULT_PORT = 8787;
-const PAIRING_TTL_MS = 5 * 60 * 1000;
+const PAIRING_WINDOW_TTL_MS = 120 * 1000;
 const POLL_INTERVAL_MS = 1000;
+const DEVICE_APPEAR_TIMEOUT_MS = 30 * 1000;
 
 /** Bridge health, as reported by `GET /v1/health`. `null` means the bridge could not be reached. */
 export interface CliHealth {
   ok: boolean;
   bridgeId: string;
+  name: string;
 }
 
 /**
@@ -39,6 +47,9 @@ export interface CliDeps {
   stderr: (line: string) => void;
   sleep: (ms: number) => Promise<void>;
   health: () => Promise<CliHealth | null>;
+  /** Asks `question` on stdin and resolves with the raw answer (no trimming/casing applied).
+   * `pair` uses this for the "Pair this Watch? [y/N] " confirmation. */
+  prompt: (question: string) => Promise<string>;
   env: NodeJS.ProcessEnv;
   cwd: string;
 }
@@ -48,7 +59,7 @@ function usage(): string {
     "Usage: bun run bridge <command> [args]",
     "",
     "Commands:",
-    "  pair [--no-wait]",
+    "  pair",
     "  devices [--json]",
     "  revoke <deviceId>",
     "  projects list",
@@ -122,19 +133,10 @@ function isProjectsError(value: ProjectsResult): value is { error: string } {
   return "error" in value;
 }
 
-/** True for a Node `ENOENT` (file does not exist), the one error a read racing an external
- * writer's unlink is expected to see. */
-function isEnoent(error: unknown): boolean {
-  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
-}
-
 function devicesFilePath(stateDir: string): string {
   return path.join(stateDir, "devices.json");
 }
 
-function pairingFilePath(stateDir: string): string {
-  return path.join(stateDir, "pairing.json");
-}
 
 /** Loads the device registry, turning a corrupt-file exception into the CLI's exit-1 contract
  * (print the path and the error, don't throw out of `runCli`) instead of letting every
@@ -205,133 +207,130 @@ async function applyVerified(
   return false;
 }
 
-async function runPair(args: string[], deps: CliDeps): Promise<number> {
-  const { flags } = splitFlags(args, ["--no-wait"]);
-  const noWait = flags.has("--no-wait");
-
-  const store = new PairingCodeStore(pairingFilePath(deps.stateDir));
-  const mintedAt = deps.now();
-  let code: string;
+/**
+ * `bun run bridge pair`, per the pairing v2 flow: open a 120 s window, wait for a Watch to reach
+ * `/v1/pair/reveal` (which writes pending-pair.json with the confirmation code), show the code
+ * and ask the operator to confirm it matches the Watch's own display, then wait for the running
+ * bridge to register the device (it does so on the Watch's next `/v1/pair/status` poll once it
+ * sees our decision).
+ */
+async function runPair(_args: string[], deps: CliDeps): Promise<number> {
+  const openedAt = deps.now();
   try {
-    code = store.mint(mintedAt);
+    openPairingWindow(deps.stateDir, openedAt, PAIRING_WINDOW_TTL_MS, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
   } catch (cause) {
-    deps.stderr(`${pairingFilePath(deps.stateDir)}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    deps.stderr(cause instanceof Error ? cause.message : String(cause));
     return 1;
   }
-  const expiresAt = new Date(mintedAt.getTime() + PAIRING_TTL_MS);
+  const windowExpiresAt = new Date(openedAt.getTime() + PAIRING_WINDOW_TTL_MS);
 
   const health = await deps.health();
   if (health === null) {
-    deps.stdout(
-      "Warning: no running bridge was found at this port. Starting one will mint its own " +
-        "pairing code, which will replace the one below.",
-    );
+    deps.stdout("Warning: no running bridge was found at this port. Start one before pairing a Watch.");
   }
 
-  const port = deps.env.PORT ?? String(DEFAULT_PORT);
-  for (const host of nonInternalIPv4Addresses()) {
-    deps.stdout(`Enter in Watch Settings: ${host}:${port}`);
-  }
-  deps.stdout(`Pairing code: ${formatPairingCode(code)} (expires ${expiresAt.toISOString()})`);
+  deps.stdout("Pairing open for 2 minutes. On your Watch, open Agent Remote and tap Next.");
 
-  if (noWait) {
-    return 0;
-  }
-
-  const pairingPath = pairingFilePath(deps.stateDir);
-  const mintedAtIso = mintedAt.toISOString();
-
+  // Phase 1: wait for a Watch to reach /v1/pair/reveal (pending-pair.json appears) or the window
+  // to expire with no request at all.
+  let requestId: string | undefined;
+  let deviceId: string | undefined;
+  let code: number | undefined;
+  let pendingExpiresAt: string | undefined;
   for (;;) {
+    let pending: ReturnType<typeof readPendingPair>;
+    try {
+      pending = readPendingPair(deps.stateDir);
+    } catch (cause) {
+      deps.stderr(cause instanceof Error ? cause.message : String(cause));
+      return 1;
+    }
+    if (pending !== undefined) {
+      requestId = pending.requestId;
+      deviceId = pending.deviceId;
+      code = pending.code;
+      pendingExpiresAt = pending.expiresAt;
+      break;
+    }
+    if (deps.now().getTime() >= windowExpiresAt.getTime()) {
+      deps.stderr("Pairing window expired with no device requesting to pair.");
+      return 1;
+    }
     await deps.sleep(POLL_INTERVAL_MS);
+  }
 
-    // Loaded fresh every tick (rather than once, up front) so a corrupt devices.json follows the
-    // CLI's own exit-1 contract instead of throwing out of registry.list() uncaught, and so this
-    // loop always sees whatever the bridge process most recently wrote.
-    const registry = loadRegistry(deps);
-    if (isRegistryError(registry)) {
-      deps.stderr(registry.error);
+  // From here on, this process has a decision (or is about to make one) recorded against
+  // requestId, in pending-pair.json. If the operator kills us with Ctrl-C before we reach one of
+  // our own exit paths below, clear it here too -- otherwise it sits there, decided, until it
+  // expires on its own, and blocks every pairing attempt in between (see /v1/pair/start's
+  // pairing_busy check).
+  const onSigint = (): void => {
+    clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+    process.exit(130);
+  };
+  process.once("SIGINT", onSigint);
+  try {
+    // Phase 2: show the code prominently and spell out the order -- either order
+    // (tap-then-confirm or confirm-then-tap) must actually work, since the operator may do
+    // either first.
+    deps.stdout(`Code on this Mac: ${code}`);
+    deps.stdout(`1. On your Watch, tap ${code}.`);
+    deps.stdout("2. Then confirm here.");
+    const answer = await deps.prompt("Pair this Watch? [y/N] ");
+    const approved = answer.trim().toLowerCase() === "y";
+
+    const applied = setPendingPairDecision(
+      deps.stateDir,
+      requestId!,
+      approved ? "approved" : "denied",
+      PENDING_PAIR_CLI_LOCK_TIMEOUT_MS,
+    );
+    if (!applied) {
+      deps.stderr("Pairing request expired or was cancelled before it could be answered.");
+      return 1;
+    }
+    if (!approved) {
+      deps.stdout("Pairing denied.");
+      // The Watch normally clears this on its next /v1/pair/status poll, but it may never poll
+      // again (it already gave up, or the operator denied before it started). Clear it ourselves
+      // so the next `pair` doesn't see a stale busy record.
+      clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
       return 1;
     }
 
-    // A second `pair` run, or a bridge restart, mints its own code and overwrites pairing.json
-    // while this run is still waiting. `pairedAt >= mintedAtIso` alone can't tell that device
-    // apart from one enrolled under our own code, so check the persisted mintedAt (the field the
-    // pairing store itself writes) against the one we minted before trusting any match below. A
-    // corrupt/unparsable file is left to the existing registry/expiry checks rather than treated
-    // as a supersession.
-    if (existsSync(pairingPath)) {
-      let currentMintedAt: string | undefined;
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(pairingPath, "utf8"));
-        if (typeof parsed === "object" && parsed !== null && typeof (parsed as { mintedAt?: unknown }).mintedAt === "string") {
-          currentMintedAt = (parsed as { mintedAt: string }).mintedAt;
-        }
-      } catch (cause) {
-        // Only the file vanishing between the exists() check above and this read is expected --
-        // the pairing store's own burn-on-verify race this block exists to handle. Anything else
-        // (invalid JSON, EACCES, ...) is a real problem: report it and stop rather than silently
-        // treating it as "no supersession" and looping forever.
-        if (!isEnoent(cause)) {
-          deps.stderr(`${pairingPath}: ${cause instanceof Error ? cause.message : String(cause)}`);
-          return 1;
-        }
-        currentMintedAt = undefined;
-      }
-      if (currentMintedAt !== undefined && currentMintedAt !== mintedAtIso) {
-        deps.stderr("pairing code was replaced by another pair run or a bridge restart; re-run pair");
+    // Phase 3: the bridge registers the device on the Watch's next status poll; wait for it to
+    // appear in devices.json. The deadline is the pending request's own expiry -- not a fixed
+    // 30s -- since the operator may have confirmed before the Watch even started polling.
+    deps.stdout(`Approved. Waiting for the Watch -- tap ${code} on your Watch if you haven't.`);
+    const parsedExpiresAt = pendingExpiresAt !== undefined ? Date.parse(pendingExpiresAt) : Number.NaN;
+    const decidedAt = deps.now();
+    const deadline = Number.isNaN(parsedExpiresAt) ? decidedAt.getTime() + DEVICE_APPEAR_TIMEOUT_MS : parsedExpiresAt;
+    for (;;) {
+      const registry = loadRegistry(deps);
+      if (isRegistryError(registry)) {
+        deps.stderr(registry.error);
         return 1;
       }
-    }
-
-    const paired = registry.list().find((device) => device.pairedAt >= mintedAtIso);
-    if (paired !== undefined) {
-      deps.stdout(`Paired device ${paired.deviceId} (${paired.deviceName})`);
-      return 0;
-    }
-
-    if (!existsSync(pairingPath)) {
-      // server.ts's /v1/pair handler burns pairing.json (PairingCodeStore.verify) before it
-      // calls registry.register(record): a tick can land in the gap between those two writes and
-      // see pairing.json already gone with the device not yet on disk. Re-check once more before
-      // declaring the code used up, so that gap doesn't get reported as a failed pairing.
-      // Known residual: if another pair run mints, pairs and burns a code within one tick, its
-      // device is reported here. Display only; /v1/pair decides access. Run `devices` to confirm.
-      const recheck = loadRegistry(deps);
-      const recheckPaired = isRegistryError(recheck)
-        ? undefined
-        : recheck.list().find((device) => device.pairedAt >= mintedAtIso);
-      if (recheckPaired !== undefined) {
-        deps.stdout(`Paired device ${recheckPaired.deviceId} (${recheckPaired.deviceName})`);
+      // deviceId is freshly chosen by the Watch for this attempt, so simply appearing in the
+      // registry at all -- with no clock comparison -- is enough to know this pairing landed.
+      const paired = registry.get(deviceId!);
+      if (paired !== undefined) {
+        deps.stdout(`Paired device ${paired.deviceId} (${paired.deviceName})`);
+        clearPairingWindow(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
         return 0;
       }
-      deps.stderr("Pairing code was used up before a device paired.");
-      return 1;
-    }
-
-    if (deps.now().getTime() - mintedAt.getTime() >= PAIRING_TTL_MS) {
-      deps.stderr("Pairing code expired before a device paired.");
-      return 1;
-    }
-  }
-}
-
-/** Every private IPv4/private-range-or-not address on a non-internal interface, in the order
- * `os.networkInterfaces()` reports them — good enough for "which address is my LAN address"
- * without a routing-table lookup, which Node/Bun have no portable API for. */
-function nonInternalIPv4Addresses(): string[] {
-  const interfaces = networkInterfaces();
-  const addresses: string[] = [];
-  for (const entries of Object.values(interfaces)) {
-    if (entries === undefined) {
-      continue;
-    }
-    for (const entry of entries) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        addresses.push(entry.address);
+      if (deps.now().getTime() >= deadline) {
+        deps.stderr("The Watch did not finish pairing. Run this command again and tap the code on your Watch.");
+        // Approved but the Watch never finished: leaving an approved, decided record sitting
+        // past its own expiry would otherwise block the next attempt with pairing_busy too.
+        clearPendingPair(deps.stateDir, PENDING_PAIR_CLI_LOCK_TIMEOUT_MS);
+        return 1;
       }
+      await deps.sleep(POLL_INTERVAL_MS);
     }
+  } finally {
+    process.off("SIGINT", onSigint);
   }
-  return addresses;
 }
 
 function deviceRow(record: DeviceRecord): { deviceId: string; deviceName: string; pairedAt: string; lastSeenAt: string | null; revoked: boolean; allowedProjects: string[] } {
@@ -561,8 +560,24 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
 }
 
+/**
+ * Which host the CLI's health probe should hit. A bridge started with `AGENTREMOTE_HOST` set to a
+ * real address (not every-interface `0.0.0.0`/`::`) only listens there, not on loopback, so
+ * probing 127.0.0.1 unconditionally reports "no running bridge" even though one is up. Mirrors
+ * `resolveBindHost` in server.ts (not imported: see this file's header comment on why cli.ts
+ * never imports server.ts).
+ */
+export function healthCheckHost(env: NodeJS.ProcessEnv): string {
+  const explicit = env.AGENTREMOTE_HOST?.trim();
+  if (explicit !== undefined && explicit.length > 0 && explicit !== "0.0.0.0" && explicit !== "::") {
+    return explicit;
+  }
+  return "127.0.0.1";
+}
+
 if (import.meta.main) {
   const port = process.env.PORT ?? String(DEFAULT_PORT);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
   const deps: CliDeps = {
     stateDir: resolveStateDir(),
     now: () => new Date(),
@@ -571,7 +586,8 @@ if (import.meta.main) {
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     health: async () => {
       try {
-        const response = await fetch(`http://127.0.0.1:${port}/v1/health`, { signal: AbortSignal.timeout(1000) });
+        const host = healthCheckHost(process.env);
+        const response = await fetch(`http://${host}:${port}/v1/health`, { signal: AbortSignal.timeout(1000) });
         if (!response.ok) {
           return null;
         }
@@ -580,10 +596,12 @@ if (import.meta.main) {
         return null;
       }
     },
+    prompt: (question) => rl.question(question),
     env: process.env,
     cwd: process.cwd(),
   };
 
   const exitCode = await runCli(process.argv.slice(2), deps);
+  rl.close();
   process.exit(exitCode);
 }
