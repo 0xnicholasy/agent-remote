@@ -15,84 +15,122 @@ interaction lifecycle expiry are M3 slice 2.
 
 | Term | Meaning |
 | --- | --- |
-| Pairing code | A 12-character Crockford base32 string the bridge prints on the Mac and the user types on the Watch. Never sent over the network. |
-| Device key | A 32-byte secret both sides derive from the pairing code. Never sent over the network. |
+| Confirmation code | A 3-digit number (100-999) both sides independently derive from the pairing handshake. Never sent over the network; only compared by eye. |
+| Device key | A 32-byte secret both sides derive from an X25519 shared secret and the handshake transcript. Never sent over the network. |
 | Device id | `dev_` followed by 16 lowercase hex characters, chosen by the client. |
 
 All HMACs are HMAC-SHA256. All comparisons of secrets or MACs are constant time. Hex output is
 lowercase.
 
-## Pairing code
+## Pairing
 
-The bridge mints one pairing code when it starts, and on demand when the operator asks for a new
-one. The code is printed to the bridge's own stdout only. See [Live pairing code
-storage](#live-pairing-code-storage) for how it is shared on disk with the operator command.
+Pairing v2 has no typed code. The Watch sends its X25519 public key; the Mac terminal
+(`bun run bridge pair`) and the Watch each show a 3-digit code derived from the handshake; the
+Watch shows four options and the user taps the one matching the Mac's code (or "None match" to
+cancel and retry); the operator then presses `y` at the `bun run bridge pair` prompt. Nothing is
+ever typed on the Watch.
 
-- Alphabet: Crockford base32 without the check symbol (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`).
-- Length: 12 characters, drawn from a cryptographic random source. 60 bits of entropy.
-- Displayed grouped for transcription (`ABCD-EFGH-JKMN`); groups and case are normalised away
-  before use. Normalisation: uppercase, strip every character outside the alphabet, and map the
-  Crockford aliases `I`/`L` to `1` and `O` to `0`.
-- Lifetime: 5 minutes from mint.
-- Attempt limit: 5 failed enrollment attempts against a code burn it. A successful enrollment also
-  burns it: one code enrolls exactly one device.
+Every route below is unauthenticated, hex encodings are lowercase, and every nonce is 16 random
+bytes hex encoded (32 hex characters):
 
-The canonical form used in every computation below is the normalised 12-character string.
+1. **`POST /v1/pair/start`**
 
-## Enrollment
+   ```json
+   { "deviceId": "dev_9f2c4a1b7d3e5061", "deviceName": "Ting's Apple Watch",
+     "devicePublicKey": "<64 lowercase hex characters, raw X25519 public key>",
+     "commit": "<64 lowercase hex characters>" }
+   ```
 
-`POST /v1/pair` is the only unauthenticated route besides `GET /v1/health`.
+   `commit = hex(SHA256("agentremote-pair-commit-v2\n" + watchNonce))`, where `watchNonce` is 16
+   random bytes the Watch keeps to itself until `/v1/pair/reveal`. Answers:
+   - `403 {"error":"pairing_closed"}` when no pairing window is open (see
+     [Timing](#timing)).
+   - `409 {"error":"pairing_busy"}` when a request is already pending.
+   - `429 {"error":"rate_limited"}` above 6 starts per minute, bridge-wide.
+   - `401 {"error":"pairing_rejected"}` for a malformed body: `deviceId` must be `dev_` followed
+     by 16 lowercase hex characters, `deviceName` 1 to 64 printable characters (no control
+     characters), and `devicePublicKey` and `commit` 64 lowercase hex characters each, where the
+     key must also import as an X25519 public key. It is also answered for a `deviceId` that is
+     already registered (including a revoked one); the Watch mints a fresh id per attempt, so
+     re-pairing is unaffected.
+   - `200`:
+     ```json
+     { "requestId": "par_<16 hex>", "bridgeId": "brg_<8 hex>",
+       "bridgePublicKey": "<64 hex>", "bridgeNonce": "<32 hex>",
+       "expiresAt": "2026-09-20T10:15:00.000Z" }
+     ```
 
-Request body:
+2. **`POST /v1/pair/reveal`**
 
-```json
-{
-  "deviceId": "dev_9f2c4a1b7d3e5061",
-  "deviceName": "Ting's Apple Watch",
-  "nonce": "<32 lowercase hex characters>",
-  "proof": "<64 lowercase hex characters>"
-}
+   ```json
+   { "requestId": "par_...", "watchNonce": "<32 hex>" }
+   ```
+
+   `requestId` must be `par_` followed by 16 lowercase hex characters and `watchNonce` 32
+   lowercase hex characters. Must arrive within 30 seconds of `start`. The bridge checks `commit` against the now-revealed
+   `watchNonce` in constant time; a mismatch, an unknown `requestId`, or a late reveal all answer
+   `401 {"error":"pairing_rejected"}` and drop the request. On a match the bridge computes the
+   confirmation code (below), writes `pending-pair.json`, and answers
+   `200 {"status":"pending","expiresAt":"..."}`.
+
+3. **`GET /v1/pair/status?requestId=`**, polled by the Watch about once a second:
+   `{"status":"pending"|"approved"|"denied"|"expired"}`. On `approved` the body also carries the
+   enrollment response fields: `deviceId`, `keyId`, `pairedAt`, `bridgeId`, `allowedProjects`,
+   `allowedActions`. An unknown `requestId` answers `expired`. Re-polling an approved `requestId`
+   before the record's `expiresAt` returns the same `approved` body; the device is registered
+   once.
+
+4. **`POST /v1/pair/cancel`** `{"requestId": "par_..."}` — the Watch's "None match" or
+   wrong-pick path. The bridge marks the request cancelled and frees the slot for a new `start`.
+   Always answers `200`.
+
+### Derivation
+
+Identical in TypeScript (`bridge/src/auth/pairing.ts`) and Swift
+(`protocol/swift/Sources/AgentRemoteProtocol/RequestSigning.swift`):
+
+```
+transcript = "agentremote-pair-confirm-v2\n" + bridgeId + "\n" + bridgePublicKey + "\n"
+             + devicePublicKey + "\n" + bridgeNonce + "\n" + watchNonce
+code       = uint32be(SHA256(transcript)[0..4]) mod 900 + 100   (3 digits, 100..999)
+shared     = X25519(ownPrivate, peerPublic)
+deviceKey  = HKDF-SHA256(ikm=shared, salt=SHA256(transcript), info="agentremote-device-key-v2", length 32)
+keyId      = "key_" + first 8 hex characters of SHA-256(deviceKey)
 ```
 
-`nonce` is 16 random bytes, hex encoded. `proof` is:
-
-```
-proof = HMAC(code, "agentremote-pair-v1\n" + deviceId + "\n" + deviceName + "\n" + nonce)
-```
-
-where `code` is the normalised pairing code encoded as UTF-8 and used directly as the HMAC key.
-
-The bridge recomputes `proof` from its own live code. On mismatch it increments the attempt
-counter and answers `401 {"error":"pairing_rejected"}` — the same body for a wrong code, an
-expired code, an exhausted code and a malformed proof, so the response does not tell an attacker
-which one it was. On a match it derives the device key, stores the device, and answers:
-
-```json
-{
-  "deviceId": "dev_9f2c4a1b7d3e5061",
-  "keyId": "key_<8 hex>",
-  "pairedAt": "2026-09-20T10:15:00.000Z",
-  "bridgeId": "brg_<8 hex>",
-  "allowedProjects": ["prj_demo"],
-  "allowedActions": ["prompt.send", "approval.accept", "approval.reject", "session.cancel", "question.answer", "session.create"]
-}
-```
-
-Both sides derive the device key independently; it never appears in the response:
-
-```
-deviceKey = HKDF-SHA256(
-  ikm  = code (UTF-8),
-  salt = deviceId + "\n" + nonce (UTF-8),
-  info = "agentremote-device-key-v1" (UTF-8),
-  length = 32 bytes
-)
-keyId = "key_" + first 8 hex characters of SHA-256(deviceKey)
-```
-
-The client stores `deviceId`, `keyId` and `deviceKey` in the Keychain and discards the pairing
-code. The bridge stores everything except the code, and persists the registry (see
+`bridgePublicKey` and `devicePublicKey` are each the raw 32-byte X25519 public key, hex encoded.
+The bridge generates a fresh X25519 key pair every process start; it is never persisted (see
+[Timing](#timing)). Both sides derive `deviceKey` independently; it never appears on the wire. The
+client stores `deviceId`, `keyId` and `deviceKey` in the Keychain. The bridge stores everything
+except `deviceKey`'s derivation inputs, and persists the registry (see
 [Device registry](#device-registry)).
+
+### Why this is safe
+
+The commit-then-reveal handshake stops a relaying attacker from choosing its own keys after seeing
+the other side's nonce: `commit` binds the Watch to `watchNonce` before it ever learns the bridge's
+nonce or public key. So the Mac's code and the Watch's *correct* option among its four choices
+match by chance only 1 in 900 for an attacker who does not hold the real bridge's private key. The
+Watch always knows its own correct code (it computed the same transcript the bridge did), so
+tapping a decoy aborts on the Watch itself, before the operator is ever asked anything. A rogue
+device that completes its own handshake and gets its own valid code is still stopped by the `y`
+prompt: the operator only presses `y` after their own Watch showed the matching code, so a device
+they did not initiate pairing from gets no confirmation. Net: roughly 1/900 odds per attempt, and
+exactly one attempt per `y` press — see [Limitations](#limitations) for what this does and does not
+protect against.
+
+### Timing
+
+`bun run bridge pair` opens a pairing window of 120 seconds, recorded in `pairing-window.json`
+(`{openedAt, expiresAt}`) under the state directory. `/v1/pair/start` is refused outside that
+window, which also closes as soon as `bun run bridge pair` exits for any reason (paired, denied,
+cancelled, Ctrl-C or an error), because no process remains to show a code or record a decision;
+the Watch's next `/v1/pair/start` then answers `pairing_closed`. Approval must land within 120 seconds of `/v1/pair/reveal` (tracked in
+`pending-pair.json`'s own `expiresAt`). Only one request may be pending at a time (`start` while
+another is mid-flight, or awaiting approval, answers `pairing_busy`). The bridge's X25519 key pair
+and both nonces live in the bridge process's memory only, never on disk; a bridge restart deletes
+any stale `pending-pair.json`/`pairing-window.json` it finds at startup, since the material needed
+to finish that handshake no longer exists anywhere.
 
 ## Signed request envelope
 
@@ -150,20 +188,27 @@ Every implementation must reproduce these exact values. The bridge asserts them 
 `bridge/src/auth/vector.test.ts` and the Watch client in
 `protocol/swift/Tests/AgentRemoteProtocolTests/RequestSigningTests.swift`, both as literals.
 
-Inputs: code `ABCD-EFGH-JKMN` (normalised `ABCDEFGHJKMN`), deviceId `dev_9f2c4a1b7d3e5061`,
-deviceName `Test Watch`, nonce `00112233445566778899aabbccddeeff`, `POST /v1/commands`, timestamp
-`2026-09-20T10:15:00.000Z`, body `{"a":1}`.
+Inputs: bridgeId `brg_9f2c4a1b`; bridge private scalar `0x11` repeated 32 times and device private
+scalar `0x22` repeated 32 times (deterministic for the vector only; production keys are random);
+bridgeNonce `00112233445566778899aabbccddeeff`; watchNonce `aabbccddeeff00112233445566778899`.
 
 | Value | Expected |
 | --- | --- |
-| proof | `7a7c4223ee9042311a66a05098b446d4db027b9c498f2dff2acdef6b88e925ae` |
-| deviceKey | `ca9dcc8f90e9c298f6027ce885a8235519206cb03314cc36c5a60c8556bacfd8` |
-| keyId | `key_cd7749ef` |
-| body SHA-256 | `015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862` |
-| signature | `v1=e1702c4ff741df5df3e1dd59f0819a1a9f4bf56ee2dee410aa6dfac763b13032` |
+| bridgePublicKey | `7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13` |
+| devicePublicKey | `0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20` |
+| commit | `44451b47ea1548fd1831d57eaedcda2cdbf53014acf86792e29b0b9459938068` |
+| code | `487` |
+| deviceKey | `bc6bd2bbeea0b02933e110b3082774c163d7574cd28a17650e4b6c4c4c35c781` |
+| keyId | `key_4217872d` |
 
-The signing string for that request is the six lines `v1`, `POST`, `/v1/commands`, the timestamp,
-the nonce, and the body digest, joined by `\n` with no trailing newline.
+The transcript is the six lines from [Derivation](#derivation) with those values, joined by `\n`
+with no trailing newline.
+
+Request signing uses the derived deviceKey: `POST /v1/commands`, timestamp
+`2026-09-20T10:15:00.000Z`, nonce `00112233445566778899aabbccddeeff`, body `{"a":1}`, body SHA-256
+`015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862`. The signing string for that
+request is the six lines `v1`, `POST`, `/v1/commands`, the timestamp, the nonce, and the body
+digest, joined by `\n` with no trailing newline.
 
 ## Command authorization
 
@@ -250,9 +295,15 @@ takes `bridge.lock`, so it is safe to run alongside a live bridge process, and w
 already-running bridge — no restart, so no live sessions are killed — because state is shared
 through those files rather than held in one process's memory:
 
-- `bun run bridge pair` mints a fresh pairing code into `pairing.json`, prints it, the host:port to
-  enter in Watch Settings, and its expiry, then waits (poll every ~1s) for a device to pair or the
-  code to expire/be used up. `--no-wait` prints the code and exits without waiting.
+- `bun run bridge pair` opens a 120-second pairing window (pairing v2, see
+  [Timing](#timing)) and tells the operator to open Agent Remote on the Watch and tap Next --
+  there is no address to enter, since the Watch finds the Mac on its own. Once the Watch reaches
+  `/v1/pair/reveal`, it prints the code prominently with the order spelled out ("1. On your
+  Watch, tap `<code>`. 2. Then confirm here.") and prompts
+  `Pair "<deviceName>" (<deviceId>)? Only press y if your Watch is showing <code> and waiting. [y/N]`;
+  either order works. On `y` it
+  waits until the pending request's own `expiresAt` (not a fixed timeout) for the Watch to finish
+  pairing, printing "Approved. Waiting for the Watch..." once.
 - `bun run bridge devices` prints the registry (no key material); `--json` for machine-readable
   output.
 - `bun run bridge revoke <deviceId>` marks that device revoked and exits.

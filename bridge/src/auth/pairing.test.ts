@@ -1,244 +1,140 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { createPublicKey } from "node:crypto";
 
 import {
-  deriveDeviceKey,
-  formatPairingCode,
-  generatePairingCode,
+  checkCommitment,
+  commitment,
+  confirmCode,
+  deriveDeviceKeyV2,
+  generateX25519KeyPair,
   keyIdFor,
-  normalizePairingCode,
-  PairingCodeStore,
-  pairingProof,
+  pairTranscript,
+  privateKeyFromRawScalar,
+  publicKeyFromHex,
+  rawPublicKeyHex,
+  sharedSecret,
 } from "./pairing";
 
-describe("generatePairingCode", () => {
-  test("produces a 12-character Crockford base32 code", () => {
-    const code = generatePairingCode();
-    expect(code).toHaveLength(12);
-    expect(code).toMatch(/^[0-9A-HJKMNP-TV-Z]{12}$/);
+describe("generateX25519KeyPair / rawPublicKeyHex / publicKeyFromHex", () => {
+  test("generates a fresh, 32-byte raw public key every call", () => {
+    const a = generateX25519KeyPair();
+    const b = generateX25519KeyPair();
+    expect(a.publicKeyHex).toHaveLength(64);
+    expect(a.publicKeyHex).not.toBe(b.publicKeyHex);
+  });
+
+  test("round-trips a raw public key through hex", () => {
+    const pair = generateX25519KeyPair();
+    const imported = publicKeyFromHex(pair.publicKeyHex);
+    expect(rawPublicKeyHex(imported)).toBe(pair.publicKeyHex);
+  });
+
+  test("rejects a public key that isn't 32 raw bytes", () => {
+    expect(() => publicKeyFromHex("aa")).toThrow(/32-byte/);
   });
 });
 
-describe("normalizePairingCode", () => {
-  test("uppercases and maps the Crockford aliases", () => {
-    expect(normalizePairingCode("abcdil1o0O")).toBe("ABCD111000");
+describe("sharedSecret", () => {
+  test("X25519(a.private, b.public) equals X25519(b.private, a.public)", () => {
+    const a = generateX25519KeyPair();
+    const b = generateX25519KeyPair();
+    const fromA = sharedSecret(a.privateKey, b.publicKeyHex);
+    const fromB = sharedSecret(b.privateKey, a.publicKeyHex);
+    expect(fromA.equals(fromB)).toBe(true);
+    expect(fromA).toHaveLength(32);
   });
 
-  test("strips characters outside the alphabet", () => {
-    expect(normalizePairingCode("ABCD-EFGH-JKMN")).toBe("ABCDEFGHJKMN");
-  });
-});
+  test("two different key pairs on the attacker's side produce different shared secrets against the same peer, so a relaying MITM cannot make its two legs agree", () => {
+    const watch = generateX25519KeyPair();
+    const mitmLegToWatch = generateX25519KeyPair();
+    const mitmLegToBridge = generateX25519KeyPair();
+    const bridge = generateX25519KeyPair();
 
-describe("formatPairingCode", () => {
-  test("groups into 4-4-4 with dashes", () => {
-    expect(formatPairingCode("ABCDEFGHJKMN")).toBe("ABCD-EFGH-JKMN");
-  });
-});
+    const watchSharedWithMitm = sharedSecret(watch.privateKey, mitmLegToWatch.publicKeyHex);
+    const bridgeSharedWithMitm = sharedSecret(bridge.privateKey, mitmLegToBridge.publicKeyHex);
+    expect(watchSharedWithMitm.equals(bridgeSharedWithMitm)).toBe(false);
 
-describe("pairingProof", () => {
-  test("matches for identical inputs", () => {
-    const a = pairingProof("ABCDEFGHJKMN", "dev_1", "Watch", "nonce1");
-    const b = pairingProof("ABCDEFGHJKMN", "dev_1", "Watch", "nonce1");
-    expect(a).toBe(b);
-  });
-
-  test("differs when any input changes", () => {
-    const base = pairingProof("ABCDEFGHJKMN", "dev_1", "Watch", "nonce1");
-    expect(pairingProof("ABCDEFGHJKMN", "dev_2", "Watch", "nonce1")).not.toBe(base);
-    expect(pairingProof("ABCDEFGHJKMN", "dev_1", "Other", "nonce1")).not.toBe(base);
-    expect(pairingProof("ABCDEFGHJKMN", "dev_1", "Watch", "nonce2")).not.toBe(base);
-    expect(pairingProof("ZZZZEFGHJKMN", "dev_1", "Watch", "nonce1")).not.toBe(base);
-  });
-});
-
-describe("deriveDeviceKey", () => {
-  test("both sides deriving from the same inputs agree", () => {
-    const a = deriveDeviceKey("ABCDEFGHJKMN", "dev_1", "nonce1");
-    const b = deriveDeviceKey("ABCDEFGHJKMN", "dev_1", "nonce1");
-    expect(a.equals(b)).toBe(true);
-    expect(a).toHaveLength(32);
-  });
-
-  test("a different nonce derives a different key", () => {
-    const a = deriveDeviceKey("ABCDEFGHJKMN", "dev_1", "nonce1");
-    const b = deriveDeviceKey("ABCDEFGHJKMN", "dev_1", "nonce2");
-    expect(a.equals(b)).toBe(false);
-  });
-});
-
-describe("keyIdFor", () => {
-  test("is 'key_' plus 8 hex characters of SHA-256(deviceKey)", () => {
-    const key = deriveDeviceKey("ABCDEFGHJKMN", "dev_1", "nonce1");
-    const keyId = keyIdFor(key);
-    expect(keyId).toMatch(/^key_[0-9a-f]{8}$/);
-  });
-});
-
-describe("PairingCodeStore", () => {
-  test("verify fails with no_code before any mint", () => {
-    const store = new PairingCodeStore();
-    const result = store.verify("deadbeef", "dev_1", "Watch", "nonce1", new Date());
-    expect(result).toEqual({ ok: false, reason: "no_code" });
-  });
-
-  test("proof match enrolls and burns the code (single use)", () => {
-    const store = new PairingCodeStore();
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    const code = store.mint(now);
-    const proof = pairingProof(code, "dev_1", "Watch", "nonce1");
-
-    const first = store.verify(proof, "dev_1", "Watch", "nonce1", now);
-    expect(first).toEqual({ ok: true, code });
-
-    const second = store.verify(proof, "dev_1", "Watch", "nonce1", now);
-    expect(second).toEqual({ ok: false, reason: "no_code" });
-  });
-
-  test("proof mismatch is rejected", () => {
-    const store = new PairingCodeStore();
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    store.mint(now);
-    const result = store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now);
-    expect(result).toEqual({ ok: false, reason: "mismatch" });
-  });
-
-  test("expires 5 minutes after mint", () => {
-    const store = new PairingCodeStore();
-    const mintedAt = new Date("2026-09-20T10:00:00.000Z");
-    const code = store.mint(mintedAt);
-    const proof = pairingProof(code, "dev_1", "Watch", "nonce1");
-
-    const justBefore = new Date(mintedAt.getTime() + 5 * 60 * 1000);
-    expect(store.verify(proof, "dev_1", "Watch", "nonce1", justBefore)).toEqual({ ok: true, code });
-
-    const store2 = new PairingCodeStore();
-    const code2 = store2.mint(mintedAt);
-    const proof2 = pairingProof(code2, "dev_1", "Watch", "nonce1");
-    const afterExpiry = new Date(mintedAt.getTime() + 5 * 60 * 1000 + 1);
-    expect(store2.verify(proof2, "dev_1", "Watch", "nonce1", afterExpiry)).toEqual({
-      ok: false,
-      reason: "expired",
+    const watchNonce = "aa".repeat(16);
+    const bridgeNonce = "bb".repeat(16);
+    const transcriptToWatch = pairTranscript({
+      bridgeId: "brg_00000000",
+      bridgePublicKeyHex: mitmLegToWatch.publicKeyHex,
+      devicePublicKeyHex: watch.publicKeyHex,
+      bridgeNonceHex: bridgeNonce,
+      watchNonceHex: watchNonce,
     });
+    const transcriptToBridge = pairTranscript({
+      bridgeId: "brg_00000000",
+      bridgePublicKeyHex: bridge.publicKeyHex,
+      devicePublicKeyHex: mitmLegToBridge.publicKeyHex,
+      bridgeNonceHex: bridgeNonce,
+      watchNonceHex: watchNonce,
+    });
+    // Different transcripts (different public keys on each leg) mean different codes on the two
+    // legs the MITM is relaying between, so the operator's Mac and the Watch disagree.
+    expect(confirmCode(transcriptToWatch)).not.toBe(confirmCode(transcriptToBridge));
+    const keyToWatch = deriveDeviceKeyV2(watchSharedWithMitm, transcriptToWatch);
+    const keyToBridge = deriveDeviceKeyV2(bridgeSharedWithMitm, transcriptToBridge);
+    expect(keyToWatch.equals(keyToBridge)).toBe(false);
   });
+});
 
-  test("5 failed attempts burn the code", () => {
-    const store = new PairingCodeStore();
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    store.mint(now);
+describe("commitment / checkCommitment", () => {
+  test("checkCommitment accepts the nonce that produced the commit and rejects any other", () => {
+    const nonce = "cc".repeat(16);
+    const otherNonce = "dd".repeat(16);
+    const commit = commitment(nonce);
+    expect(checkCommitment(commit, nonce)).toBe(true);
+    expect(checkCommitment(commit, otherNonce)).toBe(false);
+  });
+});
 
-    for (let i = 0; i < 4; i++) {
-      expect(store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-        ok: false,
-        reason: "mismatch",
-      });
+describe("confirmCode", () => {
+  test("is always a 3-digit code between 100 and 999", () => {
+    for (let i = 0; i < 50; i++) {
+      const transcript = `t-${i}`;
+      const code = confirmCode(transcript);
+      expect(code).toBeGreaterThanOrEqual(100);
+      expect(code).toBeLessThanOrEqual(999);
     }
-    // 5th failure burns the code.
-    expect(store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-      ok: false,
-      reason: "exhausted",
-    });
-    // The code is gone now, even with a correct proof.
-    expect(store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-      ok: false,
-      reason: "no_code",
-    });
+  });
+
+  test("a different transcript almost always yields a different code (not a constant function)", () => {
+    const codes = new Set(Array.from({ length: 20 }, (_, i) => confirmCode(`transcript-${i}`)));
+    expect(codes.size).toBeGreaterThan(1);
   });
 });
 
-describe("PairingCodeStore file persistence", () => {
-  let stateDir: string;
-  let filePath: string;
-
-  beforeEach(() => {
-    // A fresh temp dir per test: this must never touch the real ~/.agentremote.
-    stateDir = mkdtempSync(join(tmpdir(), "agentremote-pairing-test-"));
-    filePath = join(stateDir, "pairing.json");
-  });
-
-  afterEach(() => {
-    rmSync(stateDir, { recursive: true, force: true });
-  });
-
-  test("a second store instance over the same file verifies a code the first one minted", () => {
-    // This is the regression test for the defect: an operator one-shot process and an
-    // already-running bridge must agree on the live code via the shared file.
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    const first = new PairingCodeStore(filePath);
-    const code = first.mint(now);
-    const proof = pairingProof(code, "dev_1", "Watch", "nonce1");
-
-    const second = new PairingCodeStore(filePath);
-    expect(second.verify(proof, "dev_1", "Watch", "nonce1", now)).toEqual({ ok: true, code });
-  });
-
-  test("failed attempts persist across instances", () => {
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    const first = new PairingCodeStore(filePath);
-    first.mint(now);
-
-    for (let i = 0; i < 4; i++) {
-      const store = new PairingCodeStore(filePath);
-      expect(store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-        ok: false,
-        reason: "mismatch",
-      });
-    }
-
-    const fifth = new PairingCodeStore(filePath);
-    expect(fifth.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-      ok: false,
-      reason: "exhausted",
+describe("deriveDeviceKeyV2 / keyIdFor", () => {
+  test("both sides derive the same device key and keyId from the same shared secret and transcript", () => {
+    const a = generateX25519KeyPair();
+    const b = generateX25519KeyPair();
+    const transcript = pairTranscript({
+      bridgeId: "brg_11111111",
+      bridgePublicKeyHex: a.publicKeyHex,
+      devicePublicKeyHex: b.publicKeyHex,
+      bridgeNonceHex: "11".repeat(16),
+      watchNonceHex: "22".repeat(16),
     });
-
-    const sixth = new PairingCodeStore(filePath);
-    expect(sixth.verify("0".repeat(64), "dev_1", "Watch", "nonce1", now)).toEqual({
-      ok: false,
-      reason: "no_code",
-    });
+    const sharedFromA = sharedSecret(a.privateKey, b.publicKeyHex);
+    const sharedFromB = sharedSecret(b.privateKey, a.publicKeyHex);
+    const keyFromA = deriveDeviceKeyV2(sharedFromA, transcript);
+    const keyFromB = deriveDeviceKeyV2(sharedFromB, transcript);
+    expect(keyFromA.equals(keyFromB)).toBe(true);
+    expect(keyIdFor(keyFromA)).toBe(keyIdFor(keyFromB));
+    expect(keyIdFor(keyFromA)).toMatch(/^key_[0-9a-f]{8}$/);
   });
+});
 
-  test("a successful enrollment burns the code for a later instance too", () => {
-    const now = new Date("2026-09-20T10:00:00.000Z");
-    const first = new PairingCodeStore(filePath);
-    const code = first.mint(now);
-    const proof = pairingProof(code, "dev_1", "Watch", "nonce1");
-
-    const second = new PairingCodeStore(filePath);
-    expect(second.verify(proof, "dev_1", "Watch", "nonce1", now)).toEqual({ ok: true, code });
-
-    const third = new PairingCodeStore(filePath);
-    expect(third.verify(proof, "dev_1", "Watch", "nonce1", now)).toEqual({ ok: false, reason: "no_code" });
-  });
-
-  test("expiry is enforced across instances", () => {
-    const mintedAt = new Date("2026-09-20T10:00:00.000Z");
-    const first = new PairingCodeStore(filePath);
-    const code = first.mint(mintedAt);
-    const proof = pairingProof(code, "dev_1", "Watch", "nonce1");
-
-    const afterExpiry = new Date(mintedAt.getTime() + 5 * 60 * 1000 + 1);
-    const second = new PairingCodeStore(filePath);
-    expect(second.verify(proof, "dev_1", "Watch", "nonce1", afterExpiry)).toEqual({
-      ok: false,
-      reason: "expired",
-    });
-  });
-
-  test("a missing file means no live code", () => {
-    const store = new PairingCodeStore(filePath);
-    expect(store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", new Date())).toEqual({
-      ok: false,
-      reason: "no_code",
-    });
-  });
-
-  test("a corrupt file throws a clear error naming the path", () => {
-    writeFileSync(filePath, "not json");
-    const store = new PairingCodeStore(filePath);
-    expect(() => store.verify("0".repeat(64), "dev_1", "Watch", "nonce1", new Date())).toThrow(
-      new RegExp(filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+describe("privateKeyFromRawScalar", () => {
+  test("reconstructs the same public key deterministically for a fixed scalar", () => {
+    const key = privateKeyFromRawScalar("11".repeat(32));
+    expect(rawPublicKeyHex(createPublicKey(key))).toBe(
+      "7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13",
     );
+  });
+
+  test("rejects a scalar that isn't 32 raw bytes", () => {
+    expect(() => privateKeyFromRawScalar("aa")).toThrow(/32-byte/);
   });
 });
