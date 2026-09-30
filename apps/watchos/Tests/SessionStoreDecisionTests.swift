@@ -47,6 +47,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
     private(set) var cancelPairingCallCount = 0
     private(set) var cancelPairingRequestIds: [String] = []
     private(set) var cancelPairingCallerWasCancelled: [Bool] = []
+    private var cancelPairingBlocks = false
+    private var cancelPairingContinuation: CheckedContinuation<Void, Never>?
     /// Backs `pairingLookup()`; defaults to `.paired` to preserve the previous hardcoded
     /// behavior for every test that does not care about pairing state.
     private var pairedFlag = true
@@ -195,7 +197,8 @@ actor FakeBridgeClient: BridgeClientProtocol {
         sendGateContinuation = nil
     }
 
-    func setBaseURL(_ url: URL) async {}
+    private(set) var baseURLs: [URL] = []
+    func setBaseURL(_ url: URL) async { baseURLs.append(url) }
 
     func beginPairing(deviceName: String) async throws -> PairingHandshake {
         beginPairingCallCount += 1
@@ -235,6 +238,21 @@ actor FakeBridgeClient: BridgeClientProtocol {
         cancelPairingCallCount += 1
         cancelPairingRequestIds.append(requestId)
         cancelPairingCallerWasCancelled.append(Task.isCancelled)
+        if cancelPairingBlocks {
+            await withCheckedContinuation { cancelPairingContinuation = $0 }
+        }
+    }
+
+    /// Makes `cancelPairing(requestId:)` suspend (an unreachable host) until
+    /// `releaseBlockedCancelPairing()` runs.
+    func blockCancelPairing() {
+        cancelPairingBlocks = true
+    }
+
+    func releaseBlockedCancelPairing() {
+        cancelPairingBlocks = false
+        cancelPairingContinuation?.resume()
+        cancelPairingContinuation = nil
     }
 
     /// Arms the next `clearCredential()` call to block until `openClearCredentialGate()` runs.
@@ -4263,8 +4281,39 @@ final class SessionStoreDecisionTests: XCTestCase {
         store.hostText = "http://192.168.7.8:8787"
         await store.reconnect()
         XCTAssertEqual(store.pairingPhase, .idle)
-        let ids = await client.cancelPairingRequestIds
+        // The cancel is fire-and-forget (E-116), so it lands shortly after reconnect() returns.
+        var ids = await client.cancelPairingRequestIds
+        for _ in 0 ..< 100 where ids.isEmpty {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            ids = await client.cancelPairingRequestIds
+        }
         XCTAssertEqual(ids, ["par_c"])
+    }
+
+    /// E-116: an unreachable old host (cancel never returns) must not stall the host switch.
+    func testHostChangeDoesNotWaitForOldHostCancel() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_e116", code: 222)))
+        await client.blockCancelPairing()
+        await store.beginPairing()
+        store.hostText = "http://192.168.7.9:8787"
+        let switched = expectation(description: "reconnect returns without the old-host cancel")
+        Task {
+            await store.reconnect()
+            switched.fulfill()
+        }
+        await fulfillment(of: [switched], timeout: 5)
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let urls = await client.baseURLs
+        XCTAssertEqual(urls.last, URL(string: "http://192.168.7.9:8787"))
+        var ids = await client.cancelPairingRequestIds
+        for _ in 0 ..< 100 where ids.isEmpty {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            ids = await client.cancelPairingRequestIds
+        }
+        XCTAssertEqual(ids, ["par_e116"], "the old-host cancel is still issued")
+        await client.releaseBlockedCancelPairing()
     }
 
     /// E-102: dismissing PairingView (Settings) mid-.choosing cancels and resets to .idle.

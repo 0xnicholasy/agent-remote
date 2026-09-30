@@ -478,6 +478,26 @@ final class SessionStore {
         pairingPhase = .idle
     }
 
+    /// Same state transition as `dismissPairing()`, but the bridge's `/cancel` is sent from an
+    /// unstructured Task that is not awaited, so an unreachable host cannot delay the caller
+    /// (`reconnect()` switching hosts, E-116). The Task does not inherit the caller's
+    /// cancellation, matching the E-91 cancel in `beginPairing()`.
+    private func dismissPairingWithoutAwaitingCancel() {
+        switch pairingPhase {
+        case .starting, .choosing, .waitingForMac:
+            pairingGeneration += 1
+            pairingPollTask?.cancel()
+            pairingPollTask = nil
+            if let requestId = pairingRequestId {
+                pairingRequestId = nil
+                Task { [client] in try? await client.cancelPairing(requestId: requestId) }
+            }
+        default:
+            break
+        }
+        pairingPhase = .idle
+    }
+
     /// A network error during pairing status polling retries (1 s between attempts) for up to
     /// this long before finally giving up and showing a connection failure -- a dimmed screen or
     /// a momentary Wi-Fi blip must not strand the user on a silent "waiting" state. Instance-level
@@ -618,9 +638,9 @@ final class SessionStore {
         let sameBridge = newURL != nil && newURL == connectedHostURL
         // The pairing phase (and any in-flight handshake) belongs to the old bridge: leaving
         // `.approved`/`.choosing` in place would make PairingView refuse to start a fresh
-        // pairing against the new one (E-102). Cancelled against the old base URL, before the
-        // switch below.
-        if !sameBridge { await dismissPairing() }
+        // pairing against the new one (E-102). The old-host cancel is fired without awaiting
+        // (E-116): the old Mac may be offline, and its request timeout must not stall the switch.
+        if !sameBridge { dismissPairingWithoutAwaitingCancel() }
         if let newURL {
             await client.setBaseURL(newURL)
             connectedHostURL = newURL
