@@ -168,7 +168,9 @@ enum TurnState: String {
 @MainActor
 @Observable
 final class SessionStore {
-    private static let hostKey = "dev.agentremote.watch.host"
+    /// Internal (not private) so OnboardingView can check whether `hostText` came from the
+    /// launch-argument domain (the UI test path) without duplicating this string.
+    static let hostKey = "dev.agentremote.watch.host"
     private static let cursorKey = "dev.agentremote.watch.lastSeenEventId"
     private static let bridgeIdKey = "dev.agentremote.watch.bridgeId"
     private static let projectIdKey = "dev.agentremote.watch.projectId"
@@ -233,15 +235,11 @@ final class SessionStore {
     var advanceToNextRequest: Bool {
         didSet { defaults.set(advanceToNextRequest, forKey: SessionStore.advanceKey) }
     }
-    /// The projects this device may use and the provider the bridge runs, from `GET /v1/projects`.
-    /// Empty/nil until the first successful load; `createSession()` needs both.
-    private(set) var projects: [Project] = []
-    private(set) var bridgeProvider: String?
-    /// The project new sessions start in. Persisted; cleared on load when the bridge no longer
-    /// lists it, and set automatically when the bridge lists exactly one project.
-    var selectedProjectId: String? {
-        didSet { defaults.set(selectedProjectId, forKey: SessionStore.projectIdKey) }
-    }
+    /// The projects this device may use (`GET /v1/projects`); empty until the first successful
+    /// refreshBridgeConfiguration().
+    var projects: [Project] { authorizedProjects }
+    /// The provider id the bridge runs (`GET /v1/info`), which `session.create` must name.
+    var bridgeProvider: String? { bridgeInfo?.provider }
     var selectedProject: Project? { projects.first { $0.id == selectedProjectId } }
     /// Several projects and none chosen: RootView asks once after pairing instead of letting
     /// the first Reply fail with "Pick a project".
@@ -251,6 +249,15 @@ final class SessionStore {
     var connected: Bool { syncState != .disconnected }
     private(set) var statusLine = "Not connected"
     private(set) var statusKind: StatusKind = .notConnected
+    private(set) var bridgeInfo: BridgeInfo?
+    private(set) var authorizedProjects: [Project] = []
+    /// The project new sessions start in. Persisted; cleared when the bridge no longer lists it,
+    /// and set automatically when the bridge lists exactly one project.
+    private(set) var selectedProjectId: String? {
+        didSet { defaults.set(selectedProjectId, forKey: SessionStore.projectIdKey) }
+    }
+    private(set) var configurationError: String?
+    private(set) var isRefreshingConfiguration = false
     private(set) var isSending = false
     /// What happened to the last approve, deny or answer sent from this Watch, and which card
     /// it was for, so a newer card never shows an older card's outcome.
@@ -262,6 +269,40 @@ final class SessionStore {
     @ObservationIgnored private var unconfirmedCancels: [String: UnconfirmedSend] = [:]
     private(set) var paired = false
     private(set) var pairingError: String?
+    /// Drives OnboardingView/PairingView through pairing v2's commit-then-reveal handshake.
+    /// `.idle` until `beginPairing()` is called; `pick(_:)` and `cancelPairing()` are the only
+    /// other entry points once a `.choosing` state is reached.
+    enum PairingPhase: Equatable {
+        case idle
+        case starting
+        /// `options` holds the correct code plus three distinct decoys, already shuffled;
+        /// `correct` is the code shown on the Mac.
+        case choosing(options: [Int], correct: Int)
+        /// `code` is the option the user picked (== the correct code), kept so the view can
+        /// keep showing it large while it waits for the Mac's confirmation.
+        case waitingForMac(code: Int)
+        case approved
+        case denied
+        case expired
+        case cancelled
+        case failed(String)
+        /// The handshake never reached the bridge at all -- a network-level failure (host down,
+        /// wrong port, no route), not a `pairing_closed`/`pairing_busy`/`pairing_rejected` answer
+        /// from the bridge. Kept apart from `.failed` so the view can offer "Find my Mac" instead
+        /// of just "Start again", and so a raw NSError/URLError description (which `.failed`
+        /// would otherwise carry verbatim) never renders -- only `host` is shown here; the
+        /// underlying error is logged instead (see `classifyPairingFailure`).
+        case connectionFailure(host: String)
+
+        /// True when the view may begin a fresh handshake from this phase.
+        var canRestart: Bool {
+            switch self {
+            case .idle, .denied, .expired, .cancelled, .failed, .connectionFailure: true
+            default: false
+            }
+        }
+    }
+    private(set) var pairingPhase: PairingPhase = .idle
     /// False until the first `refreshPairedState()` (or `pair()`) has resolved, so RootView can
     /// hold a plain ProgressView instead of flashing onboarding for an instant before the
     /// stored credential is known.
@@ -291,11 +332,35 @@ final class SessionStore {
     /// Bumped on every start()/reconnect() so a poll task from a superseded generation can
     /// tell its own results are stale even when it was not cancelled in time to observe it.
     @ObservationIgnored private var pollGeneration = 0
-    /// Bumped on every refreshPairedState()/pair() so a paired-state lookup from a superseded
-    /// generation cannot overwrite a newer one: SessionStore is @MainActor but reentrant across
-    /// awaits, so a concurrent reloadCredential()/pair()/second refreshPairedState() can start
-    /// and finish while an earlier one is still suspended on `await client...`.
-    @ObservationIgnored private var pairGeneration = 0
+    /// Invalidates provider/project responses that were requested from a previous bridge.
+    @ObservationIgnored private var configurationGeneration = 0
+    /// Bumped on every refreshPairedState()/clearPairing() so a paired-state lookup from a
+    /// superseded generation cannot overwrite a newer one: SessionStore is @MainActor but
+    /// reentrant across awaits, so a concurrent reloadCredential()/clearPairing()/second
+    /// refreshPairedState() can start and finish while an earlier one is still suspended on
+    /// `await client...`.
+    ///
+    /// Kept separate from `pairingGeneration` below: `start()` (called by `reconnect()`, in turn
+    /// called from onboarding's "Next" right before it navigates to `PairingView`) fires
+    /// `refreshPairedState()` as an un-awaited `Task`. If the two flows shared one counter, that
+    /// background refresh could bump it while `beginPairing()`'s handshake was still in flight,
+    /// so `beginPairing()`'s own success guard would see a stale generation and silently drop a
+    /// completed handshake -- leaving `pairingPhase` stuck on `.starting` forever even though the
+    /// bridge had already completed `/v1/pair/start` and `/v1/pair/reveal`. Root cause of the
+    /// "Starting pairing..." hang; regression test: SessionStoreDecisionTests.
+    @ObservationIgnored private var pairedStateGeneration = 0
+    /// Bumped on every beginPairing()/pick()/cancelPairing() so a stale handshake step cannot
+    /// overwrite a newer one. See `pairedStateGeneration` above for why this is a separate
+    /// counter rather than shared with the paired-state-refresh flow.
+    @ObservationIgnored private var pairingGeneration = 0
+    /// The pairing v2 request the Watch is currently waiting on the Mac for, set by
+    /// `beginPairing()` and cleared once the handshake resolves or is cancelled.
+    @ObservationIgnored private var pairingRequestId: String?
+    @ObservationIgnored private(set) var pairingPollTask: Task<Void, Never>?
+    /// True for the lifetime of a running `pollPairingLoop`, so `resumePairingPollingIfNeeded()`
+    /// can tell a foreground-return apart from a loop that is still actually polling: a `Task`
+    /// reference alone does not report whether the work it started has finished.
+    @ObservationIgnored private var pairingPollActive = false
     /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
     /// meaningful against the bridge that issued it.
     @ObservationIgnored private var knownBridgeId: String?
@@ -322,10 +387,7 @@ final class SessionStore {
     // MARK: - Polling
 
     func start() {
-        Task { [weak self] in
-            await self?.refreshPairedState()
-            await self?.loadProjects()
-        }
+        Task { [weak self] in await self?.refreshPairedState() }
         guard pollTask == nil else { return }
         pollGeneration += 1
         let generation = pollGeneration
@@ -333,8 +395,8 @@ final class SessionStore {
     }
 
     func refreshPairedState() async {
-        pairGeneration += 1
-        let generation = pairGeneration
+        pairedStateGeneration += 1
+        let generation = pairedStateGeneration
         // A prior check found the Keychain read itself failed (E-002), so the cached
         // credential/error state is stale: reload before re-checking, or a Retry from
         // PairingCheckFailedView could never clear pairingCheckFailed. Either branch is a
@@ -348,53 +410,218 @@ final class SessionStore {
         }
         // A concurrent refreshPairedState()/pair() started after this one and may have already
         // applied a newer result; this stale lookup must not overwrite it.
-        guard generation == pairGeneration else { return }
+        guard generation == pairedStateGeneration else { return }
         applyPairedLookup(lookup)
         pairingChecked = true
     }
 
-    /// Fetches the device's projects and the bridge's provider. Quiet on failure (an unpaired or
-    /// unreachable bridge already shows its own status); `createSession()` retries it.
-    @discardableResult
-    func loadProjects() async -> Bool {
-        let generation = pollGeneration
-        guard let response = try? await client.projects(), generation == pollGeneration else { return false }
-        projects = response.projects
-        bridgeProvider = response.provider
-        if selectedProject == nil {
-            selectedProjectId = projects.count == 1 ? projects[0].id : nil
+    /// Starts pairing v2 (docs/pairing-v0.md, "Pairing"): the client runs the commit-then-reveal
+    /// handshake and returns the locally derived 3-digit code. `pairingPhase` moves to
+    /// `.choosing` with that code plus three distinct decoys, shuffled, so the view never
+    /// reveals which option is correct by its position.
+    func beginPairing() async {
+        pairingGeneration += 1
+        let generation = pairingGeneration
+        pairingPhase = .starting
+        do {
+            let handshake = try await client.beginPairing(deviceName: "Apple Watch")
+            guard generation == pairingGeneration else {
+                // A concurrent cancelPairing() saw no requestId yet and sent nothing, so free
+                // the bridge's slot here.
+                // An unstructured Task does not inherit the caller's cancellation, so when Back
+                // has already cancelled the view's .task the request is still sent (URLSession
+                // fails immediately inside a cancelled task); awaiting .value keeps the
+                // send-before-return ordering, and Task.value is not interrupted by the
+                // awaiting task's cancellation.
+                await Task { [client] in try? await client.cancelPairing(requestId: handshake.requestId) }.value
+                return
+            }
+            pairingRequestId = handshake.requestId
+            var decoys = Set<Int>()
+            while decoys.count < 3 {
+                let candidate = Int.random(in: 100 ... 999)
+                if candidate != handshake.code { decoys.insert(candidate) }
+            }
+            var options = Array(decoys) + [handshake.code]
+            options.shuffle()
+            pairingPhase = .choosing(options: options, correct: handshake.code)
+        } catch {
+            guard generation == pairingGeneration else { return }
+            pairingPhase = Self.classifyPairingFailure(error, host: hostText)
         }
-        return true
     }
 
-    /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
-    /// stores the device credential and subsequent requests are signed.
-    func pair(code: String, deviceName: String) async {
-        pairingError = nil
-        pairGeneration += 1
-        let generation = pairGeneration
-        do {
-            try await client.pair(code: code, deviceName: deviceName)
-            guard generation == pairGeneration else { return }
-            paired = true
-            everPaired = true
-            pairingCheckFailed = false
-            pairingChecked = true
-            start()
-        } catch {
-            let lookup = await client.pairingLookup()
-            // A concurrent pair()/refreshPairedState() may have already applied a newer result
-            // while this one was suspended on the awaits above; guard every write below, not
-            // just applyPairedLookup(), or a stale failure could overwrite a newer pairingError.
-            guard generation == pairGeneration else { return }
-            applyPairedLookup(lookup)
-            // applyPairedLookup() already set pairingError to the load failure's own
-            // description when the lookup itself failed (.checkFailed); that is the more
-            // specific, actionable cause. Otherwise fall back to the pair() failure itself.
-            if case .checkFailed = lookup {} else {
-                pairingError = "\(error)"
+    /// `BridgeError` already carries a short, user-safe `description` (e.g. `.pairingClosed`,
+    /// `.pairingBusy`, `.pairingRejected`) so those go straight into `.failed`. Anything else --
+    /// a `URLError`/POSIX failure from `URLSession` because the bridge was unreachable -- is a
+    /// connection failure: its raw description is logged (never shown), and the phase carries
+    /// only the host so the view can show a short "can't reach" message with a way back to
+    /// discovery.
+    static func classifyPairingFailure(_ error: Error, host: String) -> PairingPhase {
+        if let bridgeError = error as? BridgeError {
+            return .failed(bridgeError.description)
+        }
+        if error is URLError {
+            print("[SessionStore] pairing connection failure for \(host): \(error)")
+            return .connectionFailure(host: host)
+        }
+        print("[SessionStore] pairing unexpected failure for \(host): \(error)")
+        return .failed("Unexpected reply from the bridge")
+    }
+
+    /// The user tapped one of the four options shown. The correct pick moves to
+    /// `.waitingForMac` and starts polling; any other pick (including "None match") cancels the
+    /// handshake exactly as `cancelPairing()` does.
+    func pick(_ option: Int) async {
+        guard case .choosing(_, let correct) = pairingPhase, let requestId = pairingRequestId else { return }
+        guard option == correct else {
+            await cancelPairing()
+            return
+        }
+        let generation = pairingGeneration
+        pairingPhase = .waitingForMac(code: option)
+        pairingPollTask = Task { [weak self] in await self?.pollPairingLoop(requestId: requestId, generation: generation) }
+    }
+
+    /// Called when the app returns to the foreground (`scenePhase == .active`). If the Watch is
+    /// still waiting on the Mac's confirmation but the poll loop is not actually running --
+    /// e.g. its `Task` was suspended/ended while the app was backgrounded -- restarts it, so a
+    /// dimmed screen never leaves the Watch silently stuck on `.waitingForMac`.
+    func resumePairingPollingIfNeeded() {
+        guard case .waitingForMac = pairingPhase, let requestId = pairingRequestId, !pairingPollActive else { return }
+        let generation = pairingGeneration
+        pairingPollTask = Task { [weak self] in await self?.pollPairingLoop(requestId: requestId, generation: generation) }
+    }
+
+    /// Wrong pick, "None match", or the user backing out: tells the bridge to free the slot and
+    /// moves to `.cancelled`. Best-effort -- the UI has already moved on by the time the network
+    /// call resolves, since the Watch's own decision is final regardless of whether `/cancel`
+    /// itself succeeds.
+    func cancelPairing() async {
+        pairingGeneration += 1
+        pairingPollTask?.cancel()
+        pairingPollTask = nil
+        let requestId = pairingRequestId
+        pairingRequestId = nil
+        pairingPhase = .cancelled
+        if let requestId {
+            do {
+                try await client.cancelPairing(requestId: requestId)
+            } catch {
+                print("[SessionStore] pairing cancel failed for \(hostText): \(error)")
             }
-            pairingChecked = true
+        }
+    }
+
+    /// Leaves the pairing flow for good: cancels a non-terminal handshake and returns the phase
+    /// to `.idle` so the next PairingView can start a fresh one. Called when PairingView is
+    /// dismissed from Settings, and (from `reconnect()`) when the bridge host
+    /// changes. The success screen right after approval is unaffected because it is only reset
+    /// once the view goes away.
+    func dismissPairing() async {
+        switch pairingPhase {
+        case .starting, .choosing, .waitingForMac:
+            await cancelPairing()
+            // A new beginPairing() during the cancel's network await owns the phase now.
+            guard pairingPhase == .cancelled else { return }
+        default:
+            break
+        }
+        pairingPhase = .idle
+    }
+
+    /// Same state transition as `dismissPairing()`, but the bridge's `/cancel` is sent from an
+    /// unstructured Task that is not awaited, so an unreachable host cannot delay the caller
+    /// (`reconnect()` switching hosts, E-116). The Task does not inherit the caller's
+    /// cancellation, matching the E-91 cancel in `beginPairing()`.
+    private func dismissPairingWithoutAwaitingCancel() {
+        switch pairingPhase {
+        case .starting, .choosing, .waitingForMac:
+            pairingGeneration += 1
+            pairingPollTask?.cancel()
+            pairingPollTask = nil
+            if let requestId = pairingRequestId {
+                pairingRequestId = nil
+                Task { [client] in try? await client.cancelPairing(requestId: requestId) }
+            }
+        default:
+            break
+        }
+        pairingPhase = .idle
+    }
+
+    /// A network error during pairing status polling retries (1 s between attempts) for up to
+    /// this long before finally giving up and showing a connection failure -- a dimmed screen or
+    /// a momentary Wi-Fi blip must not strand the user on a silent "waiting" state. Instance-level
+    /// and internal so `SessionStoreDecisionTests` can shorten it, the same way `client` is
+    /// injectable; production code never writes it.
+    @ObservationIgnored var pairingPollRetryCap: Duration = .seconds(60)
+
+    /// Polls `GET /v1/pair/status` about once a second until the handshake resolves. Guarded by
+    /// `generation` throughout so a `cancelPairing()`/new `beginPairing()` started while this
+    /// loop is suspended on the network or the sleep stops it from ever writing a stale phase.
+    ///
+    /// A transient network error (the bridge briefly unreachable, Wi-Fi drop) is retried in
+    /// place rather than immediately failing the handshake: `BridgeError` values are semantic
+    /// answers from the bridge (e.g. the request expired or was denied) and still end the loop
+    /// right away, but anything else keeps retrying, 1 s apart, until
+    /// `pairingPollRetryCap` of retrying has elapsed.
+    private func pollPairingLoop(requestId: String, generation: Int) async {
+        pairingPollActive = true
+        defer { pairingPollActive = false }
+        var retryDeadline: ContinuousClock.Instant?
+        while !Task.isCancelled {
+            guard generation == pairingGeneration else { return }
+            do {
+                let result = try await client.pollPairing(requestId: requestId)
+                guard generation == pairingGeneration else { return }
+                retryDeadline = nil
+                switch result {
+                case .pending:
+                    try? await Task.sleep(for: .seconds(1))
+                    continue
+                case .approved:
+                    pairingRequestId = nil
+                    pairingPhase = .approved
+                    paired = true
+                    everPaired = true
+                    pairingCheckFailed = false
+                    pairingChecked = true
+                    start()
+                    return
+                case .denied:
+                    pairingRequestId = nil
+                    pairingPhase = .denied
+                    return
+                case .expired:
+                    pairingRequestId = nil
+                    pairingPhase = .expired
+                    return
+                }
+            } catch {
+                guard generation == pairingGeneration else { return }
+                if let bridgeError = error as? BridgeError {
+                    pairingRequestId = nil
+                    pairingPhase = .failed(bridgeError.description)
+                    return
+                }
+                guard error is URLError else {
+                    pairingRequestId = nil
+                    print("[SessionStore] pairing poll unexpected failure for \(hostText): \(error)")
+                    pairingPhase = .failed("Unexpected reply from the bridge")
+                    return
+                }
+                let deadline = retryDeadline ?? ContinuousClock.now + pairingPollRetryCap
+                retryDeadline = deadline
+                if ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .seconds(1))
+                    continue
+                }
+                pairingRequestId = nil
+                print("[SessionStore] pairing poll connection failure for \(hostText): \(error)")
+                pairingPhase = .connectionFailure(host: hostText)
+                return
+            }
         }
     }
 
@@ -404,8 +631,8 @@ final class SessionStore {
     /// short of deleting the app. Only ever called from the user's explicit "Pair again" tap --
     /// never automatically -- since this discards a credential that may still be valid.
     func clearPairing() async {
-        pairGeneration += 1
-        let generation = pairGeneration
+        pairedStateGeneration += 1
+        let generation = pairedStateGeneration
         do {
             try await client.clearCredential()
         } catch {
@@ -414,11 +641,11 @@ final class SessionStore {
             // next launch (V2-001). Stay on PairingCheckFailedView -- pairingCheckFailed stays
             // true, paired/everPaired untouched -- and surface the error so Retry/Pair again
             // remain reachable.
-            guard generation == pairGeneration else { return }
+            guard generation == pairedStateGeneration else { return }
             pairingError = "Couldn't clear pairing: \(error)"
             return
         }
-        guard generation == pairGeneration else { return }
+        guard generation == pairedStateGeneration else { return }
         paired = false
         everPaired = false
         pairingCheckFailed = false
@@ -451,6 +678,7 @@ final class SessionStore {
         pollTask?.cancel()
         pollTask = nil
         pollGeneration += 1
+        clearBridgeConfiguration()
         // Before the await below: the old host's "Current" must not stay on screen while the
         // cursor and session it described are being discarded.
         syncState = .syncing
@@ -460,14 +688,14 @@ final class SessionStore {
         // retry. A different (or unparseable) host is a different bridge/session space, so the
         // pending send is dropped along with everything else discardLocalView() clears below.
         let sameBridge = newURL != nil && newURL == connectedHostURL
+        // The pairing phase (and any in-flight handshake) belongs to the old bridge: leaving
+        // `.approved`/`.choosing` in place would make PairingView refuse to start a fresh
+        // pairing against the new one (E-102). The old-host cancel is fired without awaiting
+        // (E-116): the old Mac may be offline, and its request timeout must not stall the switch.
+        if !sameBridge { dismissPairingWithoutAwaitingCancel() }
         if let newURL {
             await client.setBaseURL(newURL)
             connectedHostURL = newURL
-        }
-        if !sameBridge {
-            // Another bridge's projects and provider; start() below loads the new host's.
-            projects = []
-            bridgeProvider = nil
         }
         resetCursor()
         setKnownBridgeId(nil)
@@ -542,6 +770,7 @@ final class SessionStore {
                     resetCursor()
                     setKnownBridgeId(response.bridgeId)
                     discardLocalView()
+                    clearBridgeConfiguration()
                     syncState = .syncing
                     continue
                 }
@@ -616,6 +845,9 @@ final class SessionStore {
                 // The bridge returns every event after the cursor in one page, so once it is
                 // applied the Watch matches the bridge as of this response.
                 syncState = .current
+                if bridgeInfo == nil && !isRefreshingConfiguration {
+                    await refreshBridgeConfiguration(expectedPollGeneration: generation)
+                }
             } catch {
                 if Task.isCancelled || generation != pollGeneration { return }
                 syncState = .disconnected
@@ -648,6 +880,67 @@ final class SessionStore {
             unconfirmedCancels.removeAll()
         }
         clearOutcome()
+    }
+
+    private func clearBridgeConfiguration() {
+        configurationGeneration += 1
+        bridgeInfo = nil
+        authorizedProjects = []
+        selectedProjectId = nil
+        configurationError = nil
+        isRefreshingConfiguration = false
+    }
+
+    func refreshBridgeConfiguration() async {
+        await refreshBridgeConfiguration(expectedPollGeneration: pollGeneration)
+    }
+
+    /// Reloads the provider and projects; true when both loaded.
+    @discardableResult
+    func loadProjects() async -> Bool {
+        await refreshBridgeConfiguration()
+        return bridgeInfo != nil
+    }
+
+    private func refreshBridgeConfiguration(expectedPollGeneration: Int) async {
+        configurationGeneration += 1
+        let generation = configurationGeneration
+        isRefreshingConfiguration = true
+        configurationError = nil
+        do {
+            async let fetchedInfo = client.info()
+            async let fetchedProjects = client.projects()
+            let (info, projects) = try await (fetchedInfo, fetchedProjects)
+            guard generation == configurationGeneration,
+                  expectedPollGeneration == pollGeneration else { return }
+            bridgeInfo = info
+            authorizedProjects = projects
+            if projects.count == 1 {
+                selectedProjectId = projects[0].id
+            } else if let selectedProjectId,
+                      !projects.contains(where: { $0.id == selectedProjectId }) {
+                self.selectedProjectId = nil
+            }
+            isRefreshingConfiguration = false
+        } catch {
+            guard generation == configurationGeneration,
+                  expectedPollGeneration == pollGeneration else { return }
+            bridgeInfo = nil
+            authorizedProjects = []
+            selectedProjectId = nil
+            configurationError = "Could not load provider and projects"
+            isRefreshingConfiguration = false
+            report(error)
+        }
+    }
+
+    func selectProject(_ projectId: String?) {
+        guard let projectId else {
+            selectedProjectId = nil
+            return
+        }
+        guard authorizedProjects.contains(where: { $0.id == projectId }) else { return }
+        selectedProjectId = projectId
     }
 
     /// "Denied: Run git push origin main". Falls back to the decision alone when the request is
@@ -807,19 +1100,19 @@ final class SessionStore {
 
     @discardableResult
     func createSession() async -> String? {
-        let placeholder = UUID().uuidString
-        let generation = pollGeneration
-        if bridgeProvider == nil || selectedProject == nil {
-            await loadProjects()
-        }
-        guard let provider = bridgeProvider, let project = selectedProject else {
-            statusLine = projects.isEmpty && bridgeProvider != nil
-                ? "No project allowed for this Watch"
-                : bridgeProvider == nil ? "Couldn't load projects" : "Pick a project in Settings"
+        await refreshBridgeConfiguration()
+        guard let bridgeInfo, let selectedProjectId else {
+            statusLine = configurationError
+                ?? (authorizedProjects.isEmpty
+                    ? "No authorized project is available"
+                    : "Choose a project before creating a session")
             statusKind = .error
             return nil
         }
-        let payload = SessionCreatePayload(projectId: project.id, provider: provider)
+        let placeholder = UUID().uuidString
+        let generation = pollGeneration
+        let configuration = configurationGeneration
+        let payload = SessionCreatePayload(projectId: selectedProjectId, provider: bridgeInfo.provider)
         // Captured before the await: if the user explicitly picks a different session while this
         // call is in flight, that choice must win over this call selecting its newly created
         // session. An automatic selection made by apply() (e.g. selecting the first session seen
@@ -831,7 +1124,8 @@ final class SessionStore {
             // poll loop hasn't moved on to a new generation, otherwise this would select a
             // session on a bridge binding that has since been discarded.
             guard let created = response.sessionId,
-                  generation == pollGeneration else {
+                  generation == pollGeneration,
+                  configuration == configurationGeneration else {
                 // The rebind guard rejected this response: the id it carries is not (and must
                 // not become) the store's session, so callers like sendPrompt() must not treat
                 // it as a valid target either.
@@ -840,7 +1134,7 @@ final class SessionStore {
                 return nil
             }
             if sessions[created] == nil {
-                sessions[created] = SessionModel(id: created, projectId: project.id)
+                sessions[created] = SessionModel(id: created, projectId: payload.projectId)
             }
             if userSelectionCount == userSelectionsAtStart {
                 selectedSessionId = created

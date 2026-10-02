@@ -16,7 +16,7 @@ struct ProjectPickerView: View {
             }
             ForEach(store.projects) { project in
                 Button {
-                    store.selectedProjectId = project.id
+                    store.selectProject(project.id)
                     dismiss()
                 } label: {
                     HStack {

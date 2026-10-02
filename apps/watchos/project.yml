@@ -24,6 +24,7 @@ targets:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: Agent Remote
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         WKApplication: true
         WKWatchOnly: true
         NSLocalNetworkUsageDescription: Agent Remote connects to the Mac Agent Bridge on your local network.
@@ -32,9 +33,11 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.agentremote.watch
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_VERSION: "6.0"
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "4"
+        CURRENT_PROJECT_VERSION: "1"
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
         # An unsigned simulator app has no keychain entitlement, so storing the pairing
@@ -49,6 +52,8 @@ targets:
     sources:
       - path: Tests
       - path: Sources/BridgeClient.swift
+      - path: Sources/BridgeDiscovery.swift
+      - path: Sources/BuildInfo.swift
       - path: Sources/DeviceIdentity.swift
       - path: Sources/SessionStore.swift
       - path: Sources/SessionModel.swift

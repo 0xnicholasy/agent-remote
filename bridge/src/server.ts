@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import Ajv2020 from "ajv/dist/2020";
@@ -28,9 +29,26 @@ import { ApprovalBindingMismatchError, InteractionPendingError, MockProvider, ty
 // command.schema.json lives outside bridge's package boundary in protocol/, imported the same
 // way protocol/typescript/src/index.test.ts does.
 import commandSchema from "../../protocol/schema/command.schema.json";
-import { deriveDeviceKey, formatPairingCode, keyIdFor, PairingCodeStore } from "./auth/pairing";
+import {
+  checkCommitment,
+  confirmCode,
+  deriveDeviceKeyV2,
+  generateX25519KeyPair,
+  keyIdFor,
+  pairTranscript,
+  sharedSecret,
+} from "./auth/pairing";
 import { BRIDGE_LOCK_TIMEOUT_MS, DeviceRegistry, resolveStateDir, type DeviceRecord } from "./auth/devices";
 import { atomicWriteFileSync, clearLockIfHolderDead } from "./auth/persist";
+import {
+  clearPairingWindow,
+  clearPendingPair,
+  pairingWindowFilePath,
+  pendingPairFilePath,
+  readPairingWindow,
+  readPendingPair,
+  writePendingPair,
+} from "./auth/pending-pair";
 import { NonceCache, verifyEnvelope } from "./auth/verify";
 import { bridgeProjectsFileName, projectIdFor, resolveProjectIds } from "./projects";
 import { CommandJournal } from "./state/commands";
@@ -58,6 +76,8 @@ const DEFAULT_PORT = 8787;
  * listening). Not part of the public `AgentProvider` contract. */
 interface SeedableProvider extends AgentProvider {
   seedSession(session: Session): void;
+  /** Stops provider-owned work before the bridge releases its durable-state writer lock. */
+  dispose?(): void;
 }
 
 export interface Bridge {
@@ -69,15 +89,18 @@ export interface Bridge {
   /** `brg_` + 8 hex, stable for this process and persisted alongside the device registry so a
    * client can notice it is talking to a different bridge after a restart. */
   readonly bridgeId: string;
-  /** The pairing code minted at startup, per docs/pairing-v0.md. Production only prints it (see
-   * `import.meta.main` below); exposed here so tests can pair without scraping stdout. */
-  readonly pairingCode: string;
-  /** ISO timestamp the minted `pairingCode` expires at. */
-  readonly pairingCodeExpiresAt: string;
+  /** This process's X25519 public key, raw 32 bytes hex, per the pairing v2 handshake
+   * (docs/pairing-v0.md). Fresh every process start; never persisted. */
+  readonly pairingPublicKeyHex: string;
   /** Releases the single-writer lock (see the "Single-writer lock" comment in `createBridge`)
    * so the same state dir can be reopened, e.g. by a test's `restart()` helper or a graceful
    * shutdown. Idempotent; safe to call when there was no state dir to lock. */
   close(): void;
+}
+
+export interface BridgeInfoResponse {
+  provider: string;
+  capabilities: AgentProvider["capabilities"];
 }
 
 /** Options accepted by `createBridge`. Only `createClaudeProvider` exists for tests: it lets a
@@ -95,10 +118,6 @@ export interface CreateBridgeOptions {
    * defaults to `resolveStateDir()/devices.json`. Tests point this at a temp dir. Ignored when
    * `registry` is supplied. */
   devicesFilePath?: string;
-  /** Explicit path for the persisted live pairing code; defaults to alongside `devicesFilePath`
-   * as `pairing.json`. Persisting it (rather than keeping it in the bridge process's memory
-   * only) is what lets `bun run bridge pair` mint a code the already-running bridge can see. */
-  pairingCodeFilePath?: string;
   /** Clock used for pairing TTL, signature skew, nonce TTL and device timestamps. Production
    * uses the real clock; tests pass a fixed one for determinism. */
   now?: () => Date;
@@ -195,8 +214,8 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const SKEW_MS = 120_000; // 120 seconds in either direction, per docs/pairing-v0.md.
 
   // Durable bridge state lives next to the device registry, per docs/durability-v0.md. The same
-  // guard the bridge id and pairing code use applies: an injected in-memory registry with no
-  // explicit devices path has no state dir to write into, so every journal stays in memory.
+  // guard the bridge id and pending-pair state use applies: an injected in-memory registry with
+  // no explicit devices path has no state dir to write into, so every journal stays in memory.
   const stateDirPath =
     options.registry !== undefined && options.devicesFilePath === undefined
       ? undefined
@@ -285,10 +304,16 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         );
       }
     }
-    // The one race-free moment to clear a devices.json.lock orphaned by a crashed writer: this
+    // The one race-free moment to clear a devices/pairing lock orphaned by a crashed writer: this
     // process holds bridge.lock, so no other bridge exists, and a live CLI's lock is left alone.
-    if (clearLockIfHolderDead(`${devicesFilePath}.lock`)) {
-      console.warn(`Agent Remote bridge: removed devices.json.lock left by a dead process`);
+    for (const lockFile of [
+      `${devicesFilePath}.lock`,
+      `${pendingPairFilePath(stateDirPath)}.lock`,
+      `${pairingWindowFilePath(stateDirPath)}.lock`,
+    ]) {
+      if (clearLockIfHolderDead(lockFile)) {
+        console.warn(`Agent Remote bridge: removed ${path.basename(lockFile)} left by a dead process`);
+      }
     }
     let lockReleased = false;
     releaseLock = (): void => {
@@ -332,15 +357,65 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   const bridgeIdFilePath = journalPath("bridge-id.json");
   const bridgeId = loadOrCreateBridgeId(bridgeIdFilePath);
 
-  // Mirrors the bridgeIdFilePath guard just above: an injected in-memory registry with no
-  // explicit devices path has no durable state dir to persist into either, so the pairing code
-  // stays in-memory only (as it always has) rather than writing into the real ~/.agentremote.
-  const pairingCodeFilePath = options.pairingCodeFilePath ?? journalPath("pairing.json");
-  const pairingCodeStore = new PairingCodeStore(pairingCodeFilePath);
-  const pairingMintedAt = now();
-  const pairingCode = pairingCodeStore.mint(pairingMintedAt);
-  const PAIRING_TTL_MS = 5 * 60 * 1000; // 5 minutes, per docs/pairing-v0.md.
-  const pairingCodeExpiresAt = new Date(pairingMintedAt.getTime() + PAIRING_TTL_MS).toISOString();
+  // Pairing v2 (docs/pairing-v0.md): a fresh X25519 key pair per process start, never persisted.
+  // `pendingPairStateDir` mirrors the bridgeIdFilePath guard above -- an injected in-memory
+  // registry with no explicit devices path has no durable state dir to write pairing-window.json
+  // / pending-pair.json into either, and the pairing routes simply answer "no window open" in
+  // that mode (no test exercises pairing against a pure in-memory registry).
+  const bridgeKeyPair = generateX25519KeyPair();
+  const pendingPairStateDir = stateDirPath;
+  const PAIR_REVEAL_TIMEOUT_MS = 30_000; // reveal must arrive within 30s of start.
+  const PAIR_APPROVAL_TTL_MS = 120_000; // approval must land within 120s of reveal.
+  const PAIR_RATE_LIMIT_WINDOW_MS = 60_000;
+  const PAIR_RATE_LIMIT_MAX_STARTS = 6;
+  const pairRateLimitStarts: number[] = [];
+  // Field formats the Swift client already sends (lowercase hex via `%02x`, `dev_` + 16 hex).
+  const PAIR_DEVICE_ID_PATTERN = /^dev_[0-9a-f]{16}$/;
+  const PAIR_DEVICE_NAME_PATTERN = /^[^\p{Cc}]{1,64}$/u;
+  const PAIR_KEY_HEX_PATTERN = /^[0-9a-f]{64}$/;
+  const PAIR_COMMIT_HEX_PATTERN = /^[0-9a-f]{64}$/;
+  const PAIR_REQUEST_ID_PATTERN = /^par_[0-9a-f]{16}$/;
+  const PAIR_WATCH_NONCE_PATTERN = /^[0-9a-f]{32}$/;
+
+  // A bridge restart must not resurrect a pairing attempt from a previous process: the private
+  // key that attempt was validated against no longer exists in memory anywhere.
+  if (pendingPairStateDir !== undefined) {
+    clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+    clearPairingWindow(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+  }
+
+  // Set by a successful /v1/pair/start, consumed (and cleared) by the matching /v1/pair/reveal
+  // within PAIR_REVEAL_TIMEOUT_MS. In memory only, in this process only -- see the "Timing"
+  // section of docs/pairing-v0.md.
+  interface PendingStart {
+    requestId: string;
+    deviceId: string;
+    deviceName: string;
+    devicePublicKeyHex: string;
+    commit: string;
+    bridgeNonceHex: string;
+    startedAt: Date;
+  }
+  let pendingStart: PendingStart | undefined;
+
+  // Set by a successful /v1/pair/reveal, consumed (and cleared) once /v1/pair/status observes an
+  // "approved" decision written to pending-pair.json by the CLI. Holds exactly what a status poll
+  // needs to derive the device key -- the bridge's private key and the watch's nonce never touch
+  // disk, so a bridge restart mid-approval loses this and the CLI's wait simply expires.
+  interface RevealedPairing {
+    requestId: string;
+    devicePublicKeyHex: string;
+    transcript: string;
+  }
+  let revealedPairing: RevealedPairing | undefined;
+
+  // The outcome of the one approval this process has completed. A status poll whose response was
+  // lost re-polls the same requestId; answering from this cache (until the record's own
+  // expiresAt) keeps that retry idempotent and lets concurrent polls share one registration. The
+  // cached body carries no secret: the device key is derived locally on the Watch.
+  let approvedPairing:
+    | { requestId: string; expiresAtMs: number; result: Promise<Record<string, unknown>> }
+    | undefined;
 
   // The event log and the command journal are both durable (docs/durability-v0.md): a client
   // reconnecting after a bridge restart resolves its cursor against retained events, and a retry
@@ -527,7 +602,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
   // The bridge is the sole writer of projects.json: the CLI reads it to show the RUNNING
   // bridge's project list instead of re-resolving its own (possibly different) environment.
   // Only written when there is a real state dir to persist into (mirrors bridgeIdFilePath /
-  // pairingCodeFilePath above).
+  // pendingPairStateDir above).
   const projectsFilePath = journalPath(bridgeProjectsFileName);
   if (projectsFilePath !== undefined) {
     atomicWriteFileSync(projectsFilePath, JSON.stringify(resolvedProjects));
@@ -885,71 +960,331 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     return await execution;
   }
 
-  interface PairRequestBody {
+  interface PairStartBody {
     deviceId: string;
     deviceName: string;
-    nonce: string;
-    proof: string;
+    devicePublicKey: string;
+    commit: string;
   }
 
-  function isPairRequestBody(value: unknown): value is PairRequestBody {
+  function isPairStartBody(value: unknown): value is PairStartBody {
     if (typeof value !== "object" || value === null) {
       return false;
     }
     const record = value as Record<string, unknown>;
     return (
       typeof record.deviceId === "string" &&
+      PAIR_DEVICE_ID_PATTERN.test(record.deviceId) &&
       typeof record.deviceName === "string" &&
-      typeof record.nonce === "string" &&
-      typeof record.proof === "string"
+      PAIR_DEVICE_NAME_PATTERN.test(record.deviceName) &&
+      typeof record.devicePublicKey === "string" &&
+      PAIR_KEY_HEX_PATTERN.test(record.devicePublicKey) &&
+      typeof record.commit === "string" &&
+      PAIR_COMMIT_HEX_PATTERN.test(record.commit)
     );
   }
 
-  /** `POST /v1/pair`, per the "Enrollment" section of docs/pairing-v0.md. Every failure reason
-   * — malformed body, wrong code, expired code, exhausted code, malformed proof — answers the
-   * same 401, so the response never tells an attacker which one it was. */
-  async function handlePair(rawBody: string): Promise<Response> {
+  /** `POST /v1/pair/start`, per the pairing v2 handshake in docs/pairing-v0.md. */
+  function handlePairStart(rawBody: string): Response {
+    if (pendingPairStateDir === undefined) {
+      return json({ error: "pairing_closed" }, 403);
+    }
+
+    const nowMs = now().getTime();
+    while (pairRateLimitStarts.length > 0 && nowMs - pairRateLimitStarts[0]! >= PAIR_RATE_LIMIT_WINDOW_MS) {
+      pairRateLimitStarts.shift();
+    }
+    if (pairRateLimitStarts.length >= PAIR_RATE_LIMIT_MAX_STARTS) {
+      return json({ error: "rate_limited" }, 429);
+    }
+
+    const window = readPairingWindow(pendingPairStateDir);
+    if (window === undefined || nowMs >= new Date(window.expiresAt).getTime()) {
+      return json({ error: "pairing_closed" }, 403);
+    }
+
+    // A start that was never revealed (the operator's `bun run bridge pair` died, or the Watch
+    // never followed up) would otherwise block every future start forever: `pendingStart` is
+    // in-memory and nothing else clears it. Treat it as free once its own reveal window has
+    // passed, same as `handlePairReveal`'s `withinWindow` check.
+    if (pendingStart !== undefined && nowMs - pendingStart.startedAt.getTime() >= PAIR_REVEAL_TIMEOUT_MS) {
+      pendingStart = undefined;
+    }
+
+    // A persisted pending-pair record (written on reveal) that is expired -- whether it was
+    // decided and the Watch never polled `/v1/pair/status` to clear it, or it was never decided
+    // at all -- is stale, not busy. Only a live, unexpired pending record should block a new start.
+    const existingPending = readPendingPair(pendingPairStateDir);
+    if (existingPending !== undefined && nowMs >= new Date(existingPending.expiresAt).getTime()) {
+      clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      revealedPairing = undefined;
+    }
+
+    if (pendingStart !== undefined || readPendingPair(pendingPairStateDir) !== undefined) {
+      return json({ error: "pairing_busy" }, 409);
+    }
+
     let body: unknown;
     try {
       body = JSON.parse(rawBody);
     } catch {
       return json({ error: "pairing_rejected" }, 401);
     }
-    if (!isPairRequestBody(body)) {
+    if (!isPairStartBody(body)) {
       return json({ error: "pairing_rejected" }, 401);
     }
 
-    const result = pairingCodeStore.verify(body.proof, body.deviceId, body.deviceName, body.nonce, now());
-    if (!result.ok) {
+    // An id that is already registered (including a revoked one) can never be re-paired: this
+    // keeps the CLI's "registry has the deviceId" success check sound and stops a start from
+    // overwriting an existing record.
+    if (registry.get(body.deviceId) !== undefined) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+    // Import the device key once, here, so a value that is well-formed hex but not a usable
+    // X25519 point (including a low-order one) is rejected now rather than failing at status.
+    try {
+      sharedSecret(bridgeKeyPair.privateKey, body.devicePublicKey);
+    } catch {
       return json({ error: "pairing_rejected" }, 401);
     }
 
-    const deviceKey = deriveDeviceKey(result.code, body.deviceId, body.nonce);
-    const keyId = keyIdFor(deviceKey);
-    const pairedAt = now().toISOString();
-    const projects = await provider.listProjects();
+    pairRateLimitStarts.push(nowMs);
 
-    const record: DeviceRecord = {
+    const requestId = `par_${randomBytes(8).toString("hex")}`;
+    const bridgeNonceHex = randomBytes(16).toString("hex");
+    const startedAt = now();
+    pendingStart = {
+      requestId,
       deviceId: body.deviceId,
       deviceName: body.deviceName,
-      keyId,
-      deviceKeyHex: deviceKey.toString("hex"),
-      pairedAt,
-      allowedProjects: projects.map((project) => project.id),
-      allowedActions: [...ALL_COMMAND_ACTIONS],
-      revokedAt: null,
-      lastSeenAt: null,
+      devicePublicKeyHex: body.devicePublicKey,
+      commit: body.commit,
+      bridgeNonceHex,
+      startedAt,
     };
-    registry.register(record);
 
     return json({
-      deviceId: record.deviceId,
-      keyId: record.keyId,
-      pairedAt: record.pairedAt,
+      requestId,
       bridgeId,
-      allowedProjects: record.allowedProjects,
-      allowedActions: record.allowedActions,
+      bridgePublicKey: bridgeKeyPair.publicKeyHex,
+      bridgeNonce: bridgeNonceHex,
+      expiresAt: new Date(startedAt.getTime() + PAIR_REVEAL_TIMEOUT_MS).toISOString(),
     });
+  }
+
+  interface PairRevealBody {
+    requestId: string;
+    watchNonce: string;
+  }
+
+  function isPairRevealBody(value: unknown): value is PairRevealBody {
+    if (typeof value !== "object" || value === null) {
+      return false;
+    }
+    const record = value as Record<string, unknown>;
+    return (
+      typeof record.requestId === "string" &&
+      PAIR_REQUEST_ID_PATTERN.test(record.requestId) &&
+      typeof record.watchNonce === "string" &&
+      PAIR_WATCH_NONCE_PATTERN.test(record.watchNonce)
+    );
+  }
+
+  /** `POST /v1/pair/reveal`. Every failure — malformed body, unknown/expired requestId, a
+   * commitment that does not match the revealed nonce — answers the same 401 and drops the
+   * request (clears `pendingStart`), so a wrong guess cannot be retried against the same commit. */
+  function handlePairReveal(rawBody: string): Response {
+    if (pendingPairStateDir === undefined) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
+    let body: unknown;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+    if (!isPairRevealBody(body)) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
+    const pending = pendingStart;
+    if (pending === undefined || pending.requestId !== body.requestId) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+    pendingStart = undefined; // one attempt per start, success or failure.
+
+    const withinWindow = now().getTime() - pending.startedAt.getTime() <= PAIR_REVEAL_TIMEOUT_MS;
+    if (!withinWindow || !checkCommitment(pending.commit, body.watchNonce)) {
+      return json({ error: "pairing_rejected" }, 401);
+    }
+
+    const transcript = pairTranscript({
+      bridgeId,
+      bridgePublicKeyHex: bridgeKeyPair.publicKeyHex,
+      devicePublicKeyHex: pending.devicePublicKeyHex,
+      bridgeNonceHex: pending.bridgeNonceHex,
+      watchNonceHex: body.watchNonce,
+    });
+    const code = confirmCode(transcript);
+    const revealedAt = now();
+    const expiresAt = new Date(revealedAt.getTime() + PAIR_APPROVAL_TTL_MS);
+
+    revealedPairing = { requestId: pending.requestId, devicePublicKeyHex: pending.devicePublicKeyHex, transcript };
+    writePendingPair(
+      pendingPairStateDir,
+      {
+        requestId: pending.requestId,
+        deviceId: pending.deviceId,
+        deviceName: pending.deviceName,
+        code,
+        revealedAt: revealedAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+        decision: null,
+        status: "pending",
+      },
+      BRIDGE_LOCK_TIMEOUT_MS,
+    );
+
+    return json({ status: "pending", expiresAt: expiresAt.toISOString() });
+  }
+
+  /** Clears whatever is pending for `requestId` (in either phase) and answers 200 regardless, so
+   * the Watch's "None match"/cancel path never has to distinguish which phase it was in. */
+  function handlePairCancel(rawBody: string): Response {
+    if (pendingPairStateDir === undefined) {
+      return json({});
+    }
+    let requestId: string | undefined;
+    try {
+      const body = JSON.parse(rawBody) as { requestId?: unknown };
+      requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+    } catch {
+      requestId = undefined;
+    }
+    if (requestId === undefined) {
+      return json({});
+    }
+    if (pendingStart?.requestId === requestId) {
+      pendingStart = undefined;
+    }
+    const pending = readPendingPair(pendingPairStateDir);
+    if (pending?.requestId === requestId) {
+      clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS);
+      revealedPairing = undefined;
+    }
+    return json({});
+  }
+
+  /** `GET /v1/pair/status?requestId=`, polled by the Watch about once a second. An unknown
+   * requestId answers `expired` rather than 404, so a superseded/cancelled poll and a genuinely
+   * unknown one look the same to a client that lost the race. */
+  async function handlePairStatus(url: URL): Promise<Response> {
+    const requestId = url.searchParams.get("requestId");
+    if (pendingPairStateDir === undefined || requestId === null) {
+      return json({ status: "expired" });
+    }
+
+    if (approvedPairing?.requestId === requestId) {
+      if (now().getTime() < approvedPairing.expiresAtMs) {
+        return json(await approvedPairing.result);
+      }
+      approvedPairing = undefined;
+    }
+
+    const pending = readPendingPair(pendingPairStateDir);
+    if (pending === undefined || pending.requestId !== requestId) {
+      return json({ status: "expired" });
+    }
+
+    // Best-effort: the pending record is only bookkeeping once the outcome is decided, so a
+    // failure to remove it (lock timeout, fs error) is logged and never changes the answer.
+    const clearBestEffort = (what: string, clear: () => void): void => {
+      try {
+        clear();
+      } catch (error) {
+        console.error(`pairing: ${what} cleanup failed for ${requestId}`, error);
+      }
+    };
+    // The decision is final once read: a record that cannot be removed now is removed by the CLI's
+    // denied-ack loop or by expiry, and the Watch must still receive the decision.
+    const clearPendingBestEffort = (): void =>
+      clearBestEffort("pending pair", () => clearPendingPair(pendingPairStateDir, BRIDGE_LOCK_TIMEOUT_MS));
+
+    if (now().getTime() >= new Date(pending.expiresAt).getTime()) {
+      clearPendingBestEffort();
+      revealedPairing = undefined;
+      return json({ status: "expired" });
+    }
+
+    if (pending.decision === "denied") {
+      clearPendingBestEffort();
+      revealedPairing = undefined;
+      return json({ status: "denied" });
+    }
+
+    if (pending.decision !== "approved") {
+      return json({ status: "pending" });
+    }
+
+    // Taken synchronously, before any await, so a concurrent poll cannot consume it twice.
+    const revealed = revealedPairing;
+    revealedPairing = undefined;
+    if (revealed === undefined || revealed.requestId !== requestId) {
+      // The approval landed after this process lost the in-memory transcript (a restart mid
+      // approval); nothing recoverable without the private key/nonce, which never touched disk.
+      clearPendingBestEffort();
+      return json({ status: "expired" });
+    }
+
+    const stateDir = pendingPairStateDir;
+    // Never rejects: the promise is cached per requestId, so a rejection would be replayed as a
+    // 500 on every later poll with the one-shot reveal already consumed. A failure before or at
+    // registration answers `expired` (a status the Watch already maps to a clear failure; the
+    // registry rolls back a failed write, so no device is left behind), and a failure after
+    // registration is only logged, because the device IS registered and must get its credential.
+    const result = (async (): Promise<Record<string, unknown>> => {
+      let record: DeviceRecord;
+      try {
+        const deviceKey = deriveDeviceKeyV2(sharedSecret(bridgeKeyPair.privateKey, revealed.devicePublicKeyHex), revealed.transcript);
+        const keyId = keyIdFor(deviceKey);
+        const pairedAt = now().toISOString();
+        const projects = await provider.listProjects();
+        const stillPending = readPendingPair(stateDir);
+        if (stillPending === undefined || stillPending.requestId !== requestId) {
+          return { status: "expired" };
+        }
+        record = {
+          deviceId: pending.deviceId,
+          deviceName: pending.deviceName,
+          keyId,
+          deviceKeyHex: deviceKey.toString("hex"),
+          pairedAt,
+          allowedProjects: projects.map((project) => project.id),
+          allowedActions: [...ALL_COMMAND_ACTIONS],
+          revokedAt: null,
+          lastSeenAt: null,
+        };
+        registry.register(record);
+      } catch (error) {
+        console.error(`pairing: approval failed before registration for ${requestId}`, error);
+        clearBestEffort("pending pair", () => clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
+        return { status: "expired" };
+      }
+      clearBestEffort("pending pair", () => clearPendingPair(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
+      clearBestEffort("pairing window", () => clearPairingWindow(stateDir, BRIDGE_LOCK_TIMEOUT_MS));
+      return {
+        status: "approved",
+        deviceId: record.deviceId,
+        keyId: record.keyId,
+        pairedAt: record.pairedAt,
+        bridgeId,
+        allowedProjects: record.allowedProjects,
+        allowedActions: record.allowedActions,
+      };
+    })();
+    approvedPairing = { requestId, expiresAtMs: new Date(pending.expiresAt).getTime(), result };
+    return json(await result);
   }
 
   async function handleEvents(url: URL, device: DeviceRecord | undefined): Promise<Response> {
@@ -1012,9 +1347,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
     session,
     provider,
     bridgeId,
-    pairingCode,
-    pairingCodeExpiresAt,
+    pairingPublicKeyHex: bridgeKeyPair.publicKeyHex,
     close(): void {
+      provider.dispose?.();
       releaseLock?.();
     },
     async fetch(request: Request): Promise<Response> {
@@ -1028,18 +1363,42 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
         const url = new URL(request.url);
         const path = url.pathname;
 
-        // The only two unauthenticated routes, per docs/pairing-v0.md.
+        // The only unauthenticated routes: GET /v1/health and the four POST/GET /v1/pair/* ones,
+        // per docs/pairing-v0.md.
         if (request.method === "GET" && path === "/v1/health") {
-          return json({ ok: true, bridgeId });
+          return json({ ok: true, bridgeId, name: os.hostname() });
+        }
+
+        // Minimal request logging for the pairing routes only -- method, path, status and
+        // duration, never bodies or keys -- so a stuck Watch pairing attempt can be diagnosed
+        // from the bridge's own stdout without adding a general request logger.
+        const logPairRoute = (response: Response, startedAtMs: number): Response => {
+          const ms = Math.round(performance.now() - startedAtMs);
+          console.log(`[pair] ${request.method} ${path} ${response.status} ${ms}ms`);
+          return response;
+        };
+
+        if (request.method === "GET" && path === "/v1/pair/status") {
+          const startedAtMs = performance.now();
+          return logPairRoute(await handlePairStatus(url), startedAtMs);
         }
 
         // Read the body once as text and reuse it everywhere below: the envelope signature
-        // covers the raw bytes, and handleCommand/handlePair parse this same string, so the
+        // covers the raw bytes, and handleCommand/handlePair* parse this same string, so the
         // Request is never consumed twice.
         const rawBody = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
 
-        if (request.method === "POST" && path === "/v1/pair") {
-          return await handlePair(rawBody);
+        if (request.method === "POST" && path === "/v1/pair/start") {
+          const startedAtMs = performance.now();
+          return logPairRoute(handlePairStart(rawBody), startedAtMs);
+        }
+        if (request.method === "POST" && path === "/v1/pair/reveal") {
+          const startedAtMs = performance.now();
+          return logPairRoute(handlePairReveal(rawBody), startedAtMs);
+        }
+        if (request.method === "POST" && path === "/v1/pair/cancel") {
+          const startedAtMs = performance.now();
+          return logPairRoute(handlePairCancel(rawBody), startedAtMs);
         }
 
         let device: DeviceRecord | undefined;
@@ -1091,6 +1450,9 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
           const visible =
             device === undefined ? projects : projects.filter((project) => device.allowedProjects.includes(project.id));
           return json({ projects: visible, provider: provider.id } satisfies ProjectsResponse);
+        }
+        if (request.method === "GET" && path === "/v1/info") {
+          return json({ provider: provider.id, capabilities: provider.capabilities } satisfies BridgeInfoResponse);
         }
 
         const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);
@@ -1153,7 +1515,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
 /** Picks the hostname `Bun.serve` binds to, and whether that choice needs a no-auth warning.
  * Exported for testing; `import.meta.main` below is the only production caller.
  *
- * `AGENTREMOTE_HOST` unset: the claude provider (which executes real host tool calls) defaults
+ * `AGENTREMOTE_HOST` unset: real providers (which execute real host tool calls) default
  * to loopback-only; the mock provider is left on Bun's own default (binds all interfaces),
  * matching its pre-existing behavior. `AGENTREMOTE_HOST` set explicitly always wins, and a
  * non-loopback value with the claude provider is flagged since this bridge has no auth. */
@@ -1249,8 +1611,6 @@ if (import.meta.main) {
           "behind a trusted network/proxy) unless this is intentional.",
       );
     }
-
-    console.log(`Pairing code: ${formatPairingCode(bridge.pairingCode)} (expires ${bridge.pairingCodeExpiresAt})`);
 
     const server = Bun.serve({
       port: Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10),

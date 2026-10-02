@@ -27,7 +27,7 @@ export class FileLockReleaseError extends Error {}
 /**
  * Writes `data` to `filePath` atomically (temp file then rename), with the file left at mode
  * 0600 and its parent directory created 0700 if missing. Shared by every piece of persisted
- * auth state (`DeviceRegistry`, `PairingCodeStore`) so they agree on the same on-disk safety
+ * auth state (`DeviceRegistry`, the pending-pair store) so they agree on the same on-disk safety
  * properties instead of each reimplementing it.
  */
 export function atomicWriteFileSync(filePath: string, data: string): void {

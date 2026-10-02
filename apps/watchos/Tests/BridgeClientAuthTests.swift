@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import AgentRemoteProtocol
 #if canImport(Darwin)
@@ -150,6 +151,15 @@ private final class RequestCapture: @unchecked Sendable {
         return (try? JSONSerialization.jsonObject(with: Data(bodyData))) as? [String: Any]
     }
 
+    /// The HTTP request line (`POST /path HTTP/1.1`) of the captured request.
+    func requestLine(at index: Int) -> String? {
+        lock.lock()
+        let raw = bodies[safe: index]
+        lock.unlock()
+        guard let raw else { return nil }
+        return String(decoding: raw, as: UTF8.self).split(separator: "\r\n").first.map(String.init)
+    }
+
     /// Lowercased header name -> value, parsed from the same captured raw request bytes.
     func requestHeaders(at index: Int) -> [String: String]? {
         lock.lock()
@@ -167,6 +177,14 @@ private final class RequestCapture: @unchecked Sendable {
     }
 }
 
+/// A store whose `save` always throws, to drive the Keychain-failure path of `pollPairing`.
+private final class FailingSaveCredentialStore: CredentialStore, @unchecked Sendable {
+    struct SaveFailed: Error {}
+    func loadResult() -> CredentialLoadResult { .notFound }
+    func save(_ credential: DeviceCredential) throws { throw SaveFailed() }
+    func clear() throws {}
+}
+
 private extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
@@ -178,9 +196,10 @@ private extension Array {
 /// docs/pairing-v0.md.
 final class BridgeClientAuthTests: XCTestCase {
     private func makeCredential() -> DeviceCredential {
-        let key = RequestSigning.deriveDeviceKey(
-            code: "ABCDEFGHJKMN", deviceId: "dev_9f2c4a1b7d3e5061", nonce: "00112233445566778899aabbccddeeff"
-        )
+        // Any fixed 32-byte key works here: these tests exercise header construction and error
+        // mapping, not the pairing v2 derivation itself (covered separately in RequestSigning's
+        // own tests and testPairSuccessEnrollsAndYieldsAUsableCredential).
+        let key = SymmetricKey(size: .bits256)
         return DeviceCredential(
             deviceId: "dev_9f2c4a1b7d3e5061",
             keyId: "key_cd7749ef",
@@ -278,65 +297,229 @@ final class BridgeClientAuthTests: XCTestCase {
         XCTAssertEqual(BridgeError.from(status: 409, code: nil, message: "stale binding"), .http(status: 409, message: "stale binding"))
     }
 
-    /// Covers R-004: a well-formed `POST /v1/pair` response must enroll the device and leave
-    /// behind a credential that subsequent requests can actually sign with -- specifically the
-    /// server's own `deviceId`, not whatever id the client generated locally before it knew
-    /// what the bridge would assign.
+    private static let testBridgeId = "brg_87654321"
+    private static let testBridgeNonce = "00112233445566778899aabbccddeeff"
+
+    private func startResponseBody(bridgePublicKey: String, bridgeId: String = testBridgeId) -> String {
+        #"{"requestId":"par_test01","bridgeId":"\#(bridgeId)","bridgePublicKey":"\#(bridgePublicKey)","bridgeNonce":"\#(Self.testBridgeNonce)","expiresAt":"2026-09-20T10:15:00.000Z"}"#
+    }
+
+    private func approvedBody(deviceId: String, keyId: String, bridgeId: String = testBridgeId) -> String {
+        #"{"status":"approved","deviceId":"\#(deviceId)","keyId":"\#(keyId)","pairedAt":"2026-09-20T10:15:00.000Z","bridgeId":"\#(bridgeId)","allowedProjects":[],"allowedActions":[]}"#
+    }
+
+    /// Answers start and reveal on `server`, runs `beginPairing`, and returns what the bridge
+    /// side needs to answer the approval honestly: the deviceId the Watch sent and the keyId the
+    /// bridge would derive from its own private key and the transcript.
+    private func runHandshake(
+        server: LoopbackHTTPServer,
+        capture: RequestCapture,
+        client: BridgeClient,
+        bridgeKey: Curve25519.KeyAgreement.PrivateKey
+    ) async throws -> (handshake: PairingHandshake, deviceId: String, keyId: String) {
+        let bridgePublicKey = bridgeKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: startResponseBody(bridgePublicKey: bridgePublicKey), onRequest: capture.record)
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"ok":true}"#, onRequest: capture.record)
+
+        let handshake = try await client.beginPairing(deviceName: "Test Watch")
+
+        let startBody = try XCTUnwrap(capture.requestBody(at: 0))
+        let revealBody = try XCTUnwrap(capture.requestBody(at: 1))
+        let deviceId = try XCTUnwrap(startBody["deviceId"] as? String)
+        let devicePublicKey = try XCTUnwrap(startBody["devicePublicKey"] as? String)
+        let watchNonce = try XCTUnwrap(revealBody["watchNonce"] as? String)
+        XCTAssertEqual(startBody["commit"] as? String, RequestSigning.commitment(watchNonce: watchNonce))
+
+        let transcript = RequestSigning.pairTranscript(
+            bridgeId: Self.testBridgeId,
+            bridgePublicKeyHex: bridgePublicKey,
+            devicePublicKeyHex: devicePublicKey,
+            bridgeNonceHex: Self.testBridgeNonce,
+            watchNonceHex: watchNonce
+        )
+        XCTAssertEqual(handshake.code, RequestSigning.confirmCode(transcript: transcript))
+        let shared = try RequestSigning.sharedSecret(privateKey: bridgeKey, peerPublicKeyHex: devicePublicKey)
+        let deviceKey = RequestSigning.deriveDeviceKey(shared: shared, transcript: transcript)
+        return (handshake, deviceId, RequestSigning.keyId(for: deviceKey))
+    }
+
+    /// Covers R-004 and E-11 for pairing v2: a real X25519 derivation. The bridge side of the
+    /// test derives the keyId from its own private key and the transcript, so the Watch only
+    /// enrolls when its independently derived key matches, and the stored credential carries the
+    /// deviceId the Watch itself sent at start.
     func testPairSuccessEnrollsAndYieldsAUsableCredential() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
-        server.respondOnce(
-            statusLine: "HTTP/1.1 200 OK",
-            body: #"{"deviceId":"dev_serverassigned01","keyId":"key_aaaa1111","bridgeId":"brg_87654321"}"#
-        )
-
+        let capture = RequestCapture()
         let credentialStore = InMemoryCredentialStore()
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
 
         let pairedBefore = await client.isPaired()
-        XCTAssertFalse(pairedBefore, "must not be paired before pair() runs")
-        try await client.pair(code: "ABCDEFGHJKMN", deviceName: "Test Watch")
+        XCTAssertFalse(pairedBefore, "must not be paired before pairing runs")
+        let (handshake, deviceId, keyId) = try await runHandshake(
+            server: server, capture: capture, client: client, bridgeKey: Curve25519.KeyAgreement.PrivateKey()
+        )
+        XCTAssertEqual(handshake.requestId, "par_test01")
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"status":"pending","expiresAt":"2026-09-20T10:15:00.000Z"}"#)
+        let pending = try await client.pollPairing(requestId: handshake.requestId)
+        XCTAssertEqual(pending, .pending)
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: approvedBody(deviceId: deviceId, keyId: keyId))
+        let result = try await client.pollPairing(requestId: handshake.requestId)
+        XCTAssertEqual(result, .approved)
 
         let pairedAfter = await client.isPaired()
         XCTAssertTrue(pairedAfter)
-        let stored = try XCTUnwrap(credentialStore.load(), "pair() must persist a credential")
-        XCTAssertEqual(stored.deviceId, "dev_serverassigned01", "the stored credential must use the bridge's assigned deviceId")
-        XCTAssertEqual(stored.keyId, "key_aaaa1111")
-        XCTAssertEqual(stored.bridgeId, "brg_87654321")
+        let stored = try XCTUnwrap(credentialStore.load(), "an approved pairing must persist a credential")
+        XCTAssertEqual(stored.deviceId, deviceId, "the stored credential must use the deviceId the Watch sent at start")
+        XCTAssertEqual(stored.keyId, keyId)
+        XCTAssertEqual(stored.bridgeId, Self.testBridgeId)
 
-        // The credential must actually be usable: a subsequent signed request carries the
-        // server-assigned deviceId, not the locally generated one from before pairing.
         let url = server.baseURL.appending(path: "/v1/sessions")
         let request = try await client.signedRequest(method: "GET", url: url, body: nil)
-        XCTAssertEqual(request.value(forHTTPHeaderField: "X-AgentRemote-Device"), "dev_serverassigned01")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-AgentRemote-Device"), deviceId)
     }
 
-    /// Covers R-004: when the bridge rejects the pairing code, `pair()` must throw rather than
-    /// silently leaving the caller thinking it enrolled, and no credential may be persisted.
+    /// E-11: an approval whose keyId does not match the key the Watch derived is rejected and
+    /// nothing is stored.
+    func testApprovedWithMismatchedKeyIdIsRejected() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let capture = RequestCapture()
+        let credentialStore = InMemoryCredentialStore()
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
+        let (handshake, deviceId, _) = try await runHandshake(
+            server: server, capture: capture, client: client, bridgeKey: Curve25519.KeyAgreement.PrivateKey()
+        )
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: approvedBody(deviceId: deviceId, keyId: "key_aaaa1111"))
+        do {
+            _ = try await client.pollPairing(requestId: handshake.requestId)
+            XCTFail("expected a keyId mismatch to throw")
+        } catch BridgeError.malformedResponse {
+            // expected
+        } catch {
+            XCTFail("expected .malformedResponse, got \(error)")
+        }
+        XCTAssertNil(credentialStore.load())
+        let paired = await client.isPaired()
+        XCTAssertFalse(paired)
+    }
+
+    /// E-11: an approval naming a different bridge than the one that answered start is rejected.
+    func testApprovedWithDifferentBridgeIdIsRejected() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let capture = RequestCapture()
+        let credentialStore = InMemoryCredentialStore()
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
+        let (handshake, deviceId, keyId) = try await runHandshake(
+            server: server, capture: capture, client: client, bridgeKey: Curve25519.KeyAgreement.PrivateKey()
+        )
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: approvedBody(deviceId: deviceId, keyId: keyId, bridgeId: "brg_other000"))
+        do {
+            _ = try await client.pollPairing(requestId: handshake.requestId)
+            XCTFail("expected a bridgeId mismatch to throw")
+        } catch BridgeError.malformedResponse {
+            // expected
+        } catch {
+            XCTFail("expected .malformedResponse, got \(error)")
+        }
+        XCTAssertNil(credentialStore.load())
+    }
+
+    /// E-12: a start response whose bridgePublicKey or bridgeNonce is not lowercase hex of the
+    /// right length is rejected before any key material is used.
+    func testStartResponseWithMalformedBridgeKeyIsRejected() async throws {
+        for badKey in [String(repeating: "1", count: 63), String(repeating: "zz", count: 32)] {
+            let server = LoopbackHTTPServer()
+            defer { server.stop() }
+            server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: startResponseBody(bridgePublicKey: badKey))
+            let credentialStore = InMemoryCredentialStore()
+            let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
+            do {
+                _ = try await client.beginPairing(deviceName: "Test Watch")
+                XCTFail("expected beginPairing to throw for bridgePublicKey \(badKey)")
+            } catch BridgeError.malformedResponse {
+                // expected
+            } catch {
+                XCTFail("expected .malformedResponse, got \(error)")
+            }
+            let paired = await client.isPaired()
+            XCTAssertFalse(paired)
+        }
+    }
+
+    /// E-13: when reveal fails, the Watch tells the bridge to drop the pending request.
+    func testRevealFailureSendsCancel() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let capture = RequestCapture()
+        let bridgePublicKey = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: startResponseBody(bridgePublicKey: bridgePublicKey), onRequest: capture.record)
+        server.respondOnce(statusLine: "HTTP/1.1 500 Internal Server Error", body: #"{"error":"boom"}"#, onRequest: capture.record)
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: #"{"ok":true}"#, onRequest: capture.record)
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: InMemoryCredentialStore())
+
+        do {
+            _ = try await client.beginPairing(deviceName: "Test Watch")
+            XCTFail("expected beginPairing to throw when reveal fails")
+        } catch {
+            // expected
+        }
+
+        let cancelBody = try XCTUnwrap(capture.requestBody(at: 2), "a cancel request must follow the failed reveal")
+        XCTAssertEqual(cancelBody["requestId"] as? String, "par_test01")
+        let requestLine = try XCTUnwrap(capture.requestLine(at: 2))
+        XCTAssertTrue(requestLine.contains("/v1/pair/cancel"), "unexpected request line: \(requestLine)")
+    }
+
+    /// E-03: a Keychain save failure after a valid approval surfaces as a BridgeError, not a
+    /// transport error, and leaves the client unpaired.
+    func testKeychainSaveFailureAfterApprovalThrowsBridgeError() async throws {
+        let server = LoopbackHTTPServer()
+        defer { server.stop() }
+        let capture = RequestCapture()
+        let client = BridgeClient(baseURL: server.baseURL, credentialStore: FailingSaveCredentialStore())
+        let (handshake, deviceId, keyId) = try await runHandshake(
+            server: server, capture: capture, client: client, bridgeKey: Curve25519.KeyAgreement.PrivateKey()
+        )
+
+        server.respondOnce(statusLine: "HTTP/1.1 200 OK", body: approvedBody(deviceId: deviceId, keyId: keyId))
+        do {
+            _ = try await client.pollPairing(requestId: handshake.requestId)
+            XCTFail("expected a save failure to throw")
+        } catch is BridgeError {
+            // expected
+        } catch {
+            XCTFail("expected a BridgeError, got \(error)")
+        }
+        let paired = await client.isPaired()
+        XCTAssertFalse(paired)
+    }
+
+    /// Covers R-004 for pairing v2: when the bridge refuses `/v1/pair/start` outside a pairing
+    /// window, `beginPairing()` must throw `.pairingClosed` rather than silently leaving the
+    /// caller thinking it enrolled, and no credential may be persisted.
     func testPairFailureSurfacesErrorAndDoesNotEnroll() async throws {
         let server = LoopbackHTTPServer()
         defer { server.stop() }
-        // The real bridge answers every rejected pairing code the same way -- "pairing_rejected"
-        // at 401 -- per bridge/src/server.ts's handlePair (malformed body, wrong/expired/exhausted
-        // code, and malformed proof all share this response so an attacker can't distinguish them).
         server.respondOnce(
-            statusLine: "HTTP/1.1 401 Unauthorized",
-            body: #"{"error":"pairing_rejected"}"#
+            statusLine: "HTTP/1.1 403 Forbidden",
+            body: #"{"error":"pairing_closed"}"#
         )
 
         let credentialStore = InMemoryCredentialStore()
         let client = BridgeClient(baseURL: server.baseURL, credentialStore: credentialStore)
 
         do {
-            try await client.pair(code: "000000000000", deviceName: "Test Watch")
-            XCTFail("expected pair() to throw when the bridge rejects the pairing code")
-        } catch BridgeError.http(let status, let message) {
-            // "pairing_rejected" has no dedicated BridgeError case today, so BridgeError.from
-            // falls back to .http -- the failure still surfaces instead of being swallowed.
-            XCTAssertEqual(status, 401)
-            XCTAssertEqual(message, "pairing_rejected")
+            _ = try await client.beginPairing(deviceName: "Test Watch")
+            XCTFail("expected beginPairing() to throw when the bridge refuses /v1/pair/start")
+        } catch BridgeError.pairingClosed {
+            // Expected: no pairing window is open on the bridge.
         } catch {
-            XCTFail("expected .http(401, \"pairing_rejected\"), got \(error)")
+            XCTFail("expected .pairingClosed, got \(error)")
         }
 
         let pairedAfterFailure = await client.isPaired()

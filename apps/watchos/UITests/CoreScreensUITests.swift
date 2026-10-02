@@ -29,13 +29,16 @@ final class CoreScreensUITests: XCTestCase {
     private var bridge: URL!
     private var app: XCUIApplication!
 
+    private var stateDir: URL!
+
     override func setUp() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let raw = env["AGENTREMOTE_UI_BRIDGE"], let url = URL(string: raw),
-              env["AGENTREMOTE_UI_PAIR_CODE"] != nil else {
-            throw XCTSkip("AGENTREMOTE_UI_BRIDGE and AGENTREMOTE_UI_PAIR_CODE are not set")
+              let stateDirRaw = env["AGENTREMOTE_UI_STATE_DIR"] else {
+            throw XCTSkip("AGENTREMOTE_UI_BRIDGE and AGENTREMOTE_UI_STATE_DIR are not set")
         }
         bridge = url
+        stateDir = URL(fileURLWithPath: stateDirRaw)
         continueAfterFailure = false
         app = XCUIApplication()
         // The argument domain overrides the stored bridge address without touching the app's
@@ -115,43 +118,109 @@ final class CoreScreensUITests: XCTestCase {
             XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render for an already-paired launch")
             relaunchToSettings()
             XCTAssertFalse(app.buttons["onboarding-next-1"].exists, "a paired Watch must not show onboarding after relaunch")
-            let pairLink = labeled("Pair Watch")
-            reveal(pairLink)
-            XCTAssertTrue(pairedIndicator.exists, "expected pairing to remain intact across relaunch")
+            // Reveal the indicator itself, not the Pair Watch link below it -- Device and
+            // Pair Watch share one Form section, and the form only keeps rows near the screen
+            // in the accessibility tree, so scrolling to Pair Watch can scroll Device off it.
+            reveal(pairedIndicator)
+            XCTAssertTrue(pairedIndicator.exists, "expected the paired indicator after relaunch")
             return
         }
 
         XCTContext.runActivity(named: "pairing for the first time through onboarding") { _ in }
         shot("o1-mac-setup")
         onboardingNext1.tap()
+        // Launched with -dev.agentremote.watch.host, canAdvanceFromHostStep is already true, so
+        // OnboardingView skips straight from macSetup to matchCode (no findingMac sweep, no
+        // manual host entry) -- PairingView.task then starts pairing v2 on its own.
 
-        let hostField = app.textFields["onboarding-host"]
-        XCTAssertTrue(hostField.waitForExistence(timeout: 5), "expected the Mac address step to render")
-        // Launched with -dev.agentremote.watch.host, the argument domain already prefills this
-        // field with AGENTREMOTE_UI_BRIDGE's host:port, so there is nothing to type here.
-        shot("o2-host-address")
-        let next2 = app.buttons["onboarding-next-2"]
-        XCTAssertTrue(next2.isEnabled, "Next must be enabled once the host field is prefilled")
-        next2.tap()
+        // PairingView's .task calls beginPairing(), which runs start+reveal against the real
+        // bridge; the bridge only writes pending-pair.json once reveal completes. Poll for it
+        // instead of a fixed sleep.
+        let pending = try waitForPendingPair()
+        shot("o2-pairing-code")
 
-        let codeField = app.textFields["pairing-code"]
-        XCTAssertTrue(codeField.waitForExistence(timeout: 10), "expected the pairing code step to render after reconnecting")
-        shot("o3-pairing-code")
-        codeField.tap()
-        // The field opens the system input sheet; the text goes into its focused text view.
-        let input = app.textViews.matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-        XCTAssertTrue(input.waitForExistence(timeout: 5))
-        input.typeText(ProcessInfo.processInfo.environment["AGENTREMOTE_UI_PAIR_CODE"]!)
-        button("Done").tap()
-        shot("o4-code-entered")
-        button("Pair").tap()
-        // A successful pair flips store.paired and RootView swaps onboarding out for the
-        // TabView; the pairing form (and its Pair button) goes with it.
-        XCTAssertTrue(button("Pair").waitForNonExistence(timeout: 15), "pairing did not complete")
+        let option = app.buttons["pairing-option-\(pending.code)"]
+        XCTAssertTrue(option.waitForExistence(timeout: 5), "expected an option button for the derived code \(pending.code)")
+        option.tap()
+        shot("o3-code-picked")
+
+        // Stand in for the operator's `y` at `bun run bridge pair`: write the same decision the
+        // CLI writes, through the same lock-file protocol (bridge/src/auth/pending-pair.ts).
+        try approvePendingPair(requestId: pending.requestId)
+
+        // A successful approval flips store.paired and RootView swaps onboarding out for the
+        // TabView, landing on ConversationView (the TabView's first page). Wait for that page's
+        // own Reply button first -- proof the swap happened -- then swipe up to SettingsView,
+        // the second page, where Create session lives.
+        XCTAssertTrue(button("Reply").waitForExistence(timeout: 15), "pairing did not complete")
+        app.swipeUp()
+        XCTAssertTrue(button("Create session").waitForExistence(timeout: 10), "expected Settings to render after pairing")
         relaunchToSettings()
-        let pairLink = labeled("Pair Watch")
-        reveal(pairLink)
+        // Same reasoning as the already-paired branch above: reveal the indicator itself.
+        reveal(pairedIndicator)
         XCTAssertTrue(pairedIndicator.exists, "expected pairing to have completed")
+    }
+
+    private struct PendingPair: Decodable {
+        var requestId: String
+        var code: Int
+        var status: String
+    }
+
+    /// Polls `pending-pair.json` under `AGENTREMOTE_UI_STATE_DIR` for the record the bridge
+    /// writes on a successful `/v1/pair/reveal` (bridge/src/auth/pending-pair.ts). Fails the
+    /// test rather than timing out silently if the Watch never got that far.
+    private func waitForPendingPair() throws -> PendingPair {
+        let path = stateDir.appending(path: "pending-pair.json")
+        for _ in 0 ..< 30 {
+            if let data = try? Data(contentsOf: path),
+                let record = try? JSONDecoder().decode(PendingPair.self, from: data),
+                record.status == "pending" {
+                return record
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTFail("bridge never wrote a pending pairing request within 15s")
+        throw SessionTimeout()
+    }
+
+    /// Writes `decision: "approved"` into `pending-pair.json`, taking `pending-pair.json.lock`
+    /// with `O_EXCL` first, exactly as `bun run bridge pair`'s own `y` prompt does
+    /// (bridge/src/auth/pending-pair.ts: `setPendingPairDecision`) -- so this exercises the same
+    /// file-based protocol the operator CLI uses, not a shortcut around it.
+    private func approvePendingPair(requestId: String) throws {
+        let path = stateDir.appending(path: "pending-pair.json")
+        let lockPath = stateDir.appending(path: "pending-pair.json.lock")
+
+        var acquired = false
+        for _ in 0 ..< 40 {
+            let fd = open(lockPath.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+            if fd >= 0 {
+                let pid = "\(ProcessInfo.processInfo.processIdentifier)"
+                _ = pid.withCString { write(fd, $0, strlen($0)) }
+                close(fd)
+                acquired = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        guard acquired else {
+            XCTFail("could not acquire pending-pair.json.lock within 4s")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: lockPath) }
+
+        let data = try Data(contentsOf: path)
+        guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            object["requestId"] as? String == requestId else {
+            XCTFail("pending-pair.json requestId changed before the decision could be written")
+            return
+        }
+        object["decision"] = "approved"
+        let updated = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted])
+        let tempPath = path.appendingPathExtension("tmp")
+        try updated.write(to: tempPath)
+        _ = try FileManager.default.replaceItemAt(path, withItemAt: tempPath)
     }
 
     /// Matches Settings' "Device: Paired" row, on either path through pairIfNeeded().

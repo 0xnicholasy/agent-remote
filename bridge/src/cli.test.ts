@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DeviceRegistry, type DeviceRecord } from "./auth/devices";
-import { PairingCodeStore } from "./auth/pairing";
-import { runCli, type CliDeps, type CliHealth } from "./cli";
+import { readPairingWindow, readPendingPair, writePendingPair, type PendingPairRecord } from "./auth/pending-pair";
+import { healthCheckHost, runCli, type CliDeps, type CliHealth } from "./cli";
 import { projectIdFor } from "./projects";
 
 let stateDir: string;
@@ -42,6 +42,7 @@ function makeDeps(overrides: Partial<CliDeps> = {}): CliDeps & { stdoutLines: st
       clock.advanceMs(ms);
     },
     health: async (): Promise<CliHealth | null> => null,
+    prompt: async () => "n",
     env: {},
     cwd: "/Users/tester/code/demo",
     stdoutLines,
@@ -65,96 +66,255 @@ function sampleRecord(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
   };
 }
 
-describe("pair", () => {
-  test("prints a dashed pairing code, and host:port for every printed LAN address", async () => {
-    const deps = makeDeps({ env: { PORT: "8787" } });
-    const exitCode = await runCli(["pair", "--no-wait"], deps);
+function samplePendingPair(overrides: Partial<PendingPairRecord> = {}): PendingPairRecord {
+  return {
+    requestId: "par_0011223344556677",
+    deviceId: "dev_9f2c4a1b7d3e5061",
+    deviceName: "Ting's Apple Watch",
+    code: 487,
+    revealedAt: "2026-09-25T00:00:00.000Z",
+    expiresAt: "2026-09-25T00:02:00.000Z",
+    decision: null,
+    status: "pending",
+    ...overrides,
+  };
+}
 
-    expect(exitCode).toBe(0);
-    expect(deps.stdoutLines.some((line) => /^Pairing code: [0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4} \(expires /.test(line))).toBe(
-      true,
-    );
-    for (const line of deps.stdoutLines.filter((l) => l.startsWith("Enter in Watch Settings:"))) {
-      expect(line).toMatch(/^Enter in Watch Settings: [0-9.]+:8787$/);
-    }
+describe("pair", () => {
+  test("tells the operator to open the Watch app instead of printing a LAN address to enter", async () => {
+    const deps = makeDeps({ env: { PORT: "8787" } });
+    // No pending-pair.json ever appears, so the window simply expires; this test only checks
+    // what pair prints before it starts waiting. The Watch finds the Mac on its own now, so
+    // there is no address for the operator to type in anywhere.
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stdoutLines).toContain("Pairing open for 2 minutes. On your Watch, open Agent Remote and tap Next.");
+    expect(deps.stdoutLines.some((line) => line.startsWith("Enter in Watch Settings:"))).toBe(false);
   });
 
-  test("reports paired when a separate DeviceRegistry registers a device and pairing.json is removed", async () => {
-    const devicesFilePath = join(stateDir, "devices.json");
+  test("shows the code prominently and spells out the order, and pairs the device on 'y'", async () => {
+    let revealed = false;
     const deps = makeDeps({
+      prompt: async (question) => {
+        expect(question).toBe(
+          `Pair "Ting's Apple Watch" (dev_9f2c4a1b7d3e5061)? Only press y if your Watch is showing 487 and waiting. [y/N] `,
+        );
+        return "y";
+      },
       sleep: async () => {
-        // Stands in for the watch completing pairing out of band: a separate registry writes
-        // the device, and the pairing code is burned (pairing.json removed), same as verify().
-        const operatorRegistry = DeviceRegistry.load(devicesFilePath);
-        operatorRegistry.register(sampleRecord({ pairedAt: new Date().toISOString() }));
-        rmSync(join(stateDir, "pairing.json"), { force: true });
+        if (!revealed) {
+          revealed = true;
+          writeFileSync(join(stateDir, "pending-pair.json"), JSON.stringify(samplePendingPair()), { mode: 0o600 });
+          return;
+        }
+        // Stands in for the bridge registering the device once it observes our "approved"
+        // decision on the Watch's next /v1/pair/status poll.
+        const pending = readPendingPair(stateDir);
+        if (pending?.decision === "approved") {
+          DeviceRegistry.load(join(stateDir, "devices.json")).register(sampleRecord());
+        }
       },
     });
 
     const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(0);
+    // Either order (tap-then-confirm or confirm-then-tap) must work on the Watch side; this CLI
+    // just needs to spell out one order for the operator, not enforce it.
+    expect(deps.stdoutLines).toContain("Code on this Mac: 487");
+    expect(deps.stdoutLines).toContain("1. On your Watch, tap 487.");
+    expect(deps.stdoutLines).toContain("2. Then confirm here.");
     expect(deps.stdoutLines.some((line) => line.includes(sampleRecord().deviceId))).toBe(true);
   });
 
-  test("expires when the injected clock passes the 5-minute TTL with no device paired", async () => {
+  test("a paired device still exits 0 when the pairing window file cannot be removed", async () => {
+    const windowLockPath = join(stateDir, "pairing-window.json.lock");
+    let revealed = false;
+    const deps = makeDeps({
+      prompt: async () => "y",
+      sleep: async () => {
+        if (!revealed) {
+          revealed = true;
+          writeFileSync(join(stateDir, "pending-pair.json"), JSON.stringify(samplePendingPair()), { mode: 0o600 });
+          return;
+        }
+        if (readPendingPair(stateDir)?.decision === "approved") {
+          DeviceRegistry.load(join(stateDir, "devices.json")).register(sampleRecord());
+          // A live holder makes clearPairingWindow time out when the CLI closes the window.
+          writeFileSync(windowLockPath, String(process.pid), { mode: 0o600 });
+        }
+      },
+    });
+
+    try {
+      const exitCode = await runCli(["pair"], deps);
+
+      expect(exitCode).toBe(0);
+      expect(deps.stdoutLines.some((line) => line.startsWith("Paired device "))).toBe(true);
+      expect(deps.stderrLines).toHaveLength(1);
+    } finally {
+      rmSync(windowLockPath, { force: true });
+    }
+  }, 15000);
+
+  test("denies on anything other than 'y' and never waits for a device", async () => {
+    const deps = makeDeps({
+      prompt: async () => "n",
+      sleep: async () => {
+        writeFileSync(join(stateDir, "pending-pair.json"), JSON.stringify(samplePendingPair()), { mode: 0o600 });
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stdoutLines).toContain("Pairing denied.");
+    // The window closes with the CLI, so the Watch's next start is refused at once.
+    expect(readPairingWindow(stateDir)).toBeUndefined();
+    // The Watch never polled (sleep here only rewrites the record), so at the end the CLI clears
+    // the record itself -- a stale decided record would otherwise block the next `pair` attempt
+    // with 409 pairing_busy.
+    expect(readPendingPair(stateDir)).toBeUndefined();
+  });
+
+  test("leaves the denied record for the Watch's poll", async () => {
+    writePendingPair(stateDir, samplePendingPair(), 2000);
+    let sleeps = 0;
+    let decisionSeenBySleep: string | null | undefined;
+    const deps = makeDeps({
+      prompt: async () => "n",
+      sleep: async () => {
+        sleeps += 1;
+        if (sleeps === 2) {
+          // Stands in for the bridge delivering `denied` on the Watch's poll and clearing it.
+          decisionSeenBySleep = readPendingPair(stateDir)?.decision;
+          rmSync(join(stateDir, "pending-pair.json"), { force: true });
+        }
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(decisionSeenBySleep).toBe("denied");
+    expect(sleeps).toBe(2);
+  });
+
+  test("prints the device name without terminal escape characters", async () => {
+    writePendingPair(stateDir, samplePendingPair({ deviceName: "Evil\u001b[31m Watch" }), 2000);
+    let asked = "";
+    const deps = makeDeps({
+      prompt: async (question) => {
+        asked = question;
+        return "n";
+      },
+    });
+
+    await runCli(["pair"], deps);
+
+    expect(asked).toContain('Pair "Evil[31m Watch"');
+    expect(asked).not.toContain("\u001b");
+  });
+
+  test("a lock timeout while recording the decision exits 1 with a message instead of throwing", async () => {
+    writePendingPair(stateDir, samplePendingPair(), 2000);
+    const lockPath = join(stateDir, "pending-pair.json.lock");
+    const deps = makeDeps({
+      prompt: async () => {
+        writeFileSync(lockPath, String(process.pid), { mode: 0o600 });
+        return "y";
+      },
+    });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stderrLines.length).toBeGreaterThan(0);
+    rmSync(lockPath, { force: true });
+  }, 15000);
+
+  test("expires when the window passes with no device requesting to pair", async () => {
+    const baseline = process.listenerCount("SIGINT");
     const deps = makeDeps();
+    const inner = deps.sleep;
+    let listenersDuringPhase1: number | undefined;
+    deps.sleep = async (ms) => {
+      listenersDuringPhase1 ??= process.listenerCount("SIGINT");
+      await inner(ms);
+    };
     const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(1);
-    expect(deps.stderrLines).toContain("Pairing code expired before a device paired.");
+    expect(deps.stderrLines).toContain("Pairing window expired with no device requesting to pair.");
+    // The SIGINT handler is live during Phase 1, is removed on exit, and the window is closed.
+    expect(listenersDuringPhase1).toBe(baseline + 1);
+    expect(process.listenerCount("SIGINT")).toBe(baseline);
+    expect(readPairingWindow(stateDir)).toBeUndefined();
   });
 
-  test("stops waiting when a second pair run replaces pairing.json before a device pairs with our code", async () => {
-    const devicesFilePath = join(stateDir, "devices.json");
-    const pairingFilePath = join(stateDir, "pairing.json");
+  test("reports the request as gone when it disappears before the operator answers", async () => {
+    writePendingPair(stateDir, samplePendingPair(), 2000);
     const deps = makeDeps({
-      sleep: async () => {
-        // Stands in for a second `pair` run (or a bridge restart) minting its own code and
-        // overwriting pairing.json, then a device enrolling under that new code -- all while
-        // this invocation is still waiting on its own, now-superseded code.
-        const otherStore = new PairingCodeStore(pairingFilePath);
-        otherStore.mint(new Date("2026-09-25T00:00:05.000Z"));
-        const registry = DeviceRegistry.load(devicesFilePath);
-        registry.register(sampleRecord({ pairedAt: new Date("2026-09-25T00:00:06.000Z").toISOString() }));
+      prompt: async () => {
+        // The bridge (or the Watch's own cancel) removed pending-pair.json while we were
+        // "typing" the answer.
+        rmSync(join(stateDir, "pending-pair.json"), { force: true });
+        return "y";
       },
     });
 
     const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(1);
-    expect(deps.stderrLines).toContain(
-      "pairing code was replaced by another pair run or a bridge restart; re-run pair",
-    );
-    expect(deps.stdoutLines.some((line) => line.includes(sampleRecord().deviceId))).toBe(false);
+    expect(deps.stderrLines).toContain("Pairing request expired or was cancelled before it could be answered.");
+    expect(readPairingWindow(stateDir)).toBeUndefined();
   });
 
-  test("reports used up when the pairing code is burned without a device ever registering", async () => {
+  test("prints the waiting message on approval and times out at the request's own expiresAt, not a fixed 30s", async () => {
+    // expiresAt is 10s after the clock's start, well under the old fixed 30s -- this proves the
+    // deadline now comes from the pending request itself.
+    writePendingPair(stateDir, samplePendingPair({ expiresAt: "2026-09-25T00:00:10.000Z" }), 2000);
+    const deps = makeDeps({ prompt: async () => "y" });
+
+    const exitCode = await runCli(["pair"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(deps.stdoutLines).toContain("Approved. Waiting for the Watch -- tap 487 on your Watch if you haven't.");
+    expect(deps.stderrLines).toContain("The Watch did not finish pairing. Run this command again and tap the code on your Watch.");
+    // Approved but never claimed: the CLI clears its own decided record rather than leaving an
+    // "approved" pending-pair.json sitting past its expiry, which would block the next `pair`
+    // attempt with 409 pairing_busy.
+    expect(readPendingPair(stateDir)).toBeUndefined();
+  });
+
+  test("a corrupt pending-pair.json exits 1 while waiting", async () => {
+    const pendingPairPath = join(stateDir, "pending-pair.json");
     const deps = makeDeps({
       sleep: async () => {
-        rmSync(join(stateDir, "pairing.json"), { force: true });
+        writeFileSync(pendingPairPath, "{not valid json", { mode: 0o600 });
       },
     });
 
     const exitCode = await runCli(["pair"], deps);
 
     expect(exitCode).toBe(1);
-    expect(deps.stderrLines).toContain("Pairing code was used up before a device paired.");
+    expect(deps.stderrLines.some((line) => line.includes(pendingPairPath))).toBe(true);
+  });
+});
+
+describe("healthCheckHost", () => {
+  test("defaults to loopback when AGENTREMOTE_HOST is unset", () => {
+    expect(healthCheckHost({})).toBe("127.0.0.1");
   });
 
-  test("pairing.json becoming invalid JSON during the wait exits 1 instead of retrying or hanging", async () => {
-    const pairingFilePath = join(stateDir, "pairing.json");
-    const deps = makeDeps({
-      sleep: async () => {
-        writeFileSync(pairingFilePath, "{not valid json", { mode: 0o600 });
-      },
-    });
+  test("uses AGENTREMOTE_HOST when it names a real address", () => {
+    expect(healthCheckHost({ AGENTREMOTE_HOST: "192.168.0.2" })).toBe("192.168.0.2");
+  });
 
-    const exitCode = await runCli(["pair"], deps);
-
-    expect(exitCode).toBe(1);
-    expect(deps.stderrLines.some((line) => line.includes(pairingFilePath))).toBe(true);
-    expect(deps.stdoutLines.some((line) => line.startsWith("Paired device"))).toBe(false);
+  test("falls back to loopback for the every-interface addresses", () => {
+    expect(healthCheckHost({ AGENTREMOTE_HOST: "0.0.0.0" })).toBe("127.0.0.1");
+    expect(healthCheckHost({ AGENTREMOTE_HOST: "::" })).toBe("127.0.0.1");
   });
 });
 
@@ -469,10 +629,11 @@ describe("corrupt state", () => {
     expect(deps.stderrLines.some((line) => line.includes(devicesFilePath) && line.includes("not valid JSON"))).toBe(true);
   });
 
-  test("pair: a corrupt devices.json exits 1 while waiting", async () => {
+  test("pair: a corrupt devices.json exits 1 while waiting for the approved device to appear", async () => {
     const devicesFilePath = join(stateDir, "devices.json");
+    writeFileSync(join(stateDir, "pending-pair.json"), JSON.stringify(samplePendingPair()), { mode: 0o600 });
     writeFileSync(devicesFilePath, "{not valid json", { mode: 0o600 });
-    const deps = makeDeps();
+    const deps = makeDeps({ prompt: async () => "y" });
 
     const exitCode = await runCli(["pair"], deps);
 

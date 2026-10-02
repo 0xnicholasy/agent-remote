@@ -17,9 +17,38 @@ actor FakeBridgeClient: BridgeClientProtocol {
     }
 
     private var sendResult: SendResult = .success(CommandResponse())
-    /// Controls what `pair(code:deviceName:)` does; defaults to succeeding silently like the
-    /// existing no-op did, so tests that never touch pairing are unaffected.
-    private var pairResult: Result<Void, any Error & Sendable> = .success(())
+    private var infoResult: Result<BridgeInfo, any Error & Sendable> = .success(BridgeInfo(
+        provider: "mock",
+        capabilities: AgentCapabilities(approvals: true, questions: true, resumeSession: false, streaming: true, usage: true)
+    ))
+    private var projectsResult: Result<[Project], any Error & Sendable> = .success([
+        Project(id: "prj_demo", name: "demo", path: "/tmp/demo")
+    ])
+    private(set) var infoCallCount = 0
+    private(set) var projectsCallCount = 0
+    private var infoGateAtCall: Int?
+    private var infoGateContinuation: CheckedContinuation<Void, Never>?
+    /// Controls what `beginPairing(deviceName:)` returns; defaults to a fixed handshake so tests
+    /// that never touch pairing v2 are unaffected.
+    private var beginPairingResult: Result<PairingHandshake, any Error & Sendable> =
+        .success(PairingHandshake(requestId: "par_test", code: 123))
+    private(set) var beginPairingCallCount = 0
+    /// When armed, the next `beginPairing(deviceName:)` call suspends until
+    /// `openBeginPairingGate()` runs, so a test can simulate `cancelPairing()` running while a
+    /// stale `beginPairing()` is still in flight on the network.
+    private var beginPairingGateArmed = false
+    private var beginPairingGateContinuation: CheckedContinuation<Void, Never>?
+    /// One result per `pollPairing(requestId:)` call, in order; the last one repeats once the
+    /// list is exhausted. Defaults to `[.pending]` so an untouched test's poll loop just spins
+    /// (and is cancelled by cancelPairing()/pairGeneration rather than ever resolving).
+    private var pollPairingResults: [Result<PairingPollResult, any Error & Sendable>] = [.success(.pending)]
+    private(set) var pollPairingCallCount = 0
+    private(set) var pollPairingRequestIds: [String] = []
+    private(set) var cancelPairingCallCount = 0
+    private(set) var cancelPairingRequestIds: [String] = []
+    private(set) var cancelPairingCallerWasCancelled: [Bool] = []
+    private var cancelPairingBlocks = false
+    private var cancelPairingContinuation: CheckedContinuation<Void, Never>?
     /// Backs `pairingLookup()`; defaults to `.paired` to preserve the previous hardcoded
     /// behavior for every test that does not care about pairing state.
     private var pairedFlag = true
@@ -67,27 +96,35 @@ actor FakeBridgeClient: BridgeClientProtocol {
     private var sendGateContinuation: CheckedContinuation<Void, Never>?
     private var sendCallCount = 0
 
-    /// What `projects()` returns. Defaults to the mock bridge's single project, so tests that
-    /// never touch projects still get a session.create target.
-    private var projectsResult: Result<ProjectsResponse, any Error & Sendable> = .success(
-        ProjectsResponse(projects: [Project(id: "prj_demo", name: "demo", path: "/tmp/demo")], provider: "mock")
-    )
-
     func setSendResult(_ result: SendResult) {
         sendResult = result
     }
 
-    func setProjectsResult(_ result: Result<ProjectsResponse, any Error & Sendable>) {
+    func setInfoResult(_ result: Result<BridgeInfo, any Error & Sendable>) {
+        infoResult = result
+    }
+
+    func setProjectsResult(_ result: Result<[Project], any Error & Sendable>) {
         projectsResult = result
     }
 
-    func projects() async throws -> ProjectsResponse {
-        try projectsResult.get()
+    func gateInfoCall(_ callNumber: Int) {
+        infoGateAtCall = callNumber
     }
 
-    /// Arms the next `pair(code:deviceName:)` call to throw `error` instead of succeeding.
-    func setPairResult(_ result: Result<Void, any Error & Sendable>) {
-        pairResult = result
+    func openInfoGate() {
+        infoGateContinuation?.resume()
+        infoGateContinuation = nil
+    }
+
+    /// Arms the next `beginPairing(deviceName:)` call to return `result`.
+    func setBeginPairingResult(_ result: Result<PairingHandshake, any Error & Sendable>) {
+        beginPairingResult = result
+    }
+
+    /// Arms the `pollPairing(requestId:)` results, one per call, the last repeating.
+    func setPollPairingResults(_ results: [Result<PairingPollResult, any Error & Sendable>]) {
+        pollPairingResults = results
     }
 
     /// Sets what `pairingLookup()` reports, so a test can simulate "the credential store never
@@ -160,9 +197,62 @@ actor FakeBridgeClient: BridgeClientProtocol {
         sendGateContinuation = nil
     }
 
-    func setBaseURL(_ url: URL) async {}
-    func pair(code: String, deviceName: String) async throws {
-        try pairResult.get()
+    private(set) var baseURLs: [URL] = []
+    func setBaseURL(_ url: URL) async { baseURLs.append(url) }
+
+    func beginPairing(deviceName: String) async throws -> PairingHandshake {
+        beginPairingCallCount += 1
+        if beginPairingGateArmed {
+            beginPairingGateArmed = false
+            await withCheckedContinuation { continuation in
+                beginPairingGateContinuation = continuation
+            }
+        }
+        return try beginPairingResult.get()
+    }
+
+    /// Arms the next `beginPairing(deviceName:)` call to block until `openBeginPairingGate()`.
+    func gateBeginPairingCall() {
+        beginPairingGateArmed = true
+    }
+
+    func openBeginPairingGate() {
+        beginPairingGateContinuation?.resume()
+        beginPairingGateContinuation = nil
+    }
+
+    func pollPairing(requestId: String) async throws -> PairingPollResult {
+        pollPairingCallCount += 1
+        pollPairingRequestIds.append(requestId)
+        let result = pollPairingResults.count > 1 ? pollPairingResults.removeFirst() : pollPairingResults[0]
+        switch result {
+        case .success(let value):
+            if value == .approved { pairedFlag = true }
+            return value
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    func cancelPairing(requestId: String) async throws {
+        cancelPairingCallCount += 1
+        cancelPairingRequestIds.append(requestId)
+        cancelPairingCallerWasCancelled.append(Task.isCancelled)
+        if cancelPairingBlocks {
+            await withCheckedContinuation { cancelPairingContinuation = $0 }
+        }
+    }
+
+    /// Makes `cancelPairing(requestId:)` suspend (an unreachable host) until
+    /// `releaseBlockedCancelPairing()` runs.
+    func blockCancelPairing() {
+        cancelPairingBlocks = true
+    }
+
+    func releaseBlockedCancelPairing() {
+        cancelPairingBlocks = false
+        cancelPairingContinuation?.resume()
+        cancelPairingContinuation = nil
     }
 
     /// Arms the next `clearCredential()` call to block until `openClearCredentialGate()` runs.
@@ -244,6 +334,23 @@ actor FakeBridgeClient: BridgeClientProtocol {
         }
     }
 
+    func info() async throws -> BridgeInfo {
+        infoCallCount += 1
+        let call = infoCallCount
+        let result = infoResult
+        if infoGateAtCall == call {
+            await withCheckedContinuation { continuation in
+                infoGateContinuation = continuation
+            }
+        }
+        return try result.get()
+    }
+
+    func projects() async throws -> [Project] {
+        projectsCallCount += 1
+        return try projectsResult.get()
+    }
+
     func send(_ payload: CommandPayload, sessionId: String, commandId: String, timestamp: String) async throws -> CommandResponse {
         sentCalls.append(RecordedSend(payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp))
         sendCallCount += 1
@@ -283,6 +390,120 @@ final class SessionStoreDecisionTests: XCTestCase {
 
     private func decodeEvent(_ json: String) throws -> AgentEvent {
         try decoder.decode(AgentEvent.self, from: Data(json.utf8))
+    }
+
+    func testCodexMetadataCreatesSessionForDiscoveredProviderAndProject() async throws {
+        let client = FakeBridgeClient()
+        await client.setInfoResult(.success(BridgeInfo(
+            provider: "codex",
+            capabilities: AgentCapabilities(approvals: true, questions: true, resumeSession: true, streaming: true, usage: true)
+        )))
+        await client.setProjectsResult(.success([
+            Project(id: "prj_codex", name: "Codex Project", path: "/tmp/codex")
+        ]))
+        await client.setSendResult(.success(CommandResponse(accepted: true, sessionId: "ses_codex")))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let created = await store.createSession()
+
+        XCTAssertEqual(created, "ses_codex")
+        XCTAssertEqual(store.bridgeInfo?.provider, "codex")
+        XCTAssertEqual(store.selectedProjectId, "prj_codex")
+        let calls = await client.sentCalls
+        guard case .sessionCreate(let payload) = calls.first?.payload else {
+            return XCTFail("expected session.create")
+        }
+        XCTAssertEqual(payload.provider, "codex")
+        XCTAssertEqual(payload.projectId, "prj_codex")
+    }
+
+    func testMultipleProjectsRequireExplicitSelection() async throws {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.success([
+            Project(id: "prj_one", name: "One", path: "/tmp/one"),
+            Project(id: "prj_two", name: "Two", path: "/tmp/two"),
+        ]))
+        await client.setSendResult(.success(CommandResponse(accepted: true, sessionId: "ses_two")))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let firstAttempt = await store.createSession()
+        XCTAssertNil(firstAttempt)
+        XCTAssertNil(store.selectedProjectId)
+        let callsBeforeSelection = await client.sentCalls
+        XCTAssertTrue(callsBeforeSelection.isEmpty)
+
+        store.selectProject("prj_two")
+        let secondAttempt = await store.createSession()
+        XCTAssertEqual(secondAttempt, "ses_two")
+        let calls = await client.sentCalls
+        guard case .sessionCreate(let payload) = calls.first?.payload else {
+            return XCTFail("expected session.create")
+        }
+        XCTAssertEqual(payload.projectId, "prj_two")
+    }
+
+    func testNoAuthorizedProjectsBlocksSessionCreation() async {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.success([]))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let attempt = await store.createSession()
+        XCTAssertNil(attempt)
+        XCTAssertEqual(store.statusLine, "No authorized project is available")
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testConfigurationErrorBlocksSessionCreationWithItsOwnMessage() async {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.failure(URLError(.notConnectedToInternet)))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let attempt = await store.createSession()
+        XCTAssertNil(attempt)
+        XCTAssertEqual(store.statusLine, "Could not load provider and projects")
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testMetadataFailureDoesNotFallBackToMock() async {
+        let client = FakeBridgeClient()
+        await client.setInfoResult(.failure(BridgeError.http(status: 503, message: "unavailable")))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let attempt = await store.createSession()
+        XCTAssertNil(attempt)
+        XCTAssertNil(store.bridgeInfo)
+        XCTAssertNil(store.selectedProjectId)
+        XCTAssertEqual(store.configurationError, "Could not load provider and projects")
+        let calls = await client.sentCalls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testLateMetadataCannotOverwriteNewerRefresh() async throws {
+        let client = FakeBridgeClient()
+        await client.setInfoResult(.success(BridgeInfo(
+            provider: "mock",
+            capabilities: AgentCapabilities(approvals: true, questions: true, resumeSession: false, streaming: true, usage: true)
+        )))
+        await client.gateInfoCall(1)
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        let stale = Task { await store.refreshBridgeConfiguration() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        await client.setInfoResult(.success(BridgeInfo(
+            provider: "codex",
+            capabilities: AgentCapabilities(approvals: true, questions: true, resumeSession: true, streaming: true, usage: true)
+        )))
+        await client.setProjectsResult(.success([
+            Project(id: "prj_new", name: "New", path: "/tmp/new")
+        ]))
+        await store.refreshBridgeConfiguration()
+        await client.openInfoGate()
+        await stale.value
+
+        XCTAssertEqual(store.bridgeInfo?.provider, "codex")
+        XCTAssertEqual(store.selectedProjectId, "prj_new")
     }
 
     /// Builds a store already bound to "sess_1" with a pending approval card, backed by a
@@ -2400,83 +2621,41 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
     /// reconnect() moved on to a new generation while the send was in flight), the stale id it
     /// carries must not be returned to sendPrompt() as a valid target.
-    private static let twoClaudeProjects = ProjectsResponse(
-        projects: [
-            Project(id: "prj_a_11111111", name: "a", path: "/repos/a"),
-            Project(id: "prj_b_22222222", name: "b", path: "/repos/b"),
-        ],
-        provider: "claude"
-    )
+    private static let twoProjects = [
+        Project(id: "prj_a_11111111", name: "a", path: "/repos/a"),
+        Project(id: "prj_b_22222222", name: "b", path: "/repos/b"),
+    ]
 
-    private func sentSessionCreate(_ client: FakeBridgeClient) async -> SessionCreatePayload? {
-        for call in await client.sentCalls {
-            if case .sessionCreate(let payload) = call.payload { return payload }
-        }
-        return nil
-    }
-
-    /// The single project a bridge lists is picked automatically, and session.create carries the
-    /// bridge's own provider id instead of a hard-coded "mock" the claude bridge refuses.
-    func testCreateSessionUsesTheOnlyProjectAndTheBridgeProvider() async throws {
+    /// The chosen project is persisted, so a relaunch keeps starting sessions in it; a persisted
+    /// choice the bridge no longer lists (revoked, or another bridge) is dropped on load instead
+    /// of being sent and refused.
+    func testProjectChoicePersistsAndIsDroppedWhenNoLongerListed() async throws {
         let client = FakeBridgeClient()
-        await client.setProjectsResult(.success(ProjectsResponse(
-            projects: [Project(id: "prj_a_11111111", name: "a", path: "/repos/a")],
-            provider: "claude"
-        )))
-        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
-        let store = SessionStore(client: client, defaults: freshDefaults())
-
-        let created = await store.createSession()
-
-        XCTAssertEqual(created, "sess_created")
-        XCTAssertEqual(store.selectedProjectId, "prj_a_11111111")
-        let payload = await sentSessionCreate(client)
-        XCTAssertEqual(payload?.projectId, "prj_a_11111111")
-        XCTAssertEqual(payload?.provider, "claude")
-    }
-
-    /// With several projects and none chosen, nothing is sent until the user picks one; the
-    /// session then starts in the picked project.
-    func testCreateSessionWaitsForAProjectChoiceWhenSeveralAreListed() async throws {
-        let client = FakeBridgeClient()
-        await client.setProjectsResult(.success(Self.twoClaudeProjects))
-        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
-        let store = SessionStore(client: client, defaults: freshDefaults())
-
-        let refused = await store.createSession()
-
-        XCTAssertNil(refused)
-        XCTAssertEqual(store.statusLine, "Pick a project in Settings")
-        XCTAssertTrue(store.needsProjectChoice)
-        let sentBeforeChoice = await client.sentCalls
-        XCTAssertTrue(sentBeforeChoice.isEmpty)
-
-        store.selectedProjectId = "prj_b_22222222"
-        XCTAssertFalse(store.needsProjectChoice)
-        let created = await store.createSession()
-
-        XCTAssertEqual(created, "sess_created")
-        let payload = await sentSessionCreate(client)
-        XCTAssertEqual(payload?.projectId, "prj_b_22222222")
-    }
-
-    /// A persisted choice the bridge no longer lists (revoked, or another bridge) is dropped on
-    /// load instead of being sent and refused.
-    func testLoadProjectsDropsASelectionTheBridgeNoLongerLists() async throws {
-        let client = FakeBridgeClient()
-        await client.setProjectsResult(.success(Self.twoClaudeProjects))
+        await client.setProjectsResult(.success(Self.twoProjects))
         let defaults = freshDefaults()
-        defaults.set("prj_gone_33333333", forKey: "dev.agentremote.watch.projectId")
-        let store = SessionStore(client: client, defaults: defaults)
-        XCTAssertEqual(store.selectedProjectId, "prj_gone_33333333")
+        let first = SessionStore(client: client, defaults: defaults)
+        await first.loadProjects()
+        XCTAssertTrue(first.needsProjectChoice)
+        first.selectProject("prj_b_22222222")
+        XCTAssertFalse(first.needsProjectChoice)
 
-        let loaded = await store.loadProjects()
-
+        let relaunched = SessionStore(client: client, defaults: defaults)
+        XCTAssertEqual(relaunched.selectedProjectId, "prj_b_22222222")
+        let loaded = await relaunched.loadProjects()
         XCTAssertTrue(loaded)
-        XCTAssertNil(store.selectedProjectId)
-        XCTAssertEqual(store.projects.map(\.id), ["prj_a_11111111", "prj_b_22222222"])
+        XCTAssertEqual(relaunched.selectedProjectId, "prj_b_22222222")
+
+        defaults.set("prj_gone_33333333", forKey: "dev.agentremote.watch.projectId")
+        let revoked = SessionStore(client: client, defaults: defaults)
+        XCTAssertEqual(revoked.selectedProjectId, "prj_gone_33333333")
+        await revoked.loadProjects()
+        XCTAssertNil(revoked.selectedProjectId)
+        XCTAssertEqual(revoked.projects.map(\.id), ["prj_a_11111111", "prj_b_22222222"])
     }
 
+    /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
+    /// reconnect() moved on to a new generation while the send was in flight), the stale id it
+    /// carries must not be returned to sendPrompt() as a valid target.
     func testCreateSessionReturnsNilWhenRebindRejected() async throws {
         let client = FakeBridgeClient()
         let defaults = freshDefaults()
@@ -2700,66 +2879,469 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertNotNil(store.sessions["sess_created"], "the created session must still be inserted")
     }
 
-    /// Regression for R-010: `pairingError` was never asserted because the fake client never
-    /// threw. A failing pair() must surface the error on the store and must not flip `paired`
-    /// to true just because the call was attempted.
-    func testPairFailureSetsPairingErrorAndLeavesUnpaired() async throws {
+    /// A successful handshake moves .starting -> .choosing (four distinct options, the correct
+    /// code among them) -> picking the correct one -> .waitingForMac -> polling until approved,
+    /// and paired/everPaired flip true exactly like the old pair() success path did.
+    func testCorrectPickReachesApprovedAndPaired() async throws {
         let client = FakeBridgeClient()
         let defaults = freshDefaults()
         let store = SessionStore(client: client, defaults: defaults)
-        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
-        // The real client only reports paired == true once a credential is actually stored;
-        // simulate that a failed pair leaves the credential store empty.
-        await client.setPaired(false)
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_1", code: 314)))
+        await client.setPollPairingResults([.success(.pending), .success(.approved)])
+        // Once approved, the real client's credential is stored, so the background
+        // refreshPairedState() that pair success triggers via start() must also see it.
+        await client.setPaired(true)
 
-        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
+        await store.beginPairing()
+        guard case .choosing(let options, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        XCTAssertEqual(correct, 314)
+        XCTAssertEqual(Set(options).count, 4, "the four options must be distinct")
+        XCTAssertTrue(options.contains(314), "the correct code must be among the options")
 
-        XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
-        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
+        await store.pick(correct)
+        XCTAssertEqual(store.pairingPhase, .waitingForMac(code: correct))
+
+        for _ in 0 ..< 200 {
+            if store.pairingPhase == .approved { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .approved)
+        XCTAssertTrue(store.paired, "an approved pairing must report paired")
+        XCTAssertTrue(store.everPaired)
     }
 
-    /// Regression for C3-004: when pair() throws AND the follow-up pairing lookup is
-    /// .checkFailed, applyPairedLookup() already set pairingError to the keychain-failure
-    /// message; the pair() exception message must not overwrite it.
-    func testPairFailureWithCheckFailedLookupKeepsKeychainErrorMessage() async throws {
+    /// A transient network error during status polling (a dimmed screen, a brief Wi-Fi drop)
+    /// must not strand the Watch on a silent failure: the loop retries once, 1 s later, and a
+    /// pairing that then succeeds completes exactly as if the error had never happened.
+    func testPollingRetriesAfterOneTransientErrorThenSucceeds() async throws {
         let client = FakeBridgeClient()
         let defaults = freshDefaults()
         let store = SessionStore(client: client, defaults: defaults)
-        await client.setPaired(false)
-        await client.setPairingCheckFailed(true)
-        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
-
-        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
-
-        XCTAssertTrue(store.pairingCheckFailed, "a checkFailed lookup after a failed pair() must set pairingCheckFailed")
-        XCTAssertEqual(store.pairingError, "simulated keychain read failure", "the lookup's own message must win over the pair() exception message")
-        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
-        XCTAssertTrue(store.pairingChecked)
-    }
-
-    /// Regression for R-029: a terminal auth failure stops the poll loop, but a subsequent
-    /// successful pair() must resume polling on its own -- without this, the loop stays dead
-    /// until the app relaunches or the user changes host in Settings.
-    func testSuccessfulRePairResumesPollingAfterTerminalAuthFailure() async throws {
-        let client = FakeBridgeClient()
-        let defaults = freshDefaults()
-        let store = SessionStore(client: client, defaults: defaults)
-        // Call 1 is a terminal auth failure that stops the loop; every call after (once
-        // re-paired) sees a clean, empty page.
-        await client.setEventsResults([
-            .failure(BridgeError.deviceRevoked),
-            .success(EventsPage(events: [], lastEventId: 0, skipped: 0)),
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_retry", code: 271)))
+        await client.setPollPairingResults([
+            .failure(URLError(.networkConnectionLost)),
+            .success(.approved),
         ])
+        await client.setPaired(true)
 
-        store.start()
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+
+        for _ in 0 ..< 600 {
+            if store.pairingPhase == .approved { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(store.pairingPhase, .approved, "one transient error must be retried, not treated as final")
+        XCTAssertTrue(store.paired)
+        let pollCount = await client.pollPairingCallCount
+        XCTAssertEqual(pollCount, 2, "the failed attempt and the retry that succeeded")
+    }
+
+    /// Picking a decoy cancels the handshake instead of ever polling status.
+    func testDecoyPickCancelsAndNeverPolls() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_2", code: 500)))
+
+        await store.beginPairing()
+        guard case .choosing(let options, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        let decoy = options.first { $0 != correct }!
+
+        await store.pick(decoy)
+
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+        XCTAssertFalse(store.paired)
+        let pollCount = await client.pollPairingCallCount
+        XCTAssertEqual(pollCount, 0, "a wrong pick must never poll status")
+        let cancelCount = await client.cancelPairingCallCount
+        XCTAssertEqual(cancelCount, 1, "a wrong pick must cancel the pairing request")
+    }
+
+    /// "None match" cancels the same way a wrong pick does.
+    func testCancelPairingMovesToCancelled() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_3", code: 500)))
+
+        await store.beginPairing()
+        await store.cancelPairing()
+
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+        let cancelCount = await client.cancelPairingCallCount
+        XCTAssertEqual(cancelCount, 1)
+    }
+
+    /// The matchCode back button cancels the live handshake; the next beginPairing() starts a
+    /// fresh one with a new requestId.
+    func testCancelThenBeginPairingStartsAFreshHandshake() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_first", code: 111)))
+        await store.beginPairing()
+        guard case .choosing = store.pairingPhase else {
+            return XCTFail("expected .choosing after the first beginPairing()")
+        }
+
+        await store.cancelPairing()
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_second", code: 222)))
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after restarting")
+        }
+        XCTAssertEqual(correct, 222)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_first"])
+    }
+
+    /// A `beginPairing()` whose network call is still in flight must not overwrite a
+    /// `cancelPairing()` that ran while it was suspended (pairGeneration guard). Without the
+    /// `generation == pairGeneration` check in `beginPairing()`, the stale call would land after
+    /// cancelPairing() and flip `.cancelled` back to `.choosing`.
+    func testStaleBeginPairingDoesNotOverwriteConcurrentCancel() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_stale", code: 456)))
+        await client.gateBeginPairingCall()
+
+        let beginTask = Task { await store.beginPairing() }
+        for _ in 0 ..< 200 {
+            let count = await client.beginPairingCallCount
+            if count == 1 { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        await store.cancelPairing()
+        XCTAssertEqual(store.pairingPhase, .cancelled, "cancelPairing() must apply immediately")
+
+        await client.openBeginPairingGate()
+        await beginTask.value
+
+        XCTAssertEqual(
+            store.pairingPhase, .cancelled,
+            "a beginPairing() started before cancelPairing() must not overwrite it once its network call resolves"
+        )
+        XCTAssertFalse(store.paired)
+    }
+
+    /// Root cause of the "Starting pairing..." hang observed on device: `reconnect()` (called by
+    /// onboarding's "Next" right before it navigates to `PairingView`) fires `refreshPairedState()`
+    /// as an un-awaited `Task` via `start()`. If that paired-state refresh shared its generation
+    /// counter with the pairing handshake, a refresh that ran to completion *while* a
+    /// `beginPairing()` network call was still in flight would bump the shared counter and make
+    /// `beginPairing()`'s own success guard see a stale generation -- dropping a handshake the
+    /// bridge had already completed and leaving `pairingPhase` stuck on `.starting` forever, with
+    /// no error and nothing left to move it. `pairedStateGeneration`/`pairingGeneration` must be
+    /// independent counters so this cannot happen.
+    func testConcurrentRefreshPairedStateDoesNotStrandBeginPairingOnStarting() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_race", code: 789)))
+        await client.gateBeginPairingCall()
+
+        let beginTask = Task { await store.beginPairing() }
+        for _ in 0 ..< 200 {
+            let count = await client.beginPairingCallCount
+            if count == 1 { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .starting, "beginPairing() must set .starting before its network call")
+
+        // A paired-state refresh -- e.g. the one `reconnect()` fires via `start()` right before
+        // onboarding navigates to PairingView -- runs to completion while the handshake above is
+        // still gated in flight.
+        await store.refreshPairedState()
+        XCTAssertTrue(store.pairingChecked, "the concurrent refresh must still complete normally")
+        XCTAssertEqual(
+            store.pairingPhase, .starting,
+            "an unrelated refreshPairedState() must not itself change the in-flight handshake's phase"
+        )
+
+        await client.openBeginPairingGate()
+        await beginTask.value
+
+        guard case .choosing(let options, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing once the gated handshake resolves, got \(store.pairingPhase)")
+        }
+        XCTAssertEqual(correct, 789)
+        XCTAssertTrue(options.contains(789))
+    }
+
+    /// A poll that reports `.denied` maps to `.denied`, and stops polling.
+    func testPollDeniedMapsToDeniedPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_4", code: 777)))
+        await client.setPollPairingResults([.success(.denied)])
+
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+
+        for _ in 0 ..< 200 {
+            if store.pairingPhase == .denied { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .denied)
+        XCTAssertFalse(store.paired)
+    }
+
+    /// A poll that reports `.expired` maps to `.expired`.
+    func testPollExpiredMapsToExpiredPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_5", code: 222)))
+        await client.setPollPairingResults([.success(.expired)])
+
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+
+        for _ in 0 ..< 200 {
+            if store.pairingPhase == .expired { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .expired)
+        XCTAssertFalse(store.paired)
+    }
+
+    /// A `beginPairing()` failure (e.g. pairing_closed) surfaces on `pairingPhase` as `.failed`
+    /// with a readable message, and must not report paired.
+    func testBeginPairingFailureSetsFailedPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.failure(BridgeError.pairingClosed))
+
+        await store.beginPairing()
+
+        guard case .failed(let message) = store.pairingPhase else {
+            return XCTFail("expected .failed after a beginPairing() failure, got \(store.pairingPhase)")
+        }
+        XCTAssertEqual(message, "\(BridgeError.pairingClosed)")
+        XCTAssertFalse(store.paired)
+    }
+
+    /// Only phases that ended the handshake (or never started one) may start a new one.
+    func testPairingPhaseCanRestart() {
+        XCTAssertTrue(SessionStore.PairingPhase.connectionFailure(host: "x").canRestart)
+        XCTAssertTrue(SessionStore.PairingPhase.failed("x").canRestart)
+        XCTAssertFalse(SessionStore.PairingPhase.waitingForMac(code: 123).canRestart)
+        XCTAssertFalse(SessionStore.PairingPhase.starting.canRestart)
+        XCTAssertFalse(SessionStore.PairingPhase.approved.canRestart)
+    }
+
+    /// "Start again" after a connection failure runs a fresh handshake.
+    func testBeginPairingAfterConnectionFailureReachesChoosing() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.failure(URLError(.cannotConnectToHost)))
+        await store.beginPairing()
+        guard case .connectionFailure = store.pairingPhase else {
+            return XCTFail("expected .connectionFailure, got \(store.pairingPhase)")
+        }
+
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_retry", code: 321)))
+        await store.beginPairing()
+        guard case .choosing = store.pairingPhase else {
+            return XCTFail("expected .choosing after restart, got \(store.pairingPhase)")
+        }
+    }
+
+    /// A non-transport poll error (e.g. a decoding failure) must fail once, not retry for 60 s.
+    func testPollDecodingErrorFailsWithoutRetrying() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_dec", code: 555)))
+        let decodingError = DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "bad"))
+        await client.setPollPairingResults([.failure(decodingError)])
+
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+
+        for _ in 0 ..< 200 {
+            if case .failed = store.pairingPhase { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .failed = store.pairingPhase else {
+            return XCTFail("expected .failed, got \(store.pairingPhase)")
+        }
+        let calls = await client.pollPairingCallCount
+        XCTAssertEqual(calls, 1)
+    }
+
+    /// The retry cap is elapsed time from the first consecutive failure, not an iteration count.
+    func testPollTransportErrorsGiveUpAfterTheRetryCap() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setPollPairingResults([.failure(URLError(.timedOut))])
+        store.pairingPollRetryCap = .milliseconds(500)
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_cap", code: 333)))
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+        let start = ContinuousClock.now
+
+        for _ in 0 ..< 600 {
+            if case .connectionFailure = store.pairingPhase { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let elapsed = ContinuousClock.now - start
+        guard case .connectionFailure = store.pairingPhase else {
+            return XCTFail("expected .connectionFailure, got \(store.pairingPhase)")
+        }
+        let calls = await client.pollPairingCallCount
+        XCTAssertEqual(calls, 2)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(500))
+    }
+
+    func testResumePairingPollingRestartsAnEndedLoop() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setPollPairingResults([.success(.pending)])
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_resume", code: 333)))
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+        store.pairingPollTask?.cancel()
         try await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(store.statusKind, .authFailed, "setup should leave the loop stopped on a terminal auth failure")
+        await client.setPollPairingResults([.success(.approved)])
+        await client.setPaired(true)
+        store.resumePairingPollingIfNeeded()
 
-        await store.pair(code: "AAAAAAAAAAAA", deviceName: "Test Watch")
-        try await Task.sleep(for: .milliseconds(50))
+        for _ in 0 ..< 400 {
+            if store.pairingPhase == .approved { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .approved)
+        XCTAssertTrue(store.paired)
+    }
 
-        XCTAssertEqual(store.statusKind, .connected, "a successful re-pair must resume polling without a relaunch or host change")
+    func testResumePairingPollingIsANoOpWhileTheLoopRuns() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setPollPairingResults([.success(.pending)])
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_noop", code: 333)))
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else {
+            return XCTFail("expected .choosing after a successful beginPairing()")
+        }
+        await store.pick(correct)
+        let before = await client.pollPairingCallCount
+        let phaseBefore = store.pairingPhase
+
+        store.resumePairingPollingIfNeeded()
+        store.resumePairingPollingIfNeeded()
+        store.resumePairingPollingIfNeeded()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let after = await client.pollPairingCallCount
+        XCTAssertLessThanOrEqual(after - before, 1)
+        XCTAssertEqual(store.pairingPhase, phaseBefore)
+    }
+
+    func testResumePairingPollingIgnoresOtherPhases() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_other", code: 444)))
+        await store.beginPairing()
+        let phase = store.pairingPhase
+
+        store.resumePairingPollingIfNeeded()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let calls = await client.pollPairingCallCount
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(store.pairingPhase, phase)
+    }
+
+    func testClassifyPairingFailureSeparatesTransportFromOther() {
+        let decoding = DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "bad"))
+        guard case .failed = SessionStore.classifyPairingFailure(decoding, host: "h") else {
+            return XCTFail("DecodingError must classify as .failed")
+        }
+        XCTAssertEqual(
+            SessionStore.classifyPairingFailure(URLError(.timedOut), host: "h"),
+            .connectionFailure(host: "h")
+        )
+    }
+
+    /// A handshake that resolves after cancelPairing() ran must be cancelled on the bridge,
+    /// since cancelPairing() had no requestId to send.
+    func testStaleBeginPairingCancelsItsHandshake() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_orphan", code: 456)))
+        await client.gateBeginPairingCall()
+
+        let beginTask = Task { await store.beginPairing() }
+        for _ in 0 ..< 200 {
+            let count = await client.beginPairingCallCount
+            if count == 1 { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await store.cancelPairing()
+        await client.openBeginPairingGate()
+        await beginTask.value
+
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertTrue(ids.contains("par_orphan"))
+    }
+
+    /// Back cancels the view's .task while beginPairing() is still awaiting the handshake; the
+    /// compensating cancel must still be sent, from a task that is not itself cancelled.
+    func testBackDuringStartingStillFreesTheSlot() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_back", code: 222)))
+        await client.gateBeginPairingCall()
+
+        let viewTask = Task { await store.beginPairing() }
+        for _ in 0 ..< 200 {
+            let count = await client.beginPairingCallCount
+            if count == 1 { break }
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        viewTask.cancel()
+        await store.cancelPairing()
+        await client.openBeginPairingGate()
+        await viewTask.value
+
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_back"])
+        let cancelled = await client.cancelPairingCallerWasCancelled
+        XCTAssertEqual(cancelled, [false])
     }
 
     /// RootView holds a plain ProgressView until `pairingChecked`, so a store that never
@@ -2775,21 +3357,6 @@ final class SessionStoreDecisionTests: XCTestCase {
 
         XCTAssertTrue(store.pairingChecked, "pairingChecked must be true once refreshPairedState() resolves")
         XCTAssertFalse(store.paired, "an unpaired fake must leave paired false")
-    }
-
-    /// A failing pair() must still resolve pairingChecked -- otherwise a Watch that fails
-    /// pairing on first run would sit on the onboarding spinner instead of the onboarding UI.
-    func testPairFailureSetsPairingCheckedTrue() async throws {
-        let client = FakeBridgeClient()
-        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "invalid pairing code")))
-        await client.setPaired(false)
-        let store = SessionStore(client: client, defaults: freshDefaults())
-
-        await store.pair(code: "ZZZZZZZZZZZZ", deviceName: "Test Watch")
-
-        XCTAssertFalse(store.paired, "a failing pair() must not report the device as paired")
-        XCTAssertNotNil(store.pairingError, "a failing pair() must surface an error on the store")
-        XCTAssertTrue(store.pairingChecked, "pairingChecked must be true even when pair() fails")
     }
 
     /// Regression for E-001: RootView must gate onboarding on `everPaired`, not the live
@@ -2940,39 +3507,6 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.paired, "a stale lookup delivered after a newer one must not overwrite its result")
     }
 
-    /// Regression for R2-002: pair()'s failure path wrote `pairingError` after its
-    /// `pairingLookup()` await without checking `pairGeneration`, so a stale failed pair() could
-    /// clobber a newer, concurrent attempt's error with its own stale one. Gate the failing
-    /// pair()'s post-await lookup so a second, newer pair() attempt (with a different error)
-    /// completes and applies its own error first; the stale attempt's error must never land.
-    func testStalePairFailureDoesNotOverwriteNewerPairingError() async throws {
-        let client = FakeBridgeClient()
-        let store = SessionStore(client: client, defaults: freshDefaults())
-
-        await client.setPairResult(.failure(BridgeError.http(status: 400, message: "stale error")))
-        await client.setPaired(false)
-        await client.gatePairingCall(1)
-        let firstTask = Task { await store.pair(code: "AAAAAAAAAAAA", deviceName: "Test Watch") }
-        while await client.lookupCallCount < 1 {
-            await Task.yield()
-        }
-
-        // A second, newer pair() attempt runs to completion first with a different error.
-        await client.setPairResult(.failure(BridgeError.http(status: 401, message: "newer error")))
-        await store.pair(code: "BBBBBBBBBBBB", deviceName: "Test Watch")
-        XCTAssertEqual(store.pairingError, "\(BridgeError.http(status: 401, message: "newer error"))")
-
-        // Release the first (stale) attempt; its lookup delivers late.
-        await client.openPairingGate()
-        await firstTask.value
-
-        XCTAssertEqual(
-            store.pairingError,
-            "\(BridgeError.http(status: 401, message: "newer error"))",
-            "a stale pair() failure delivered after a newer attempt must not overwrite its pairingError"
-        )
-    }
-
     /// Regression for R2-001: a permanently undecodable stored credential (corrupt keychain
     /// data) leaves Retry (refreshPairedState()) failing forever, since it only re-reads the
     /// same broken data. "Pair again" must clear the credential store and reset paired state so
@@ -3018,66 +3552,6 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertFalse(store.paired, "a failed clearCredential() must not report paired")
         XCTAssertFalse(store.everPaired, "a failed clearCredential() must not report everPaired")
         XCTAssertNotNil(store.pairingError, "a failed clearCredential() must surface an error for the view")
-    }
-
-    /// Regression for C2-005: a stale `clearPairing()` whose `clearCredential()` resolves late
-    /// (e.g. a slow Keychain delete) must not stomp a newer `pair()` result that already
-    /// resolved while it was suspended. `clearPairing()`'s `pairGeneration` guard exists exactly
-    /// to drop this stale write; without it this would flip `paired` back to false and
-    /// `everPaired`/`pairingCheckFailed` back to their pre-pair state.
-    func testStaleClearPairingDoesNotOverwriteNewerPairResult() async throws {
-        let client = FakeBridgeClient()
-        await client.setPaired(false)
-        await client.setPairingCheckFailed(true)
-        let store = SessionStore(client: client, defaults: freshDefaults())
-
-        await store.refreshPairedState()
-        XCTAssertTrue(store.pairingCheckFailed, "setup should leave the store reporting a read failure")
-
-        // Start a stale "Pair again" whose clearCredential() will not resolve until the gate
-        // opens.
-        await client.gateClearCredentialCall()
-        let staleClearTask = Task { await store.clearPairing() }
-        while await client.clearCredentialCallCount < 1 {
-            await Task.yield()
-        }
-
-        // A newer, successful pair() runs to completion first. pair() itself starts polling,
-        // which kicks off its own async refreshPairedState(); model the real client (which would
-        // now find the credential it just stored) so that lookup does not itself report
-        // .notPaired and race the assertions below.
-        await client.setPaired(true)
-        await store.pair(code: "AAAAAAAAAAAA", deviceName: "Test Watch")
-        XCTAssertTrue(store.paired, "the newer pair() must report paired")
-        XCTAssertTrue(store.everPaired)
-        XCTAssertFalse(store.pairingCheckFailed)
-
-        // Let pair()'s own start()-triggered refreshPairedState() (a second, independent newer
-        // generation) resolve against the still-true `pairedFlag` before the stale clear's
-        // late clearCredential() flips it -- otherwise that unrelated read would legitimately
-        // (and correctly) observe the credential gone once the gate below releases it, which
-        // would confound this test with a different race than the one it targets. Poll
-        // lookupCallCount instead of sleeping: it reaches 2 (1 for the setup reloadCredential(),
-        // 1 for this background lookup) only after that lookup's currentLookup() snapshot has
-        // already been taken, which is the deterministic condition the sleep was standing in for.
-        var pollIterations = 0
-        while await client.lookupCallCount < 2 {
-            pollIterations += 1
-            if pollIterations > 10_000 {
-                XCTFail("timed out waiting for pair()'s background refreshPairedState() lookup")
-                break
-            }
-            await Task.yield()
-        }
-
-        // Release the stale clearPairing(); its clearCredential() now resolves successfully,
-        // but its generation is stale and must not apply.
-        await client.openClearCredentialGate()
-        await staleClearTask.value
-
-        XCTAssertTrue(store.paired, "a stale clearPairing() delivered after a newer pair() must not overwrite paired")
-        XCTAssertTrue(store.everPaired, "a stale clearPairing() must not clear everPaired set by the newer pair()")
-        XCTAssertFalse(store.pairingCheckFailed, "a stale clearPairing() must not resurrect pairingCheckFailed")
     }
 
     // MARK: - Recovery (M3 slice 4)
@@ -4041,5 +4515,110 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(created, "sess_created")
         XCTAssertNotNil(store.sessions["sess_created"], "the new session must still be inserted")
         XCTAssertEqual(store.selectedSessionId, "sess_b", "the user's mid-flight switch must not be overridden by createSession() selecting its new session")
+    }
+
+    /// E-102: an approved (or mid-handshake) phase belongs to the old bridge; switching the
+    /// host must return it to .idle so Settings > Pair Watch can start a fresh pairing.
+    func testHostChangeResetsApprovedPairingPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_h", code: 123)))
+        await client.setPollPairingResults([.success(.approved)])
+        await client.setPaired(true)
+        await store.beginPairing()
+        guard case .choosing(_, let correct) = store.pairingPhase else { return XCTFail("expected .choosing") }
+        await store.pick(correct)
+        for _ in 0 ..< 200 {
+            if store.pairingPhase == .approved { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(store.pairingPhase, .approved)
+
+        store.hostText = "http://192.168.7.7:8787"
+        await store.reconnect()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        XCTAssertTrue(store.pairingPhase.canRestart)
+    }
+
+    /// Reconnecting to the same host keeps the success screen (no reset without a host change).
+    func testSameHostReconnectKeepsPairingPhase() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_s", code: 124)))
+        await store.beginPairing()
+        guard case .choosing = store.pairingPhase else { return XCTFail("expected .choosing") }
+        await store.reconnect()
+        guard case .choosing = store.pairingPhase else { return XCTFail("same host must not reset") }
+    }
+
+    /// E-102: a host change mid-handshake cancels it on the old bridge and frees the phase.
+    func testHostChangeCancelsInFlightHandshake() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_c", code: 222)))
+        await store.beginPairing()
+        store.hostText = "http://192.168.7.8:8787"
+        await store.reconnect()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        // The cancel is fire-and-forget (E-116), so it lands shortly after reconnect() returns.
+        var ids = await client.cancelPairingRequestIds
+        for _ in 0 ..< 100 where ids.isEmpty {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            ids = await client.cancelPairingRequestIds
+        }
+        XCTAssertEqual(ids, ["par_c"])
+    }
+
+    /// E-116: an unreachable old host (cancel never returns) must not stall the host switch.
+    func testHostChangeDoesNotWaitForOldHostCancel() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_e116", code: 222)))
+        await client.blockCancelPairing()
+        await store.beginPairing()
+        store.hostText = "http://192.168.7.9:8787"
+        let switched = expectation(description: "reconnect returns without the old-host cancel")
+        Task {
+            await store.reconnect()
+            switched.fulfill()
+        }
+        await fulfillment(of: [switched], timeout: 5)
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let urls = await client.baseURLs
+        XCTAssertEqual(urls.last, URL(string: "http://192.168.7.9:8787"))
+        var ids = await client.cancelPairingRequestIds
+        for _ in 0 ..< 100 where ids.isEmpty {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            ids = await client.cancelPairingRequestIds
+        }
+        XCTAssertEqual(ids, ["par_e116"], "the old-host cancel is still issued")
+        await client.releaseBlockedCancelPairing()
+    }
+
+    /// E-102: dismissing PairingView (Settings) mid-.choosing cancels and resets to .idle.
+    func testDismissPairingCancelsChoosingAndResets() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_d", code: 333)))
+        await store.beginPairing()
+        await store.dismissPairing()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let ids = await client.cancelPairingRequestIds
+        XCTAssertEqual(ids, ["par_d"])
+    }
+
+    /// The success screen is left alone until the view is dismissed; a terminal phase then
+    /// resets without any cancel call.
+    func testDismissPairingResetsTerminalPhaseWithoutCancel() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        await client.setBeginPairingResult(.success(PairingHandshake(requestId: "par_t", code: 444)))
+        await store.beginPairing()
+        await store.cancelPairing()
+        XCTAssertEqual(store.pairingPhase, .cancelled)
+        await store.dismissPairing()
+        XCTAssertEqual(store.pairingPhase, .idle)
+        let count = await client.cancelPairingCallCount
+        XCTAssertEqual(count, 1)
     }
 }

@@ -11,18 +11,22 @@ struct SettingsView: View {
                 Section("Bridge") {
                     TextField("host:port", text: $store.hostText)
                     Button("Connect") { Task { await store.reconnect() } }
-                    Button("Create session") { Task { await store.createSession() } }
-                        .disabled(store.selectedProject == nil)
+                    LabeledContent("Provider", value: store.bridgeInfo?.provider ?? "Unavailable")
                     NavigationLink {
                         ProjectPickerView()
                     } label: {
-                        LabeledContent("Project", value: store.selectedProject?.name ?? "Choose")
+                        LabeledContent("Project", value: store.selectedProject?.name ?? (store.projects.isEmpty ? "None authorized" : "Choose"))
                     }
-                    LabeledContent("Agent", value: store.bridgeProvider ?? "unknown")
+                    if let error = store.configurationError {
+                        Text(error).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Button("Refresh projects") { Task { await store.refreshBridgeConfiguration() } }
+                    Button("Create session") { Task { await store.createSession() } }
+                        .disabled(store.isRefreshingConfiguration || store.selectedProjectId == nil)
                 }
                 Section("Pairing") {
                     LabeledContent("Device", value: store.paired ? "Paired" : "Not paired")
-                    NavigationLink("Pair Watch") { PairingView() }
+                    NavigationLink("Pair Watch") { PairingView(resetsOnDismiss: true) }
                 }
                 Section("Speech") {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
@@ -39,6 +43,12 @@ struct SettingsView: View {
                 Section {
                     Button("Cancel turn", role: .destructive) { Task { await store.cancel() } }
                         .disabled(store.isSending)
+                }
+                Section {
+                    Text(BuildInfo.versionLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("app-build-version")
                 }
             }
             .navigationTitle("Settings")
