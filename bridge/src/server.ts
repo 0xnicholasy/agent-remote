@@ -1090,7 +1090,7 @@ export function createBridge(options: CreateBridgeOptions = {}): Bridge {
           // Same no-device/no-filter and newly-paired/no-narrowing notes as handleEvents above.
           const visible =
             device === undefined ? projects : projects.filter((project) => device.allowedProjects.includes(project.id));
-          return json({ projects: visible } satisfies ProjectsResponse);
+          return json({ projects: visible, provider: provider.id } satisfies ProjectsResponse);
         }
 
         const cancelMatch = /^\/v1\/sessions\/([^/]+)\/cancel$/.exec(path);

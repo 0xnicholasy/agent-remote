@@ -223,7 +223,8 @@ downgrading them to an existing command.
 - `POST /v1/commands` submits one command envelope.
 - `GET /v1/events?after=N&wait=S` long polls for events with `eventId > N`, waiting up to `S` seconds.
 - `GET /v1/sessions` lists known sessions.
-- `GET /v1/projects` lists known projects.
+- `GET /v1/projects` lists the projects this device may use, plus `provider`: the id of the
+  provider the bridge runs. A client sends that id as `session.create`'s `provider`.
 - `POST /v1/sessions/:id/cancel` is a convenience form of `session.cancel`.
 
 `GET /v1/events` returns immediately when events newer than `N` already exist. Otherwise it
