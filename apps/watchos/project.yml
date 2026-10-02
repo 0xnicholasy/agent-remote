@@ -51,6 +51,7 @@ targets:
       - path: Sources/BridgeClient.swift
       - path: Sources/DeviceIdentity.swift
       - path: Sources/SessionStore.swift
+      - path: Sources/SessionModel.swift
       - path: Sources/Speech.swift
       - path: Sources/OnboardingView.swift
       - path: Sources/PairingView.swift

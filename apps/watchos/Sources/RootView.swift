@@ -2,6 +2,14 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(SessionStore.self) private var store
+    /// Set when the user closes the project prompt without choosing, so it is not shown again
+    /// this launch; Settings > Project stays available.
+    @State private var projectPromptDismissed = false
+    /// Pages top to bottom: sessions, inbox, conversation (the start page), settings. The
+    /// lists sit above the conversation so Settings stays one swipe up from it.
+    @State private var page = Page.conversation
+
+    enum Page: Hashable { case sessions, inbox, conversation, settings }
 
     var body: some View {
         // Until the stored credential is known, a plain spinner beats flashing onboarding (or
@@ -19,11 +27,19 @@ struct RootView: View {
             // user on the TabView/Settings instead of ejecting them into onboarding (E-001).
             OnboardingView()
         } else {
-            TabView {
-                ConversationView()
-                SettingsView()
+            TabView(selection: $page) {
+                SessionListView { page = .conversation }.tag(Page.sessions)
+                InboxView { page = .conversation }.tag(Page.inbox)
+                ConversationView { page = .inbox }.tag(Page.conversation)
+                SettingsView().tag(Page.settings)
             }
             .tabViewStyle(.verticalPage)
+            .sheet(isPresented: Binding(
+                get: { store.needsProjectChoice && !projectPromptDismissed },
+                set: { if !$0 { projectPromptDismissed = true } }
+            )) {
+                NavigationStack { ProjectPickerView() }
+            }
         }
     }
 }
@@ -76,6 +92,8 @@ private struct PairingCheckFailedView: View {
 /// Reply button pinned under it.
 struct ConversationView: View {
     @Environment(SessionStore.self) private var store
+    /// Opens the inbox, from the "more waiting" line.
+    var openInbox: () -> Void = {}
     @State private var dictating = false
     @State private var confirmingStop = false
     /// The turn the open dialog was shown for, so confirming it can't cancel a different turn
@@ -100,6 +118,13 @@ struct ConversationView: View {
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
+                        }
+                        if store.otherWaitingCount > 0 {
+                            Button("\(store.otherWaitingCount) more waiting") { openInbox() }
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("more-waiting")
                         }
                         ForEach(store.transcript) { item in
                             TranscriptRow(item: item).id(item.id)

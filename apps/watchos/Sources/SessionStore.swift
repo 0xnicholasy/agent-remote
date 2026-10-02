@@ -171,30 +171,81 @@ final class SessionStore {
     private static let hostKey = "dev.agentremote.watch.host"
     private static let cursorKey = "dev.agentremote.watch.lastSeenEventId"
     private static let bridgeIdKey = "dev.agentremote.watch.bridgeId"
-    private static let projectId = "prj_demo"
-    private static let provider = "mock"
+    private static let projectIdKey = "dev.agentremote.watch.projectId"
+    private static let advanceKey = "dev.agentremote.watch.advanceToNextRequest"
 
-    private(set) var transcript: [TranscriptItem] = []
-    private(set) var pendingApproval: ApprovalRequest?
-    private(set) var pendingQuestion: QuestionRequestedPayload?
-    private(set) var turnState: TurnState = .idle
+    /// Every session this device can see, keyed by session id. Events for any of them are
+    /// applied to their own model; the properties below read the selected one.
+    private(set) var sessions: [String: SessionModel] = [:]
+    /// The session the conversation page shows and that prompts, decisions and cancel go to.
+    /// Stays set after that session ends, so its transcript remains readable.
+    private(set) var selectedSessionId: String?
+    /// Bumped only when the user explicitly picks a session (selectSession), never when apply()
+    /// auto-selects one. createSession() compares this to decide whether an automatic selection
+    /// happened during its await, which must not block it from selecting the session it created.
+    @ObservationIgnored private var userSelectionCount = 0
+    private var selected: SessionModel? { selectedSessionId.flatMap { sessions[$0] } }
+
+    /// The selected session while it can still take commands: nil when nothing is selected or
+    /// the selected session has ended. A selected id whose model has not arrived yet (created
+    /// here, `session.started` still in flight) counts as live.
+    var sessionId: String? {
+        guard let id = selectedSessionId, sessions[id]?.ended != true else { return nil }
+        return id
+    }
+    var transcript: [TranscriptItem] { selected?.transcript ?? gapNotice.map { [$0] } ?? [] }
+    /// A gap line from a page that left no session to hold it, shown until one exists.
+    private var gapNotice: TranscriptItem?
+    var pendingApproval: ApprovalRequest? { selected?.pendingApproval }
+    var pendingQuestion: QuestionRequestedPayload? { selected?.pendingQuestion }
+    var turnState: TurnState { selected?.turnState ?? .idle }
     /// The event id of the most recent turnStarted, so a caller that captured it before showing
     /// UI (e.g. a confirmation dialog) can tell whether the turn it was shown for is still the
     /// one running when the user acts, or a stop/start happened underneath it.
-    private(set) var currentTurnId: Int?
+    var currentTurnId: Int? { selected?.currentTurnId }
     /// True between sendPrompt() and the turnStarted that answers it. Separates "this turn's id
     /// is not known yet because it was just sent from here" from "a turn is running whose
     /// turnStarted was never seen" (e.g. a gap replay that starts mid-turn): both leave
     /// currentTurnId nil, but only the first may later be bound to the next turnStarted's id.
-    private(set) var awaitingLocalTurnStart = false
+    var awaitingLocalTurnStart: Bool { selected?.awaitingLocalTurnStart ?? false }
     /// The id turnStarted bound `awaitingLocalTurnStart` to, kept so `.pendingLocal` stays
     /// current through the very turnStarted that resolves it: applying a reconnect page can
     /// run turnStarted's write to `currentTurnId` and a later turn's own start in one
     /// synchronous loop, so a view's onChange never fires in between and must not be relied on
     /// to rebind. Cleared on session reset and on the next sendPrompt(), so it never outlives
     /// the turn it names.
-    @ObservationIgnored private var localResolvedTurnId: Int?
-    private(set) var sessionId: String?
+    private var localResolvedTurnId: Int? { selected?.localResolvedTurnId }
+
+    /// Waiting approvals and questions across every session, in inbox order.
+    var pendingInteractions: [PendingInteraction] {
+        sessions.values.flatMap(\.pendingInteractions).sorted(by: PendingInteraction.inboxOrder)
+    }
+    /// Requests waiting in sessions other than the selected one: the "N more waiting" badge.
+    var otherWaitingCount: Int {
+        pendingInteractions.filter { $0.sessionId != selectedSessionId }.count
+    }
+    /// Newest activity first.
+    var sessionList: [SessionModel] {
+        sessions.values.sorted { $0.lastEventId > $1.lastEventId }
+    }
+    /// After an approve, deny or answer lands, move to the next waiting request in another
+    /// session. Persisted; on by default.
+    var advanceToNextRequest: Bool {
+        didSet { defaults.set(advanceToNextRequest, forKey: SessionStore.advanceKey) }
+    }
+    /// The projects this device may use and the provider the bridge runs, from `GET /v1/projects`.
+    /// Empty/nil until the first successful load; `createSession()` needs both.
+    private(set) var projects: [Project] = []
+    private(set) var bridgeProvider: String?
+    /// The project new sessions start in. Persisted; cleared on load when the bridge no longer
+    /// lists it, and set automatically when the bridge lists exactly one project.
+    var selectedProjectId: String? {
+        didSet { defaults.set(selectedProjectId, forKey: SessionStore.projectIdKey) }
+    }
+    var selectedProject: Project? { projects.first { $0.id == selectedProjectId } }
+    /// Several projects and none chosen: RootView asks once after pairing instead of letting
+    /// the first Reply fail with "Pick a project".
+    var needsProjectChoice: Bool { projects.count > 1 && selectedProject == nil }
     private(set) var lastSeenEventId: Int
     private(set) var syncState: SyncState = .disconnected
     var connected: Bool { syncState != .disconnected }
@@ -205,9 +256,10 @@ final class SessionStore {
     /// it was for, so a newer card never shows an older card's outcome.
     private(set) var actionOutcome: ActionOutcome?
     @ObservationIgnored private var actionOutcomeCardId: String?
-    @ObservationIgnored private var unconfirmedSend: UnconfirmedSend?
-    /// A cancel whose outcome never reached the Watch; retrying reuses its command id.
-    @ObservationIgnored private var unconfirmedCancel: UnconfirmedSend?
+    @ObservationIgnored private var unconfirmedSends: [String: UnconfirmedSend] = [:]
+    /// A cancel whose outcome never reached the Watch; retrying reuses its command id. Keyed by
+    /// session id, same as `unconfirmedSends`.
+    @ObservationIgnored private var unconfirmedCancels: [String: UnconfirmedSend] = [:]
     private(set) var paired = false
     private(set) var pairingError: String?
     /// False until the first `refreshPairedState()` (or `pair()`) has resolved, so RootView can
@@ -244,10 +296,6 @@ final class SessionStore {
     /// awaits, so a concurrent reloadCredential()/pair()/second refreshPairedState() can start
     /// and finish while an earlier one is still suspended on `await client...`.
     @ObservationIgnored private var pairGeneration = 0
-    /// Kept so an answered question can be shown by its label rather than its option id.
-    @ObservationIgnored private var lastQuestion: QuestionRequestedPayload?
-    /// Kept so a resolved approval can say what was decided, not only how.
-    @ObservationIgnored private var lastApproval: ApprovalRequest?
     /// The `bridgeId` the cursor belongs to. Persisted with the cursor, since a cursor is only
     /// meaningful against the bridge that issued it.
     @ObservationIgnored private var knownBridgeId: String?
@@ -264,6 +312,8 @@ final class SessionStore {
         hostText = stored ?? url.absoluteString
         lastSeenEventId = defaults.integer(forKey: SessionStore.cursorKey)
         knownBridgeId = defaults.string(forKey: SessionStore.bridgeIdKey)
+        selectedProjectId = defaults.string(forKey: SessionStore.projectIdKey)
+        advanceToNextRequest = defaults.object(forKey: SessionStore.advanceKey) as? Bool ?? true
         connectedHostURL = url
         self.client = client ?? BridgeClient(baseURL: url)
         self.speaker = speaker
@@ -272,7 +322,10 @@ final class SessionStore {
     // MARK: - Polling
 
     func start() {
-        Task { [weak self] in await self?.refreshPairedState() }
+        Task { [weak self] in
+            await self?.refreshPairedState()
+            await self?.loadProjects()
+        }
         guard pollTask == nil else { return }
         pollGeneration += 1
         let generation = pollGeneration
@@ -298,6 +351,20 @@ final class SessionStore {
         guard generation == pairGeneration else { return }
         applyPairedLookup(lookup)
         pairingChecked = true
+    }
+
+    /// Fetches the device's projects and the bridge's provider. Quiet on failure (an unpaired or
+    /// unreachable bridge already shows its own status); `createSession()` retries it.
+    @discardableResult
+    func loadProjects() async -> Bool {
+        let generation = pollGeneration
+        guard let response = try? await client.projects(), generation == pollGeneration else { return false }
+        projects = response.projects
+        bridgeProvider = response.provider
+        if selectedProject == nil {
+            selectedProjectId = projects.count == 1 ? projects[0].id : nil
+        }
+        return true
     }
 
     /// Enrolls this Watch with the bridge currently set in `hostText`. On success the client
@@ -397,6 +464,11 @@ final class SessionStore {
             await client.setBaseURL(newURL)
             connectedHostURL = newURL
         }
+        if !sameBridge {
+            // Another bridge's projects and provider; start() below loads the new host's.
+            projects = []
+            bridgeProvider = nil
+        }
         resetCursor()
         setKnownBridgeId(nil)
         // A new host means a different bridge and session space: drop the old binding and
@@ -406,22 +478,43 @@ final class SessionStore {
         start()
     }
 
-    /// Clears the session binding and its pending UI state. Shared by reconnect(), the terminal
-    /// event branches in apply(), and the bridge-restart path in pollLoop() so a session that no
-    /// longer has a live bridge behind it never leaves a stuck card or a dangling binding.
-    private func resetSessionState(preservingUnconfirmedSend: Bool = false) {
-        sessionId = nil
-        pendingApproval = nil
-        pendingQuestion = nil
-        currentTurnId = nil
-        awaitingLocalTurnStart = false
-        localResolvedTurnId = nil
-        if !preservingUnconfirmedSend {
-            unconfirmedSend = nil
-            unconfirmedCancel = nil
-        }
-        actionOutcome = nil
-        actionOutcomeCardId = nil
+    /// Ends one session: its pending card and turn tracking go, its transcript stays. Called
+    /// from apply() on `session.completed` and on a fatal error. A terminal session has no
+    /// bridge left to ack a pending card, so leaving one would be a stuck card with a no-op
+    /// approve()/answer().
+    private func endSession(_ id: String) {
+        guard var model = sessions[id] else { return }
+        let cardIds = [model.pendingApproval?.binding.approvalId, model.pendingQuestion?.questionId]
+        model.ended = true
+        model.pendingApproval = nil
+        model.pendingQuestion = nil
+        model.currentTurnId = nil
+        model.awaitingLocalTurnStart = false
+        model.localResolvedTurnId = nil
+        sessions[id] = model
+        unconfirmedSends[id] = nil
+        unconfirmedCancels[id] = nil
+        if selectedSessionId == id || cardIds.contains(actionOutcomeCardId) { clearOutcome() }
+    }
+
+    /// Applies `body` to one session's model, creating the model on first sight.
+    private func update(_ id: String, _ body: (inout SessionModel) -> Void) {
+        var model = sessions[id] ?? SessionModel(id: id)
+        body(&model)
+        sessions[id] = model
+    }
+
+    /// The project's display name, or its id when the project list does not carry it.
+    func projectName(_ projectId: String?) -> String {
+        guard let projectId else { return "Session" }
+        return projects.first { $0.id == projectId }?.name ?? projectId
+    }
+
+    /// Shows another session on the conversation page (inbox and session list taps).
+    func selectSession(_ id: String) {
+        guard sessions[id] != nil else { return }
+        selectedSessionId = id
+        userSelectionCount += 1
     }
 
     private func pollLoop(generation: Int) async {
@@ -474,9 +567,9 @@ final class SessionStore {
                     discardLocalView()
                 }
                 // Binding to the first event in the page (apply()'s fallback) is wrong when
-                // the page also crosses into a later session: bind to the last session.started
-                // in the page instead, so its events aren't dropped by the cross-session guard
-                // below. This applies whenever the page is applied with no existing session
+                // the page also crosses into a later session: select the last session.started
+                // in the page instead, so the page ends on the newest session rather than the
+                // first one it mentions. This applies whenever the page is applied with no existing session
                 // binding, not just after a gap: first launch, and the id-rollback and
                 // bridgeId-change restart paths above all reset the cursor and discard the view
                 // before falling through to a full replay here. No session.started in the page
@@ -486,7 +579,7 @@ final class SessionStore {
                     if let lastStart = response.events.last(where: {
                         if case .sessionStarted = $0.payload { true } else { false }
                     }) {
-                        sessionId = lastStart.sessionId
+                        selectedSessionId = lastStart.sessionId
                     }
                 }
                 for event in response.events {
@@ -494,19 +587,28 @@ final class SessionStore {
                 }
                 // Inserted after applying, or a session.started in the page would clear it.
                 if gap {
+                    let line: TranscriptItem
                     if let first = response.firstEventId, first > 0 {
-                        transcript.insert(TranscriptItem(
+                        line = TranscriptItem(
                             id: "gap-\(first)",
                             role: .system,
                             text: "Earlier events expired on the bridge; showing from event \(first)"
-                        ), at: 0)
+                        )
                     } else {
-                        transcript.insert(TranscriptItem(
+                        line = TranscriptItem(
                             id: "gap-\(response.lastEventId)",
                             role: .system,
                             text: "Earlier events expired on the bridge"
-                        ), at: 0)
+                        )
                     }
+                    // Every session rebuilt from this page lost its earlier events.
+                    if let selectedSessionId, sessions[selectedSessionId] == nil {
+                        sessions[selectedSessionId] = SessionModel(id: selectedSessionId)
+                    }
+                    for id in sessions.keys {
+                        sessions[id]?.transcript.insert(line, at: 0)
+                    }
+                    if sessions.isEmpty { gapNotice = line }
                 }
                 // Advances past skipped (undecodable) events too, not just the decoded ones.
                 lastSeenEventId = max(lastSeenEventId, response.lastEventId)
@@ -538,11 +640,14 @@ final class SessionStore {
     /// binding, any pending card, the transcript and the turn pill. Shared by the bridge-change
     /// and truncated-cursor paths in pollLoop().
     private func discardLocalView(preservingUnconfirmedSend: Bool = false) {
-        resetSessionState(preservingUnconfirmedSend: preservingUnconfirmedSend)
-        transcript.removeAll()
-        turnState = .idle
-        lastQuestion = nil
-        lastApproval = nil
+        sessions.removeAll()
+        gapNotice = nil
+        selectedSessionId = nil
+        if !preservingUnconfirmedSend {
+            unconfirmedSends.removeAll()
+            unconfirmedCancels.removeAll()
+        }
+        clearOutcome()
     }
 
     /// "Denied: Run git push origin main". Falls back to the decision alone when the request is
@@ -586,120 +691,116 @@ final class SessionStore {
     // Not private: the unit test target compiles this file directly and drives the store
     // through decoded events instead of a running bridge.
     func apply(_ event: AgentEvent) {
-        if case .sessionStarted = event.payload {
-            // Already tracking a session: a session.started for a different id belongs to
-            // someone else's session and must not reset this one's card, status, or transcript.
-            if let current = sessionId, current != event.sessionId {
-                statusLine = "Ignored session \(event.sessionId) (still on \(current))"
-                statusKind = .skippedEvents
-                return
-            }
-            sessionId = event.sessionId
-            transcript.removeAll()
-            pendingApproval = nil
-            pendingQuestion = nil
-            turnState = .idle
-            currentTurnId = nil
-            awaitingLocalTurnStart = false
-            localResolvedTurnId = nil
-            append(.system, "Session \(event.sessionId) started", id: event.eventId)
+        let id = event.sessionId
+        if case .sessionStarted(let payload) = event.payload {
+            // A (re)started id starts clean; every other session is left alone.
+            var model = SessionModel(id: id, projectId: payload.projectId)
+            model.lastEventId = event.eventId
+            model.append(.system, "Session \(id) started", id: event.eventId)
+            sessions[id] = model
+            // Follow a new session only when nothing live is selected: a second session
+            // starting elsewhere must not pull the page away from one still running.
+            if sessionId == nil { selectedSessionId = id }
             return
         }
-        // Binds to the first event seen when no session.started has been observed yet, for
-        // example right after relaunch with a cursor already past that event.
-        if sessionId == nil { sessionId = event.sessionId }
-        guard event.sessionId == sessionId else { return }
+        // Selects the first session seen when nothing is selected yet, for example right
+        // after relaunch with a cursor already past that session's session.started.
+        if selectedSessionId == nil { selectedSessionId = id }
+        let isSelected = id == selectedSessionId
+        var model = sessions[id] ?? SessionModel(id: id)
+        model.lastEventId = max(model.lastEventId, event.eventId)
+        var endsSession = false
 
         switch event.payload {
         case .sessionStarted:
             break
         case .turnStarted(let payload):
-            turnState = .thinking
-            currentTurnId = event.eventId
-            if awaitingLocalTurnStart {
-                localResolvedTurnId = event.eventId
+            model.turnState = .thinking
+            model.currentTurnId = event.eventId
+            if model.awaitingLocalTurnStart {
+                model.localResolvedTurnId = event.eventId
             }
-            awaitingLocalTurnStart = false
+            model.awaitingLocalTurnStart = false
             if let prompt = payload.prompt, !prompt.isEmpty {
-                append(.user, prompt, id: event.eventId)
+                model.append(.user, prompt, id: event.eventId)
             }
         case .agentThinking(let payload):
-            turnState = .thinking
-            append(.system, payload.text, id: event.eventId)
+            model.turnState = .thinking
+            model.append(.system, payload.text, id: event.eventId)
         case .commandStarted(let payload):
-            turnState = .running
-            append(.system, "$ \(payload.command)", id: event.eventId)
+            model.turnState = .running
+            model.append(.system, "$ \(payload.command)", id: event.eventId)
         case .commandOutput(let payload):
             let chunk = payload.chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !chunk.isEmpty { append(.system, chunk, id: event.eventId) }
+            if !chunk.isEmpty { model.append(.system, chunk, id: event.eventId) }
         case .commandCompleted(let payload):
-            append(.system, "exit \(payload.exitCode)", id: event.eventId)
+            model.append(.system, "exit \(payload.exitCode)", id: event.eventId)
         case .agentMessage(let payload):
-            append(.agent, payload.text, id: event.eventId)
-            speaker.speak(payload.text)
+            model.append(.agent, payload.text, id: event.eventId)
+            if isSelected { speaker.speak(payload.text) }
         case .approvalRequested(let payload):
-            pendingApproval = payload
-            lastApproval = payload
-            turnState = .waiting
-            speaker.speak(payload.spokenSummary ?? payload.title)
+            model.pendingApproval = payload
+            model.lastApproval = payload
+            model.pendingSinceEventId = event.eventId
+            model.turnState = .waiting
+            // Only the session on screen speaks, so two sessions asking at once do not talk
+            // over each other; the others wait in the inbox.
+            if isSelected { speaker.speak(payload.spokenSummary ?? payload.title) }
         case .approvalResolved(let payload):
-            pendingApproval = nil
+            // Resolve by id only: a resolution for some other approval must not hide this one.
+            if model.pendingApproval?.binding.approvalId == payload.approvalId {
+                model.pendingApproval = nil
+            }
             // The transcript line below now carries the outcome, so a "Sent" banner left from
             // this or an earlier send must not reappear under it. Only when this resolution is
             // for the card the outcome belongs to: an unrelated approval/question id resolving
             // must not wipe a still-current card's outcome.
             if actionOutcomeCardId == payload.approvalId { clearOutcome() }
-            let title = lastApproval?.binding.approvalId == payload.approvalId ? lastApproval?.title : nil
-            append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
+            let title = model.lastApproval?.binding.approvalId == payload.approvalId ? model.lastApproval?.title : nil
+            model.append(.system, Self.resolutionLine(payload.decision, title: title), id: event.eventId)
         case .questionRequested(let payload):
-            pendingQuestion = payload
-            lastQuestion = payload
-            turnState = .waiting
-            speaker.speak(payload.spokenSummary ?? payload.text)
+            model.pendingQuestion = payload
+            model.lastQuestion = payload
+            model.pendingSinceEventId = event.eventId
+            model.turnState = .waiting
+            if isSelected { speaker.speak(payload.spokenSummary ?? payload.text) }
         case .questionAnswered(let payload):
-            pendingQuestion = nil
+            if model.pendingQuestion?.questionId == payload.questionId {
+                model.pendingQuestion = nil
+            }
             if actionOutcomeCardId == payload.questionId { clearOutcome() }
-            let label = lastQuestion?.options.first { $0.id == payload.answer }?.label
-            append(.user, label ?? payload.answer, id: event.eventId)
+            let label = model.lastQuestion?.options.first { $0.id == payload.answer }?.label
+            model.append(.user, label ?? payload.answer, id: event.eventId)
         case .turnCompleted:
-            turnState = .completed
-            currentTurnId = nil
-            awaitingLocalTurnStart = false
-            localResolvedTurnId = nil
+            model.turnState = .completed
+            model.currentTurnId = nil
+            model.awaitingLocalTurnStart = false
+            model.localResolvedTurnId = nil
         case .sessionCompleted(let payload):
-            turnState = payload.reason == .error ? .error : .completed
-            append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
-            // The session is over: release the binding so a later session.started (bridge- or
-            // user-initiated) can rebind instead of being dropped by the guard above. A
-            // terminal session has no bridge left to ack a pending card, so drop it here too
-            // instead of leaving it stuck on screen with a no-op approve()/answer().
-            resetSessionState()
+            model.turnState = payload.reason == .error ? .error : .completed
+            model.append(.system, "Session \(payload.reason.rawValue)", id: event.eventId)
+            endsSession = true
         case .error(let payload):
-            append(.system, payload.message, id: event.eventId)
-            // Only a fatal error ends the session; a recoverable one keeps the binding so
-            // in-flight events for it are still applied. Turn tracking (currentTurnId) and
-            // turnState must only be cleared/overwritten here when there is no turn currently
-            // tracked as cancelable -- otherwise a recoverable error event (arriving on the
-            // stream while a turn is still running) would hide the Stop-turn button. This is
-            // the event stream's own rule, independent of report(), which no longer touches
-            // turnState at all.
+            model.append(.system, payload.message, id: event.eventId)
+            // Only a fatal error ends the session; a recoverable one keeps it live so in-flight
+            // events for it are still applied. turnState is only overwritten here when no turn
+            // is tracked as cancelable -- otherwise a recoverable error arriving while a turn
+            // is still running would hide the Stop-turn button.
             if payload.fatal {
-                turnState = .error
-                resetSessionState()
-            } else if !canCancelTurn {
-                turnState = .error
+                model.turnState = .error
+                endsSession = true
+            } else if !model.canCancelTurn {
+                model.turnState = .error
             }
         case .fileRead(let payload):
-            append(.system, "Read \(payload.path)", id: event.eventId)
+            model.append(.system, "Read \(payload.path)", id: event.eventId)
         case .fileModified(let payload):
-            append(.system, "\(payload.changeType.rawValue) \(payload.path)", id: event.eventId)
+            model.append(.system, "\(payload.changeType.rawValue) \(payload.path)", id: event.eventId)
         case .usageUpdated:
             break
         }
-    }
-
-    private func append(_ role: TranscriptItem.Role, _ text: String, id: Int) {
-        transcript.append(TranscriptItem(id: "e\(id)", role: role, text: text))
+        sessions[id] = model
+        if endsSession { endSession(id) }
     }
 
     // MARK: - Commands
@@ -708,15 +809,29 @@ final class SessionStore {
     func createSession() async -> String? {
         let placeholder = UUID().uuidString
         let generation = pollGeneration
-        let payload = SessionCreatePayload(projectId: SessionStore.projectId, provider: SessionStore.provider)
+        if bridgeProvider == nil || selectedProject == nil {
+            await loadProjects()
+        }
+        guard let provider = bridgeProvider, let project = selectedProject else {
+            statusLine = projects.isEmpty && bridgeProvider != nil
+                ? "No project allowed for this Watch"
+                : bridgeProvider == nil ? "Couldn't load projects" : "Pick a project in Settings"
+            statusKind = .error
+            return nil
+        }
+        let payload = SessionCreatePayload(projectId: project.id, provider: provider)
+        // Captured before the await: if the user explicitly picks a different session while this
+        // call is in flight, that choice must win over this call selecting its newly created
+        // session. An automatic selection made by apply() (e.g. selecting the first session seen
+        // when nothing live is selected) does not count and must not block this from selecting.
+        let userSelectionsAtStart = userSelectionCount
         do {
             let response = try await client.send(.sessionCreate(payload), sessionId: placeholder)
-            // reconnect() or a session.started for another session can run during the await
-            // above; only bind if nothing has claimed sessionId since, or a poll loop hasn't
-            // moved on to a new generation, otherwise this would rebind to a stale session.
+            // reconnect() can run during the await above; only select the new session if the
+            // poll loop hasn't moved on to a new generation, otherwise this would select a
+            // session on a bridge binding that has since been discarded.
             guard let created = response.sessionId,
-                  generation == pollGeneration,
-                  sessionId == nil || sessionId == created else {
+                  generation == pollGeneration else {
                 // The rebind guard rejected this response: the id it carries is not (and must
                 // not become) the store's session, so callers like sendPrompt() must not treat
                 // it as a valid target either.
@@ -724,7 +839,12 @@ final class SessionStore {
                 statusKind = .skippedEvents
                 return nil
             }
-            sessionId = created
+            if sessions[created] == nil {
+                sessions[created] = SessionModel(id: created, projectId: project.id)
+            }
+            if userSelectionCount == userSelectionsAtStart {
+                selectedSessionId = created
+            }
             return created
         } catch {
             report(error)
@@ -749,13 +869,15 @@ final class SessionStore {
         var target = sessionId
         if target == nil { target = await createSession() }
         guard let target else { return false }
-        turnState = .thinking
-        // The real turn id is not known until turnStarted arrives; clearing it here (rather
-        // than leaving the previous turn's id) stops a Stop-turn dialog opened in this window
-        // from being guarded against the wrong, stale id when that event lands.
-        currentTurnId = nil
-        awaitingLocalTurnStart = true
-        localResolvedTurnId = nil
+        update(target) { model in
+            model.turnState = .thinking
+            // The real turn id is not known until turnStarted arrives; clearing it here (rather
+            // than leaving the previous turn's id) stops a Stop-turn dialog opened in this
+            // window from being guarded against the wrong, stale id when that event lands.
+            model.currentTurnId = nil
+            model.awaitingLocalTurnStart = true
+            model.localResolvedTurnId = nil
+        }
         do {
             try await perform(.promptSend(PromptSendPayload(text: trimmed)), sessionId: target)
             return true
@@ -763,7 +885,7 @@ final class SessionStore {
             // Only this send's own failure ends the wait for its turn; rollBackLocalTurn() is
             // scoped to sendPrompt's own optimistic state, unlike report() which is shared with
             // decide() and cancel() and must not touch turnState.
-            rollBackLocalTurn()
+            rollBackLocalTurn(target)
             report(error)
             return false
         }
@@ -839,7 +961,7 @@ final class SessionStore {
         let generation = pollGeneration
         let commandId: String
         let timestamp: String
-        if let unconfirmed = unconfirmedSend, unconfirmed.payload == payload, unconfirmed.sessionId == sessionId {
+        if let unconfirmed = unconfirmedSends[sessionId], unconfirmed.payload == payload {
             commandId = unconfirmed.commandId
             timestamp = unconfirmed.timestamp
         } else {
@@ -852,7 +974,7 @@ final class SessionStore {
             // The send itself succeeded (accepted by the bridge) regardless of what the guards
             // below do with local UI state, so every path out of this do block reports success.
             guard generation == pollGeneration else { return true }
-            unconfirmedSend = nil
+            unconfirmedSends[sessionId] = nil
             // If the resolution event already removed the card, its transcript line shows the
             // outcome and a "Sent" banner would only linger under it.
             guard isCurrent(card) else {
@@ -861,12 +983,13 @@ final class SessionStore {
             }
             setOutcome(.acknowledged, for: card)
             clearCard(card)
+            advanceToNextWaiting(after: sessionId)
             return true
         } catch {
             // Every path below reports failure: the send did not land a confirmed decision, so
             // callers must not treat this as delivered (e.g. clearing dictated text).
             guard generation == pollGeneration else { return false }
-            unconfirmedSend = nil
+            unconfirmedSends[sessionId] = nil
             let outcome = ActionOutcome.classify(error)
             switch outcome {
             case .offline, .failed, .rateLimited, .unconfirmed:
@@ -878,7 +1001,7 @@ final class SessionStore {
                     if actionOutcomeCardId == card.id { clearOutcome() }
                     return false
                 }
-                unconfirmedSend = UnconfirmedSend(
+                unconfirmedSends[sessionId] = UnconfirmedSend(
                     payload: payload, sessionId: sessionId, commandId: commandId, timestamp: timestamp
                 )
                 setOutcome(outcome, for: card)
@@ -928,21 +1051,40 @@ final class SessionStore {
         actionOutcome = outcome
     }
 
-    private func isCurrent(_ card: DecisionCard) -> Bool {
-        switch card {
-        case .approval(let id): pendingApproval?.binding.approvalId == id
-        case .question(let id): pendingQuestion?.questionId == id
-        }
+    /// The session still holding this card, if any. Cards are looked up across every session,
+    /// so switching the page to another session while a send is in flight does not strand it.
+    private func owner(of card: DecisionCard) -> String? {
+        sessions.values.first { model in
+            switch card {
+            case .approval(let id): model.pendingApproval?.binding.approvalId == id
+            case .question(let id): model.pendingQuestion?.questionId == id
+            }
+        }?.id
     }
+
+    private func isCurrent(_ card: DecisionCard) -> Bool { owner(of: card) != nil }
 
     /// A newer card could have arrived (via the poll loop) while the send was in flight; only
     /// clear the one this call answered.
     private func clearCard(_ card: DecisionCard) {
-        guard isCurrent(card) else { return }
-        switch card {
-        case .approval: pendingApproval = nil
-        case .question: pendingQuestion = nil
+        guard let owner = owner(of: card) else { return }
+        update(owner) { model in
+            switch card {
+            case .approval: model.pendingApproval = nil
+            case .question: model.pendingQuestion = nil
+            }
         }
+    }
+
+    /// After a decision lands on the page's last waiting card, moves to the next waiting
+    /// request in another session (inbox order), when the setting is on. Only acts if the page
+    /// is still on the session the decision was for -- if the user switched away while the send
+    /// was in flight, that choice must not be overridden.
+    private func advanceToNextWaiting(after decidedSessionId: String) {
+        guard selectedSessionId == decidedSessionId,
+              advanceToNextRequest, (selected?.waitingCount ?? 0) == 0,
+              let next = pendingInteractions.first(where: { $0.sessionId != selectedSessionId }) else { return }
+        selectedSessionId = next.sessionId
     }
 
     /// Cancels the running turn. A cancel whose outcome did not reach the Watch keeps its
@@ -958,7 +1100,7 @@ final class SessionStore {
         // state for it (mirrors the guard in decide()/createSession()).
         let generation = pollGeneration
         let payload = CommandPayload.sessionCancel(SessionCancelPayload(reason: "Cancelled from the Watch"))
-        let retry = unconfirmedCancel?.sessionId == target ? unconfirmedCancel : nil
+        let retry = unconfirmedCancels[target]
         let commandId = retry?.commandId ?? UUID().uuidString
         let timestamp = retry?.timestamp ?? BridgeClient.timestamp()
         do {
@@ -968,16 +1110,16 @@ final class SessionStore {
             // resetSessionState() already cleared unconfirmedCancel/status correctly and this
             // stale reply must not resurrect or stomp any of it.
             guard generation == pollGeneration, target == sessionId else { return }
-            unconfirmedCancel = nil
+            unconfirmedCancels[target] = nil
         } catch {
             guard generation == pollGeneration, target == sessionId else { return }
             switch ActionOutcome.classify(error) {
             case .offline, .failed, .rateLimited, .unconfirmed:
-                unconfirmedCancel = UnconfirmedSend(
+                unconfirmedCancels[target] = UnconfirmedSend(
                     payload: payload, sessionId: target, commandId: commandId, timestamp: timestamp
                 )
             default:
-                unconfirmedCancel = nil
+                unconfirmedCancels[target] = nil
             }
             report(error)
         }
@@ -1082,11 +1224,13 @@ final class SessionStore {
 
     /// Sole owner of the undo for sendPrompt()'s optimistic turn state. A turnStarted that landed
     /// during the send already cleared `awaitingLocalTurnStart` and is authoritative, so it wins.
-    private func rollBackLocalTurn() {
-        guard awaitingLocalTurnStart else { return }
-        awaitingLocalTurnStart = false
-        localResolvedTurnId = nil
-        currentTurnId = nil
-        turnState = .error
+    private func rollBackLocalTurn(_ id: String) {
+        guard sessions[id]?.awaitingLocalTurnStart == true else { return }
+        update(id) { model in
+            model.awaitingLocalTurnStart = false
+            model.localResolvedTurnId = nil
+            model.currentTurnId = nil
+            model.turnState = .error
+        }
     }
 }

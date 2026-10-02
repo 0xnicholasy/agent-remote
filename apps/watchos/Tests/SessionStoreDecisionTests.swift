@@ -67,8 +67,22 @@ actor FakeBridgeClient: BridgeClientProtocol {
     private var sendGateContinuation: CheckedContinuation<Void, Never>?
     private var sendCallCount = 0
 
+    /// What `projects()` returns. Defaults to the mock bridge's single project, so tests that
+    /// never touch projects still get a session.create target.
+    private var projectsResult: Result<ProjectsResponse, any Error & Sendable> = .success(
+        ProjectsResponse(projects: [Project(id: "prj_demo", name: "demo", path: "/tmp/demo")], provider: "mock")
+    )
+
     func setSendResult(_ result: SendResult) {
         sendResult = result
+    }
+
+    func setProjectsResult(_ result: Result<ProjectsResponse, any Error & Sendable>) {
+        projectsResult = result
+    }
+
+    func projects() async throws -> ProjectsResponse {
+        try projectsResult.get()
     }
 
     /// Arms the next `pair(code:deviceName:)` call to throw `error` instead of succeeding.
@@ -2386,6 +2400,83 @@ final class SessionStoreDecisionTests: XCTestCase {
     /// Regression for R-016: when createSession()'s rebind guard rejects the response (a
     /// reconnect() moved on to a new generation while the send was in flight), the stale id it
     /// carries must not be returned to sendPrompt() as a valid target.
+    private static let twoClaudeProjects = ProjectsResponse(
+        projects: [
+            Project(id: "prj_a_11111111", name: "a", path: "/repos/a"),
+            Project(id: "prj_b_22222222", name: "b", path: "/repos/b"),
+        ],
+        provider: "claude"
+    )
+
+    private func sentSessionCreate(_ client: FakeBridgeClient) async -> SessionCreatePayload? {
+        for call in await client.sentCalls {
+            if case .sessionCreate(let payload) = call.payload { return payload }
+        }
+        return nil
+    }
+
+    /// The single project a bridge lists is picked automatically, and session.create carries the
+    /// bridge's own provider id instead of a hard-coded "mock" the claude bridge refuses.
+    func testCreateSessionUsesTheOnlyProjectAndTheBridgeProvider() async throws {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.success(ProjectsResponse(
+            projects: [Project(id: "prj_a_11111111", name: "a", path: "/repos/a")],
+            provider: "claude"
+        )))
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let created = await store.createSession()
+
+        XCTAssertEqual(created, "sess_created")
+        XCTAssertEqual(store.selectedProjectId, "prj_a_11111111")
+        let payload = await sentSessionCreate(client)
+        XCTAssertEqual(payload?.projectId, "prj_a_11111111")
+        XCTAssertEqual(payload?.provider, "claude")
+    }
+
+    /// With several projects and none chosen, nothing is sent until the user picks one; the
+    /// session then starts in the picked project.
+    func testCreateSessionWaitsForAProjectChoiceWhenSeveralAreListed() async throws {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.success(Self.twoClaudeProjects))
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        let store = SessionStore(client: client, defaults: freshDefaults())
+
+        let refused = await store.createSession()
+
+        XCTAssertNil(refused)
+        XCTAssertEqual(store.statusLine, "Pick a project in Settings")
+        XCTAssertTrue(store.needsProjectChoice)
+        let sentBeforeChoice = await client.sentCalls
+        XCTAssertTrue(sentBeforeChoice.isEmpty)
+
+        store.selectedProjectId = "prj_b_22222222"
+        XCTAssertFalse(store.needsProjectChoice)
+        let created = await store.createSession()
+
+        XCTAssertEqual(created, "sess_created")
+        let payload = await sentSessionCreate(client)
+        XCTAssertEqual(payload?.projectId, "prj_b_22222222")
+    }
+
+    /// A persisted choice the bridge no longer lists (revoked, or another bridge) is dropped on
+    /// load instead of being sent and refused.
+    func testLoadProjectsDropsASelectionTheBridgeNoLongerLists() async throws {
+        let client = FakeBridgeClient()
+        await client.setProjectsResult(.success(Self.twoClaudeProjects))
+        let defaults = freshDefaults()
+        defaults.set("prj_gone_33333333", forKey: "dev.agentremote.watch.projectId")
+        let store = SessionStore(client: client, defaults: defaults)
+        XCTAssertEqual(store.selectedProjectId, "prj_gone_33333333")
+
+        let loaded = await store.loadProjects()
+
+        XCTAssertTrue(loaded)
+        XCTAssertNil(store.selectedProjectId)
+        XCTAssertEqual(store.projects.map(\.id), ["prj_a_11111111", "prj_b_22222222"])
+    }
+
     func testCreateSessionReturnsNilWhenRebindRejected() async throws {
         let client = FakeBridgeClient()
         let defaults = freshDefaults()
@@ -2409,9 +2500,9 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.statusKind, .skippedEvents)
     }
 
-    /// Regression for R-017: a session.started for a different id while already bound must
-    /// surface a status line instead of being dropped with no trace.
-    func testCrossSessionStartedSetsStatusLine() async throws {
+    /// A session.started for a different id while one is selected adds that session alongside
+    /// it (so its requests reach the inbox) without moving the page or dropping the open card.
+    func testCrossSessionStartedAddsSessionWithoutStealingSelection() async throws {
         let (store, _) = try await makeStoreWithPendingApproval()
 
         let otherStarted = try decodeEvent("""
@@ -2423,9 +2514,9 @@ final class SessionStoreDecisionTests: XCTestCase {
         """)
         store.apply(otherStarted)
 
-        XCTAssertEqual(store.sessionId, "sess_1", "the current session must not be replaced")
-        XCTAssertEqual(store.statusKind, .skippedEvents)
-        XCTAssertTrue(store.statusLine.contains("sess_other"))
+        XCTAssertEqual(store.sessionId, "sess_1", "the selected session must not be replaced")
+        XCTAssertNotNil(store.pendingApproval, "the selected session's card must survive")
+        XCTAssertNotNil(store.sessions["sess_other"], "the other session must be tracked, not ignored")
     }
 
     /// Regression for R-019: a fatal .error event must reset the session binding and clear the
@@ -2554,11 +2645,9 @@ final class SessionStoreDecisionTests: XCTestCase {
         XCTAssertEqual(store.sessionId, "sess_mid")
     }
 
-    /// Regression for R-024: pollLoop's post-loop Connected/Skipped status write used to run
-    /// after applying the batch's events, clobbering the "Ignored session" status apply() sets
-    /// for a cross-session session.started. The status write now happens before the loop, so
-    /// apply()'s message must survive an otherwise-clean batch.
-    func testCrossSessionStartedStatusSurvivesPollLoopBatch() async throws {
+    /// Same as above through the poll loop: a batch carrying another session's start adds it
+    /// to the session list and leaves the selected one in place.
+    func testCrossSessionStartedThroughPollLoopKeepsSelection() async throws {
         let (store, client) = try await makeStoreWithPendingApproval()
 
         let otherStarted = try decodeEvent("""
@@ -2575,14 +2664,14 @@ final class SessionStoreDecisionTests: XCTestCase {
         store.start()
         try await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(store.sessionId, "sess_1", "the current session must not be replaced")
-        XCTAssertEqual(store.statusKind, .skippedEvents)
-        XCTAssertTrue(store.statusLine.contains("sess_other"), "apply()'s Ignored session status must survive the batch")
+        XCTAssertEqual(store.sessionId, "sess_1", "the selected session must not be replaced")
+        XCTAssertEqual(Set(store.sessionList.map(\.id)), ["sess_1", "sess_other"])
     }
 
-    /// Regression for R-022: an apply()-driven bind to a different session during the await in
-    /// createSession() must not be overwritten by the create response.
-    func testCreateSessionDoesNotOverwriteConcurrentApplyBind() async throws {
+    /// A session started elsewhere during the await in createSession() is kept, and -- since the
+    /// selection changed while the create was in flight -- createSession() must not steal it back
+    /// once its response lands.
+    func testCreateSessionSelectsCreatedAlongsideConcurrentSession() async throws {
         let client = FakeBridgeClient()
         let defaults = freshDefaults()
         let store = SessionStore(client: client, defaults: defaults)
@@ -2600,13 +2689,15 @@ final class SessionStoreDecisionTests: XCTestCase {
         }
         """)
         store.apply(started)
-        XCTAssertEqual(store.sessionId, "sess_other")
+        XCTAssertEqual(store.sessionId, "sess_other", "apply() auto-selects the first session seen when nothing live is selected")
 
         await client.openSendGate()
         let created = await createTask.value
 
-        XCTAssertNil(created, "same-generation create must not overwrite a session bound by apply()")
-        XCTAssertEqual(store.sessionId, "sess_other", "the concurrently bound session must survive")
+        XCTAssertEqual(created, "sess_created")
+        XCTAssertEqual(store.sessionId, "sess_created", "an automatic selection made by apply() during the await must not block createSession() from selecting the session it created")
+        XCTAssertNotNil(store.sessions["sess_other"], "the concurrently started session must survive")
+        XCTAssertNotNil(store.sessions["sess_created"], "the created session must still be inserted")
     }
 
     /// Regression for R-010: `pairingError` was never asserted because the fake client never
@@ -3706,5 +3797,249 @@ final class SessionStoreDecisionTests: XCTestCase {
             store.transcript.contains { $0.text == "Approval denied" },
             "an approvalId reused after discard must fall back to the decision alone"
         )
+    }
+
+    // MARK: - Several sessions
+
+    private func startSession(_ store: SessionStore, _ sessionId: String, eventId: Int) throws {
+        store.apply(try decodeEvent("""
+        {
+            "eventId": \(eventId), "sessionId": "\(sessionId)", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:00.000Z", "type": "session.started",
+            "payload": { "projectId": "prj_\(sessionId)", "resumed": false }
+        }
+        """))
+    }
+
+    private func requestApproval(
+        _ store: SessionStore, _ sessionId: String, approvalId: String, eventId: Int, expiresAt: String
+    ) throws {
+        store.apply(try decodeEvent("""
+        {
+            "eventId": \(eventId), "sessionId": "\(sessionId)", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:01.000Z", "type": "approval.requested",
+            "payload": {
+                "binding": {
+                    "approvalId": "\(approvalId)", "sessionId": "\(sessionId)", "turnId": "turn_1",
+                    "toolCallId": "tool_\(approvalId)", "actionDigest": "digest",
+                    "expiresAt": "\(expiresAt)"
+                },
+                "kind": "command",
+                "title": "Run \(approvalId)",
+                "titleFidelity": "exact"
+            }
+        }
+        """))
+    }
+
+    private func resolveApproval(_ store: SessionStore, _ sessionId: String, approvalId: String, eventId: Int) throws {
+        store.apply(try decodeEvent("""
+        {
+            "eventId": \(eventId), "sessionId": "\(sessionId)", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:02.000Z", "type": "approval.resolved",
+            "payload": { "approvalId": "\(approvalId)", "decision": "accepted" }
+        }
+        """))
+    }
+
+    /// Two sessions each waiting on an approval: both reach the inbox, and resolving one
+    /// leaves the other's card in place.
+    func testResolvingOneSessionsApprovalKeepsTheOther() throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try requestApproval(store, "sess_a", approvalId: "appr_a", eventId: 3, expiresAt: "2026-09-17T00:05:00.000Z")
+        try requestApproval(store, "sess_b", approvalId: "appr_b", eventId: 4, expiresAt: "2026-09-17T00:05:00.000Z")
+        XCTAssertEqual(store.pendingInteractions.map(\.id), ["appr_a", "appr_b"])
+
+        try resolveApproval(store, "sess_a", approvalId: "appr_a", eventId: 5)
+
+        XCTAssertEqual(store.pendingInteractions.map(\.id), ["appr_b"])
+        XCTAssertEqual(store.sessions["sess_b"]?.pendingApproval?.binding.approvalId, "appr_b")
+    }
+
+    /// A resolution naming an approval that is not the one pending must not clear the card.
+    func testResolutionForOtherApprovalIdIsIgnored() throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try requestApproval(store, "sess_a", approvalId: "appr_new", eventId: 2, expiresAt: "2026-09-17T00:05:00.000Z")
+
+        try resolveApproval(store, "sess_a", approvalId: "appr_old", eventId: 3)
+
+        XCTAssertEqual(store.pendingApproval?.binding.approvalId, "appr_new")
+    }
+
+    /// Ending one session drops only that session's waiting card.
+    func testSessionCompletedClearsOnlyItsOwnCard() throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try requestApproval(store, "sess_a", approvalId: "appr_a", eventId: 3, expiresAt: "2026-09-17T00:05:00.000Z")
+        try requestApproval(store, "sess_b", approvalId: "appr_b", eventId: 4, expiresAt: "2026-09-17T00:05:00.000Z")
+
+        store.apply(try decodeEvent("""
+        {
+            "eventId": 5, "sessionId": "sess_b", "provider": "mock",
+            "timestamp": "2026-09-17T00:00:03.000Z", "type": "session.completed",
+            "payload": { "reason": "cancelled" }
+        }
+        """))
+
+        XCTAssertEqual(store.pendingInteractions.map(\.id), ["appr_a"])
+        XCTAssertEqual(store.sessions["sess_b"]?.ended, true)
+        XCTAssertEqual(store.sessionId, "sess_a", "the live selected session stays selected")
+    }
+
+    /// The inbox lists the request that expires first at the top, whatever order it arrived in.
+    func testInboxOrdersBySoonestExpiry() throws {
+        let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try requestApproval(store, "sess_a", approvalId: "appr_late", eventId: 3, expiresAt: "2026-09-17T00:09:00.000Z")
+        try requestApproval(store, "sess_b", approvalId: "appr_soon", eventId: 4, expiresAt: "2026-09-17T00:02:00.000Z")
+
+        XCTAssertEqual(store.pendingInteractions.map(\.id), ["appr_soon", "appr_late"])
+        XCTAssertEqual(store.otherWaitingCount, 1, "sess_a is selected; sess_b's request is the other one")
+    }
+
+    /// After an approval on the selected session is acknowledged, the page moves to the session
+    /// with the next waiting request; with the setting off it stays put.
+    func testAcknowledgedDecisionAdvancesToNextWaitingSession() async throws {
+        for advance in [true, false] {
+            let store = SessionStore(client: FakeBridgeClient(), defaults: freshDefaults())
+            store.advanceToNextRequest = advance
+            try startSession(store, "sess_a", eventId: 1)
+            try startSession(store, "sess_b", eventId: 2)
+            try requestApproval(store, "sess_a", approvalId: "appr_a", eventId: 3, expiresAt: "2026-09-17T00:05:00.000Z")
+            try requestApproval(store, "sess_b", approvalId: "appr_b", eventId: 4, expiresAt: "2026-09-17T00:05:00.000Z")
+            XCTAssertEqual(store.sessionId, "sess_a")
+
+            await store.approve()
+
+            XCTAssertEqual(store.sessionId, advance ? "sess_b" : "sess_a")
+            XCTAssertEqual(store.pendingApproval?.binding.approvalId, advance ? "appr_b" : nil)
+        }
+    }
+
+    /// Selecting a session from the inbox shows its card, and a decision goes to that session.
+    func testSelectSessionRoutesDecisionToThatSession() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try requestApproval(store, "sess_b", approvalId: "appr_b", eventId: 3, expiresAt: "2026-09-17T00:05:00.000Z")
+        XCTAssertNil(store.pendingApproval, "sess_a is selected and has nothing waiting")
+
+        store.selectSession("sess_b")
+        await store.reject()
+
+        let sent = await client.sentCalls
+        XCTAssertEqual(sent.last?.sessionId, "sess_b")
+    }
+
+    /// Regression: unconfirmedSend was a single slot shared by every session. Session A's send
+    /// failing offline (keeping its commandId for retry) must survive session B's send
+    /// succeeding in between -- retrying A must reuse A's original commandId, not mint a new one.
+    func testOfflineSendCommandIdSurvivesAnotherSessionsSuccess() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try requestApproval(store, "sess_a", approvalId: "appr_a", eventId: 3, expiresAt: "2026-09-17T00:05:00.000Z")
+        try requestApproval(store, "sess_b", approvalId: "appr_b", eventId: 4, expiresAt: "2026-09-17T00:05:00.000Z")
+
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+        await store.approve()
+        let calls1 = await client.sentCalls
+        let aCommandId = calls1[0].commandId
+        XCTAssertNotNil(store.sessions["sess_a"]?.pendingApproval, "offline must keep session A's card")
+
+        store.selectSession("sess_b")
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+        XCTAssertNil(store.sessions["sess_b"]?.pendingApproval, "session B's send succeeded")
+
+        store.selectSession("sess_a")
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.approve()
+
+        let calls2 = await client.sentCalls
+        XCTAssertEqual(calls2.count, 3)
+        XCTAssertEqual(calls2[2].commandId, aCommandId, "retrying A's send must reuse A's own commandId, not a fresh one")
+        XCTAssertNil(store.sessions["sess_a"]?.pendingApproval)
+    }
+
+    /// Same bug, cancel side: unconfirmedCancel was a single slot shared by every session.
+    func testOfflineCancelCommandIdSurvivesAnotherSessionsSuccess() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+
+        await client.setSendResult(.failure(URLError(.notConnectedToInternet)))
+        await store.cancel()
+        let calls1 = await client.sentCalls
+        let aCommandId = calls1[0].commandId
+
+        store.selectSession("sess_b")
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        store.selectSession("sess_a")
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await store.cancel()
+
+        let calls2 = await client.sentCalls
+        XCTAssertEqual(calls2.count, 3)
+        XCTAssertEqual(calls2[2].commandId, aCommandId, "retrying A's cancel must reuse A's own commandId, not a fresh one")
+    }
+
+    /// Regression: advanceToNextWaiting() used the live selection, so switching to another
+    /// session while a decision was in flight got silently overridden once that send landed.
+    func testAdvanceToNextWaitingDoesNotFireWhenSelectionChangedDuringSend() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        store.advanceToNextRequest = true
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        try startSession(store, "sess_c", eventId: 3)
+        try requestApproval(store, "sess_a", approvalId: "appr_a", eventId: 4, expiresAt: "2026-09-17T00:05:00.000Z")
+        try requestApproval(store, "sess_c", approvalId: "appr_c", eventId: 5, expiresAt: "2026-09-17T00:05:00.000Z")
+        XCTAssertEqual(store.sessionId, "sess_a")
+
+        await client.setSendResult(.success(CommandResponse(accepted: true)))
+        await client.gateSendCall(1)
+        let approveTask = Task { await store.approve() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        store.selectSession("sess_b")
+        await client.openSendGate()
+        await approveTask.value
+
+        XCTAssertEqual(store.sessionId, "sess_b", "the user's mid-flight switch to sess_b must not be overridden by advanceToNextWaiting jumping to sess_c")
+    }
+
+    /// Regression: createSession() selected the newly created session unconditionally after the
+    /// await, stealing the selection back from a user who switched to a different session while
+    /// the create was in flight.
+    func testCreateSessionDoesNotStealSelectionChangedDuringSend() async throws {
+        let client = FakeBridgeClient()
+        let store = SessionStore(client: client, defaults: freshDefaults())
+        try startSession(store, "sess_a", eventId: 1)
+        try startSession(store, "sess_b", eventId: 2)
+        XCTAssertEqual(store.sessionId, "sess_a")
+
+        await client.setSendResult(.success(CommandResponse(sessionId: "sess_created")))
+        await client.gateSendCall(1)
+        let createTask = Task { await store.createSession() }
+        try await Task.sleep(for: .milliseconds(20))
+
+        store.selectSession("sess_b")
+        await client.openSendGate()
+        let created = await createTask.value
+
+        XCTAssertEqual(created, "sess_created")
+        XCTAssertNotNil(store.sessions["sess_created"], "the new session must still be inserted")
+        XCTAssertEqual(store.selectedSessionId, "sess_b", "the user's mid-flight switch must not be overridden by createSession() selecting its new session")
     }
 }

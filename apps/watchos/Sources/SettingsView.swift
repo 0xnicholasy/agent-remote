@@ -12,6 +12,13 @@ struct SettingsView: View {
                     TextField("host:port", text: $store.hostText)
                     Button("Connect") { Task { await store.reconnect() } }
                     Button("Create session") { Task { await store.createSession() } }
+                        .disabled(store.selectedProject == nil)
+                    NavigationLink {
+                        ProjectPickerView()
+                    } label: {
+                        LabeledContent("Project", value: store.selectedProject?.name ?? "Choose")
+                    }
+                    LabeledContent("Agent", value: store.bridgeProvider ?? "unknown")
                 }
                 Section("Pairing") {
                     LabeledContent("Device", value: store.paired ? "Paired" : "Not paired")
@@ -19,6 +26,9 @@ struct SettingsView: View {
                 }
                 Section("Speech") {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
+                }
+                Section("Requests") {
+                    Toggle("Advance to next request", isOn: $store.advanceToNextRequest)
                 }
                 Section("Status") {
                     LabeledContent("State", value: store.syncState.label)

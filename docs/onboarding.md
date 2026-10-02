@@ -58,7 +58,10 @@ An empty `allowedProjects` means the device is allowed no project at all, not "a
 `projects list` and `projects allow` read the project list of the running bridge (or, if none is
 running, the last bridge started against this state dir), not this shell's own environment.
 
-## What is not here yet
+## 5. Choose a project on the Watch
 
-A project picker (choosing which authorized project a session targets) is not built. See
-[Roadmap](../tasks/todo.md) (M4).
+Settings shows "Project" and "Agent" (the bridge's provider). With exactly one allowed project
+the Watch picks it on its own; with several, the Watch asks once right after pairing, and
+Settings > "Project" changes it later. New sessions start in
+that project, and "Create session" stays disabled until one is chosen. A Watch with no allowed
+project says so; allow one with `bun run bridge projects allow`.
