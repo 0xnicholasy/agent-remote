@@ -12,30 +12,17 @@ struct SettingsView: View {
                     TextField("host:port", text: $store.hostText)
                     Button("Connect") { Task { await store.reconnect() } }
                     LabeledContent("Provider", value: store.bridgeInfo?.provider ?? "Unavailable")
-                    if store.authorizedProjects.count > 1 {
-                        Picker(
-                            "Project",
-                            selection: Binding(
-                                get: { store.selectedProjectId },
-                                set: { store.selectProject($0) }
-                            )
-                        ) {
-                            Text("Choose project").tag(String?.none)
-                            ForEach(store.authorizedProjects) { project in
-                                Text(project.name).tag(Optional(project.id))
-                            }
-                        }
-                    } else if let project = store.authorizedProjects.first {
-                        LabeledContent("Project", value: project.name)
-                    } else {
-                        LabeledContent("Project", value: "None authorized")
+                    NavigationLink {
+                        ProjectPickerView()
+                    } label: {
+                        LabeledContent("Project", value: store.selectedProject?.name ?? (store.projects.isEmpty ? "None authorized" : "Choose"))
                     }
                     if let error = store.configurationError {
                         Text(error).font(.caption2).foregroundStyle(.secondary)
                     }
                     Button("Refresh projects") { Task { await store.refreshBridgeConfiguration() } }
                     Button("Create session") { Task { await store.createSession() } }
-                        .disabled(store.isRefreshingConfiguration || store.selectedProjectId == nil || store.canCancelTurn)
+                        .disabled(store.isRefreshingConfiguration || store.selectedProjectId == nil)
                 }
                 Section("Pairing") {
                     LabeledContent("Device", value: store.paired ? "Paired" : "Not paired")
@@ -43,6 +30,9 @@ struct SettingsView: View {
                 }
                 Section("Speech") {
                     Toggle("Mute", isOn: Bindable(store.speaker).muted)
+                }
+                Section("Requests") {
+                    Toggle("Advance to next request", isOn: $store.advanceToNextRequest)
                 }
                 Section("Status") {
                     LabeledContent("State", value: store.syncState.label)

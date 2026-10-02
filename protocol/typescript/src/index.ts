@@ -403,6 +403,8 @@ export interface SessionsResponse {
 
 export interface ProjectsResponse {
   projects: Project[];
+  /** The id of the provider this bridge runs (`mock` or `claude`), for `session.create`. */
+  provider: string;
 }
 
 /**

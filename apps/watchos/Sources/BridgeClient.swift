@@ -108,6 +108,8 @@ struct BridgeInfo: Decodable, Sendable, Equatable {
     var capabilities: AgentCapabilities
 }
 
+/// `GET /v1/projects` also carries the bridge's provider id; the Watch reads that from
+/// `GET /v1/info` instead (`BridgeInfo`), so only the project list is decoded here.
 private struct ProjectsResponse: Decodable, Sendable {
     var projects: [Project]
 }
@@ -127,6 +129,8 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
     case decisionExpired
     case commandIdConflict
     case rateLimited
+    /// `session.create` refused: the provider already runs as many sessions as it allows.
+    case sessionLimit
     /// The bridge stopped while this command was running and cannot say whether it took effect.
     case commandIndeterminate
     /// The approval or question is no longer waiting for an answer (already decided, expired,
@@ -161,6 +165,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case .decisionExpired: "That approval or question already expired."
         case .commandIdConflict: "That command was already sent with different contents."
         case .rateLimited: "The bridge is rate limiting requests from this Watch; it will retry shortly."
+        case .sessionLimit: "The Mac is running the most sessions it allows. Stop one, then try again."
         case .commandIndeterminate: "The bridge cannot tell whether that command took effect."
         case .interactionNotPending: "That request is no longer waiting for an answer."
         case .reviewAtDesk: "Review this action at the Mac before allowing it."
@@ -184,6 +189,7 @@ enum BridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case "decision_expired": .decisionExpired
         case "command_id_conflict": .commandIdConflict
         case "rate_limited": .rateLimited
+        case "session_limit": .sessionLimit
         case "command_indeterminate": .commandIndeterminate
         case "interaction_not_pending": .interactionNotPending
         case "review_at_desk": .reviewAtDesk

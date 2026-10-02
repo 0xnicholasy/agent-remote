@@ -13,6 +13,7 @@ import type {
   CommandResponse,
   EventsResponse,
   Project,
+  ProjectsResponse,
   ProviderHost,
   Session,
   SessionsResponse,
@@ -1192,7 +1193,10 @@ describe("AGENTREMOTE_PROJECT_DIRS parsing", () => {
       };
       const claudeBridge = createBridge(options);
       const projectsResponse = await claudeBridge.fetch(new Request("http://bridge.local/v1/projects"));
-      const projects = ((await projectsResponse.json()) as { projects: Project[] }).projects;
+      const body = (await projectsResponse.json()) as ProjectsResponse;
+      const projects = body.projects;
+      // The Watch reads this to fill session.create's provider; a mismatch is refused with 400.
+      expect(body.provider).toBe("claude");
       expect(projects.map((project) => project.path)).toEqual(["/repos/one", "/repos/two"]);
       expect(projects.map((project) => project.id)).toEqual([projectIdFor("/repos/one"), projectIdFor("/repos/two")]);
     } finally {
